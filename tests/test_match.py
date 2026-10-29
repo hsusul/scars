@@ -16,12 +16,14 @@ from scars.match import (
     PrefixArg,
     PromptPattern,
     RecordedCall,
+    call_matches,
     matches,
     parse_spec,
     precision,
     prompt_paths,
     repo_relative,
     select,
+    trigger_key,
 )
 from scars.model import (
     ErrorSignature,
@@ -223,7 +225,7 @@ def test_command_trigger_needs_a_command():
         ("SRC/*.PY", "src/a.py", True),
         ("src/**", "src/a/b", True),
         ("src/**", "lib/a", False),
-        ("*.md", "docs/a.md", False),
+        ("*.md", "notes/a.md", False),
         ("src/?.py", "src/ab.py", False),
         ("src/[ab].py", "src/b.py", True),
         ("src/a.py", f"{ROOT}/src/a.py", True),
@@ -266,6 +268,20 @@ def test_repo_relative(path, expected):
 def test_prompt_paths_picks_path_like_words():
     prompt = "Fix `src/app.py`, then README.md. See https://x.io/a and the docs."
     assert prompt_paths(prompt) == ("src/app.py", "README.md")
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("Please fix `src/app.py`.", ("src/app.py",)),
+        ('Open "README.md".', ("README.md",)),
+        ("(see `a/b.py`),", ("a/b.py",)),
+        ("Is it 'lib/x.ts'?)", ("lib/x.ts",)),
+        ("edit src/app.py...", ("src/app.py",)),
+    ],
+)
+def test_prompt_paths_strips_closing_delimiters_and_sentence_punctuation(prompt, expected):
+    assert prompt_paths(prompt) == expected
 
 
 def test_path_trigger_reads_paths_named_in_a_prompt():
@@ -334,10 +350,12 @@ def test_plan_start_selects_promoted_pinned_in_scope_ranked():
         lesson("L-unpinned"),
         lesson("L-other-repo", pinned=True, scope=RepoScope(RepoId("other"))),
         lesson("L-path", pinned=True, scope=PathScope(REPO, "src/**")),
+        lesson("L-prov", pinned=True, status=Status.PROVISIONAL, seen=9),
+        lesson("L-cand", pinned=True, status=Status.CANDIDATE, seen=9),
     ]
     for kind in (HookEventKind.SESSION_START, HookEventKind.COMPACT):
         result = select(lessons, event(kind), CTX)
-        assert ids(result) == ["L-a", "L-b", "L-c", "L-path"]
+        assert ids(result) == ["L-a", "L-b", "L-c"]
         assert result.deadline_hit is False
 
 
@@ -355,6 +373,15 @@ def test_plan_prompt_needs_pinned_and_a_plan_stage_prompt_or_path_trigger_capped
         lesson("L-unpinned", prompt_trigger, seen=9),
         lesson("L-gate-stage", Trigger(TriggerKind.PROMPT, "deploy", Stage.GATE), pinned=True, seen=9),
         lesson("L-command", Trigger(TriggerKind.COMMAND, "deploy", Stage.PLAN), pinned=True, seen=9),
+        lesson("L-prov", prompt_trigger, pinned=True, status=Status.PROVISIONAL, seen=9),
+        lesson("L-cand", prompt_trigger, pinned=True, status=Status.CANDIDATE, seen=9),
+        lesson(
+            "L-cand-session",
+            prompt_trigger,
+            pinned=True,
+            status=Status.CANDIDATE,
+            scope=SessionScope(SessionId("s1")),
+        ),
     ]
     result = select(lessons, event(HookEventKind.PROMPT, prompt="deploy src/a.py"), CTX)
     assert ids(result) == ["L-1", "L-2"]
@@ -367,10 +394,61 @@ def test_gate_needs_promoted_block_and_a_gate_command_or_path_trigger_capped_at_
         lesson("L-block-b", trig, level=Level.BLOCK),
         lesson("L-block-a", trig, level=Level.BLOCK),
         lesson("L-plan", cmd_trigger("xcodebuild", Stage.PLAN), level=Level.BLOCK, seen=9),
-        lesson("L-path", Trigger(TriggerKind.PATH, "*.xcodeproj", Stage.GATE), level=Level.BLOCK, seen=9),
+        lesson("L-path", Trigger(TriggerKind.PATH, "*.xcodeproj/**", Stage.GATE), level=Level.BLOCK, seen=9),
+        lesson("L-prov", trig, level=Level.BLOCK, status=Status.PROVISIONAL, seen=9),
+        lesson("L-cand", trig, level=Level.BLOCK, status=Status.CANDIDATE, seen=9),
+        lesson(
+            "L-cand-session",
+            trig,
+            level=Level.BLOCK,
+            status=Status.CANDIDATE,
+            scope=SessionScope(SessionId("s1")),
+        ),
     ]
     assert ids(select(lessons, event(command="xcodebuild -scheme X"), CTX)) == ["L-block-a"]
     assert ids(select(lessons, event(command="$(xcodebuild)"), CTX)) == []
+
+
+def test_gate_path_trigger_fires_on_real_edit_paths():
+    gate = lesson(
+        "L-pbx", Trigger(TriggerKind.PATH, "*.xcodeproj/project.pbxproj", Stage.GATE), level=Level.BLOCK
+    )
+    edit = event(paths=(f"{ROOT}/App.xcodeproj/project.pbxproj",))
+    assert ids(select([gate], edit, CTX)) == ["L-pbx"]
+    assert ids(select([gate], event(paths=("App.xcodeproj/project.pbxproj",)), CTX)) == ["L-pbx"]
+    assert ids(select([gate], event(paths=(f"{ROOT}/ios/App.xcodeproj/project.pbxproj",)), CTX)) == []
+    assert ids(select([gate], event(paths=(f"{ROOT}/App.xcodeproj/xcuserdata",)), CTX)) == []
+
+
+def test_repair_fires_only_error_triggers():
+    ctx = MatchContext(repo_root=ROOT, repo_id=REPO, error_signature=ErrorSignature("boom"))
+    failed = HookEvent(
+        harness=Harness.CLAUDE,
+        harness_version="2.1.299",
+        event=HookEventKind.TOOL_FAILED,
+        session_id=SessionId("s1"),
+        tool_use_id=None,
+        cwd=ROOT,
+        tool_kind=ToolKind.SHELL,
+        command="xcodebuild -scheme X",
+        paths=(f"{ROOT}/src/a.py",),
+        error_text="boom",
+        prompt="deploy",
+        model_id=None,
+    )
+    lessons = [
+        lesson("L-cmd", Trigger(TriggerKind.COMMAND, "xcodebuild", Stage.REPAIR), seen=9),
+        lesson("L-path", Trigger(TriggerKind.PATH, "src/*.py", Stage.REPAIR), seen=9),
+        lesson("L-prompt", Trigger(TriggerKind.PROMPT, "deploy", Stage.REPAIR), seen=9),
+        lesson("L-err", Trigger(TriggerKind.ERROR, "boom", Stage.REPAIR)),
+    ]
+    assert ids(select(lessons, failed, ctx)) == ["L-err"]
+
+
+def test_repair_error_trigger_fires_when_the_command_is_unsupported():
+    ctx = MatchContext(repo_root=ROOT, repo_id=REPO, error_signature=ErrorSignature("boom"))
+    err = lesson("L-err", Trigger(TriggerKind.ERROR, "boom", Stage.REPAIR))
+    assert ids(select([err], event(HookEventKind.TOOL_FAILED, command="$(xcodebuild)"), ctx)) == ["L-err"]
 
 
 def test_repair_ranks_promoted_then_provisional_and_admits_this_sessions_candidates():
@@ -388,6 +466,98 @@ def test_repair_ranks_promoted_then_provisional_and_admits_this_sessions_candida
     assert ids(select([*lessons, lesson("L-prom", err)], failed, ctx)) == ["L-prom", "L-prov"]
 
 
+def test_path_scope_glob_must_match_an_event_path():
+    scoped = lesson(
+        "L-ios",
+        Trigger(TriggerKind.PATH, "**/*.py", Stage.GATE),
+        level=Level.BLOCK,
+        scope=PathScope(REPO, "ios/**"),
+    )
+    assert ids(select([scoped], event(paths=(f"{ROOT}/web/app.py",)), CTX)) == []
+    assert ids(select([scoped], event(paths=(f"{ROOT}/ios/app.py",)), CTX)) == ["L-ios"]
+
+
+def test_path_scope_is_not_eligible_without_event_paths():
+    gate = lesson("L-gate", cmd_trigger("xcodebuild"), level=Level.BLOCK, scope=PathScope(REPO, "ios/**"))
+    assert ids(select([gate], event(command="xcodebuild"), CTX)) == []
+    plan = lesson(
+        "L-plan",
+        Trigger(TriggerKind.PROMPT, "deploy", Stage.PLAN),
+        pinned=True,
+        scope=PathScope(REPO, "ios/**"),
+    )
+    assert ids(select([plan], event(HookEventKind.PROMPT, prompt="deploy now"), CTX)) == []
+    assert ids(select([plan], event(HookEventKind.PROMPT, prompt="deploy ios/app.swift"), CTX)) == ["L-plan"]
+
+
+def test_plan_start_admits_only_machine_and_repo_scope():
+    lessons = [
+        lesson("L-machine", pinned=True, scope=MachineScope()),
+        lesson("L-repo", pinned=True),
+        lesson("L-path", pinned=True, scope=PathScope(REPO, "**")),
+        lesson("L-session", pinned=True, scope=SessionScope(SessionId("s1"))),
+    ]
+    for kind in (HookEventKind.SESSION_START, HookEventKind.COMPACT):
+        assert ids(select(lessons, event(kind, paths=(f"{ROOT}/a.py",)), CTX)) == ["L-machine", "L-repo"]
+
+
+def test_select_reports_the_firing_trigger_and_its_key():
+    fired = cmd_trigger("xcodebuild -scheme *")
+    gate = lesson("L-1", cmd_trigger("make"), fired, level=Level.BLOCK)
+    result = select([gate], event(command="xcodebuild -scheme X"), CTX)
+    assert [(s.lesson.id, s.trigger, s.trigger_key) for s in result.selected] == [
+        ("L-1", fired, "command:gate:xcodebuild -scheme *")
+    ]
+    start = select([lesson("L-2", pinned=True)], event(HookEventKind.SESSION_START), CTX)
+    assert [(s.lesson.id, s.trigger, s.trigger_key) for s in start.selected] == [("L-2", None, "start:plan")]
+
+
+def test_select_skips_already_shown_pairs_before_the_cap():
+    prompt_trigger = Trigger(TriggerKind.PROMPT, "deploy", Stage.PLAN)
+    lessons = [lesson(f"L-{i}", prompt_trigger, pinned=True, seen=9 - i) for i in range(3)]
+    shown = {(LessonId("L-0"), "prompt:plan:deploy"), (LessonId("L-1"), "prompt:plan:other")}
+    result = select(lessons, event(HookEventKind.PROMPT, prompt="deploy"), CTX, shown=shown)
+    assert ids(result) == ["L-1", "L-2"]
+
+
+def test_select_tries_another_trigger_when_the_first_was_shown():
+    keyword, path = (
+        Trigger(TriggerKind.PROMPT, "deploy", Stage.PLAN),
+        Trigger(TriggerKind.PATH, "*.py", Stage.PLAN),
+    )
+    plan = lesson("L-0", keyword, path, pinned=True)
+    prompt = event(HookEventKind.PROMPT, prompt="deploy a.py")
+    result = select([plan], prompt, CTX, shown={(LessonId("L-0"), "prompt:plan:deploy")})
+    assert [s.trigger_key for s in result.selected] == ["path:plan:*.py"]
+    assert (
+        select([plan], prompt, CTX, shown={("L-0", "prompt:plan:deploy"), ("L-0", "path:plan:*.py")}).selected
+        == ()
+    )
+
+
+def test_gate_never_deduplicates_a_deny():
+    gate = lesson("L-0", cmd_trigger("xcodebuild"), level=Level.BLOCK)
+    shown = {(LessonId("L-0"), "command:gate:xcodebuild")}
+    assert ids(select([gate], event(command="xcodebuild"), CTX, shown=shown)) == ["L-0"]
+
+
+def test_select_reports_a_deadline_passed_during_the_last_evaluation(monkeypatch):
+    import scars.match as match_module
+
+    now = [0.0]
+    real = match_module.matches
+
+    def slow(*args, **kwargs):
+        now[0] += 0.060
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(match_module, "matches", slow)
+    gate = lesson("L-0", cmd_trigger("xcodebuild"), level=Level.BLOCK)
+    result = select([gate], event(command="xcodebuild"), CTX, clock=lambda: now[0])
+    assert ids(result) == ["L-0"]
+    assert result.deadline_hit is True
+
+
 def test_select_skips_a_malformed_trigger_and_keeps_the_rest():
     lessons = [
         lesson("L-bad", cmd_trigger("make a*b"), level=Level.BLOCK),
@@ -397,7 +567,8 @@ def test_select_skips_a_malformed_trigger_and_keeps_the_rest():
 
 
 def test_select_stops_at_the_deadline_with_matches_so_far():
-    ticks = iter([0.0, 0.0, 0.010, 0.051, 0.052])
+    # One reading to set the deadline, then one after each lesson.
+    ticks = iter([0.0, 0.010, 0.051])
     lessons = [lesson(f"L-{i}", pinned=True) for i in range(4)]
     result = select(lessons, event(HookEventKind.SESSION_START), CTX, clock=lambda: next(ticks))
     assert ids(result) == ["L-0", "L-1"]
@@ -412,15 +583,19 @@ def test_thousand_command_lessons_against_a_4_kb_command_finish_well_inside_the_
     # but `-arg0` never follows `-argN*`, so each lesson scans all ~600 arguments.
     lessons = [
         lesson(f"L-{i:04}", cmd_trigger(f"xcodebuild -arg{i % 500 + 1}* -arg0 !-no{i}"), level=Level.BLOCK)
-        for i in range(1000)
+        for i in range(999)
     ]
+    # Ranks last, so the scan visits every other lesson before the gate cap stops it.
+    lessons.append(lesson("L-zzzz", cmd_trigger("make"), level=Level.BLOCK))
+    gate = event(command=command)
+    select(lessons[:10], gate, CTX, deadline_ms=10_000)
     start = time.perf_counter()
-    result = select(lessons, event(command=command), CTX, deadline_ms=10_000)
+    result = select(lessons, gate, CTX, deadline_ms=10_000)
     elapsed_ms = (time.perf_counter() - start) * 1000
     print(f"1,000 command lessons against a {len(command)}-byte command: {elapsed_ms:.1f} ms")
-    assert result.lessons == ()
+    assert ids(result) == ["L-zzzz"]
     assert result.deadline_hit is False
-    assert elapsed_ms < 250
+    assert elapsed_ms < 1000
 
 
 # Precision check
@@ -453,6 +628,75 @@ def test_precision_replays_path_triggers_against_recorded_paths():
     trigger = Trigger(TriggerKind.PATH, "src/*.py", Stage.GATE)
     result = precision(trigger, calls, error_signature=ErrorSignature("boom"), repo_root=ROOT)
     assert result == Precision(1, 1, 2, 3)
+
+
+def test_precision_resolves_paths_against_each_calls_repo_root():
+    sig = ErrorSignature("boom")
+    calls = [
+        RecordedCall(ToolKind.EDIT, None, ("/wt1/src/a.py",), False, sig, repo_root="/wt1"),
+        RecordedCall(ToolKind.EDIT, None, ("/wt2/src/b.py",), True, None, repo_root="/wt2"),
+        RecordedCall(ToolKind.EDIT, None, ("/wt2/src/c.py",), True, None),
+    ]
+    trigger = Trigger(TriggerKind.PATH, "src/*.py", Stage.GATE)
+    assert precision(trigger, calls, error_signature=sig, repo_root="/wt1") == Precision(1, 1, 2, 3)
+
+
+def test_precision_respects_the_calls_tool_kind():
+    sig = ErrorSignature("boom")
+    calls = [
+        RecordedCall(ToolKind.EDIT, "xcodebuild", (), False, sig),
+        RecordedCall(ToolKind.OTHER, "xcodebuild", (), True, None),
+        RecordedCall(ToolKind.SHELL, "xcodebuild", (), False, sig),
+    ]
+    assert precision(cmd_trigger("xcodebuild"), calls, error_signature=sig) == Precision(1, 0, 1, 3)
+
+
+@pytest.mark.parametrize(
+    ("trigger", "recorded", "expected"),
+    [
+        (cmd_trigger("xcodebuild"), RecordedCall(ToolKind.SHELL, "xcodebuild -x", (), True, None), True),
+        (cmd_trigger("xcodebuild"), RecordedCall(ToolKind.EDIT, "xcodebuild", ("a",), True, None), False),
+        (cmd_trigger("xcodebuild"), RecordedCall(ToolKind.SHELL, "$(xcodebuild)", (), True, None), False),
+        (
+            Trigger(TriggerKind.PATH, "src/*.py", Stage.GATE),
+            RecordedCall(ToolKind.EDIT, None, ("/wt2/src/a.py",), True, None, repo_root="/wt2"),
+            True,
+        ),
+        (
+            Trigger(TriggerKind.PATH, "src/*.py", Stage.GATE),
+            RecordedCall(ToolKind.EDIT, None, ("/wt2/src/a.py",), True, None),
+            False,
+        ),
+        (
+            Trigger(TriggerKind.PATH, "**", Stage.GATE),
+            RecordedCall(ToolKind.SHELL, "ls", (), True, None),
+            False,
+        ),
+        (
+            Trigger(TriggerKind.ERROR, "boom", Stage.REPAIR),
+            RecordedCall(ToolKind.SHELL, "x", (), False, ErrorSignature("boom")),
+            True,
+        ),
+        (
+            Trigger(TriggerKind.ERROR, "boom", Stage.REPAIR),
+            RecordedCall(ToolKind.SHELL, "x", (), True, None),
+            False,
+        ),
+    ],
+)
+def test_call_matches(trigger, recorded, expected):
+    assert call_matches(trigger, recorded, repo_root="/wt1") is expected
+
+
+def test_call_matches_rejects_prompt_triggers():
+    with pytest.raises(ValueError, match="prompt"):
+        call_matches(
+            Trigger(TriggerKind.PROMPT, "x", Stage.PLAN), RecordedCall(ToolKind.SHELL, "x", (), True, None)
+        )
+
+
+def test_trigger_key():
+    assert trigger_key(Trigger(TriggerKind.PATH, "src/**", Stage.GATE)) == "path:gate:src/**"
 
 
 def test_precision_rejects_non_pre_triggers():

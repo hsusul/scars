@@ -1,7 +1,7 @@
 """Trigger grammar, matching, stage selection and the precision check.
 
-See ARCHITECTURE "Matching", "Delivery stages" and "Precision check". No user-supplied regular expression is
-ever compiled: specs parse into the small typed patterns below (C12, R12).
+No user-supplied regular expression is ever compiled: specs parse into the small typed patterns below,
+so a hostile spec cannot cause catastrophic backtracking.
 """
 
 import bisect
@@ -9,7 +9,7 @@ import fnmatch
 import functools
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 
 from scars.model import (
@@ -17,6 +17,7 @@ from scars.model import (
     HookEvent,
     HookEventKind,
     Lesson,
+    LessonId,
     Level,
     MachineScope,
     PathScope,
@@ -379,13 +380,27 @@ _PATH_STRIP = "\"'`()[]{}<>,;:!?"
 
 
 def prompt_paths(prompt: str) -> tuple[str, ...]:
-    """Words in a prompt that look like paths: they contain `/` or `.` and are not URLs."""
+    """Words in a prompt that look like paths: they contain `/` or `.` and are not URLs.
+
+    Quotes, brackets and sentence punctuation are stripped from both ends until none is left, so
+    "fix `src/app.py`." names `src/app.py`.
+    """
     found: list[str] = []
     for word in prompt.split():
-        word = word.strip(_PATH_STRIP).rstrip(".")
+        while True:
+            stripped = word.strip(_PATH_STRIP).rstrip(".")
+            if stripped == word:
+                break
+            word = stripped
         if ("/" in word or "." in word) and "://" not in word:
             found.append(word)
     return tuple(found)
+
+
+def event_paths(event: HookEvent) -> tuple[str, ...]:
+    """Paths an event is about: its tool paths, plus the paths named in the prompt on prompt events."""
+    named = prompt_paths(event.prompt) if event.event is HookEventKind.PROMPT and event.prompt else ()
+    return (*event.paths, *named)
 
 
 def matches(trigger: Trigger, event: HookEvent, context: MatchContext | None = None) -> bool:
@@ -399,8 +414,7 @@ def matches(trigger: Trigger, event: HookEvent, context: MatchContext | None = N
         case CommandPattern() as pattern:
             return _any_command(pattern, event.command)
         case PathPattern() as pattern:
-            named = prompt_paths(event.prompt) if event.event is HookEventKind.PROMPT and event.prompt else ()
-            return _any_path(pattern, (*event.paths, *named), event.cwd, ctx.repo_root)
+            return _any_path(pattern, event_paths(event), event.cwd, ctx.repo_root)
         case ErrorPattern(signature):
             return ctx.error_signature is not None and ctx.error_signature == signature
         case PromptPattern(keywords):
@@ -409,7 +423,7 @@ def matches(trigger: Trigger, event: HookEvent, context: MatchContext | None = N
 
 @dataclass(frozen=True)
 class StageRule:
-    """One row of the ARCHITECTURE "Delivery stages" table. Character caps belong to rendering."""
+    """Which lessons one hook event may deliver. Character caps belong to rendering."""
 
     stage: Stage
     statuses: frozenset[Status]
@@ -420,9 +434,14 @@ class StageRule:
     cap: int | None
     session_candidates: bool
     """Also admit candidates scoped to this session."""
+    scope_kinds: frozenset[str] = frozenset({"machine", "repo", "path", "session"})
+    dedupe: bool = True
+    """Skip (lesson, trigger) pairs already shown. The gate never dedupes: every matching call is denied."""
 
 
-_PLAN_START = StageRule(Stage.PLAN, frozenset({Status.PROMOTED}), True, None, None, None, False)
+_PLAN_START = StageRule(
+    Stage.PLAN, frozenset({Status.PROMOTED}), True, None, None, None, False, frozenset({"machine", "repo"})
+)
 
 STAGE_RULES: dict[HookEventKind, StageRule] = {
     HookEventKind.SESSION_START: _PLAN_START,
@@ -444,6 +463,7 @@ STAGE_RULES: dict[HookEventKind, StageRule] = {
         frozenset({TriggerKind.COMMAND, TriggerKind.PATH}),
         1,
         False,
+        dedupe=False,
     ),
     HookEventKind.TOOL_FAILED: StageRule(
         Stage.REPAIR,
@@ -459,11 +479,32 @@ STAGE_RULES: dict[HookEventKind, StageRule] = {
 _STATUS_RANK = {Status.PROMOTED: 0, Status.PROVISIONAL: 1, Status.CANDIDATE: 2}
 
 
+PLAN_START_KEY = "start:plan"
+"""`trigger_key` for session start and compaction, where lessons are selected without a trigger."""
+
+
+def trigger_key(trigger: Trigger) -> str:
+    """Stable key for one trigger, as `kind:stage:spec`, used to record hits and dedupe deliveries."""
+    return f"{trigger.kind.value}:{trigger.stage.value}:{trigger.spec}"
+
+
+@dataclass(frozen=True)
+class Selected:
+    lesson: Lesson
+    trigger: Trigger | None
+    """The trigger that fired, or None at session start and compaction."""
+    trigger_key: str
+
+
 @dataclass(frozen=True)
 class Selection:
-    lessons: tuple[Lesson, ...]
+    selected: tuple[Selected, ...]
     deadline_hit: bool
-    """True when the deadline stopped the scan; `lessons` holds the matches found before it."""
+    """True when the deadline passed during the scan; `selected` holds the matches found by then."""
+
+    @property
+    def lessons(self) -> tuple[Lesson, ...]:
+        return tuple(s.lesson for s in self.selected)
 
 
 def select(
@@ -471,6 +512,7 @@ def select(
     event: HookEvent,
     context: MatchContext | None = None,
     *,
+    shown: Collection[tuple[LessonId, str]] = frozenset(),
     deadline_ms: int = 50,
     clock: Callable[[], float] = time.monotonic,
 ) -> Selection:
@@ -479,60 +521,94 @@ def select(
     Order: promoted before provisional before candidate, then more `sessions_seen`, then lesson id.
     Only triggers whose `stage` equals the event's stage are evaluated. A trigger with a malformed spec
     is skipped, so one bad row cannot silence every other lesson.
+
+    `shown` holds the `(lesson_id, trigger_key)` pairs already delivered in this session and context
+    epoch. Those pairs are skipped before the cap is applied, so shown lessons do not crowd out unshown
+    ones; a lesson whose first firing trigger was shown can still fire through another trigger. The
+    gate ignores `shown`. The deadline is checked with `clock` after each lesson, with no signals.
     """
     ctx = context or MatchContext()
     rule = STAGE_RULES[event.event]
+    seen = shown if rule.dedupe else frozenset()
+    paths = event_paths(event)
     limit = clock() + deadline_ms / 1000
-    chosen: list[Lesson] = []
+    chosen: list[Selected] = []
     ranked = sorted(lessons, key=lambda le: (_STATUS_RANK.get(le.status, 3), -le.sessions_seen, le.id))
     for lesson in ranked:
+        if _eligible(rule, lesson, event, paths, ctx):
+            hit = _fire(rule, lesson, event, ctx, seen)
+            if hit is not None:
+                chosen.append(hit)
         if clock() > limit:
             return Selection(tuple(chosen), True)
-        if _eligible(rule, lesson, event, ctx) and _fires(rule, lesson, event, ctx):
-            chosen.append(lesson)
-            if rule.cap is not None and len(chosen) >= rule.cap:
-                break
+        if rule.cap is not None and len(chosen) >= rule.cap:
+            break
     return Selection(tuple(chosen), False)
 
 
-def _in_scope(scope: Scope, event: HookEvent, ctx: MatchContext) -> bool:
+def _in_scope(scope: Scope, event: HookEvent, paths: tuple[str, ...], ctx: MatchContext) -> bool:
     match scope:
         case MachineScope():
             return True
-        case RepoScope(repo_id=repo_id) | PathScope(repo_id=repo_id):
+        case RepoScope(repo_id=repo_id):
             return ctx.repo_id is not None and repo_id == ctx.repo_id
+        case PathScope(repo_id=repo_id, glob=glob):
+            if ctx.repo_id is None or repo_id != ctx.repo_id or not paths:
+                return False
+            try:
+                pattern = parse_spec(TriggerKind.PATH, glob)
+            except InvalidTrigger:
+                return False
+            return isinstance(pattern, PathPattern) and _any_path(pattern, paths, event.cwd, ctx.repo_root)
         case SessionScope(session_id=session_id):
             return session_id == event.session_id
 
 
-def _eligible(rule: StageRule, lesson: Lesson, event: HookEvent, ctx: MatchContext) -> bool:
+def _eligible(
+    rule: StageRule, lesson: Lesson, event: HookEvent, paths: tuple[str, ...], ctx: MatchContext
+) -> bool:
     session_candidate = rule.session_candidates and lesson.status is Status.CANDIDATE
     session_candidate = session_candidate and isinstance(lesson.scope, SessionScope)
     return (
         (lesson.status in rule.statuses or session_candidate)
         and (not rule.pinned_only or lesson.pinned)
         and (rule.level is None or lesson.level is rule.level)
-        and _in_scope(lesson.scope, event, ctx)
+        and lesson.scope.kind in rule.scope_kinds
+        and _in_scope(lesson.scope, event, paths, ctx)
     )
 
 
-def _fires(rule: StageRule, lesson: Lesson, event: HookEvent, ctx: MatchContext) -> bool:
+def _fire(
+    rule: StageRule,
+    lesson: Lesson,
+    event: HookEvent,
+    ctx: MatchContext,
+    seen: Collection[tuple[LessonId, str]],
+) -> Selected | None:
+    """The first trigger that fires and has not been shown, as a selection, or None."""
     if rule.trigger_kinds is None:
-        return True
+        return None if (lesson.id, PLAN_START_KEY) in seen else Selected(lesson, None, PLAN_START_KEY)
     for trigger in lesson.triggers:
         if trigger.kind not in rule.trigger_kinds or trigger.stage is not rule.stage:
             continue
+        key = trigger_key(trigger)
+        if (lesson.id, key) in seen:
+            continue
         try:
             if matches(trigger, event, ctx):
-                return True
+                return Selected(lesson, trigger, key)
         except InvalidTrigger:
             continue
-    return False
+    return None
 
 
 @dataclass(frozen=True)
 class RecordedCall:
-    """One mined tool call, as the miner produces it for the precision check."""
+    """One mined tool call, as the miner produces it for the precision check.
+
+    `repo_root` is the worktree root the call ran in, so calls from several worktrees of one repo resolve
+    their paths against their own root. When it is None, the caller's default root applies.
+    """
 
     tool_kind: ToolKind
     command: str | None
@@ -540,6 +616,26 @@ class RecordedCall:
     succeeded: bool
     error_signature: ErrorSignature | None
     cwd: str = ""
+    repo_root: str | None = None
+
+
+def call_matches(trigger: Trigger, call: RecordedCall, *, repo_root: str | None = None) -> bool:
+    """Whether one trigger matches one recorded call. Raises `InvalidTrigger` for a malformed spec.
+
+    A command trigger matches only shell calls. A path trigger matches only calls with paths, resolved
+    against `call.repo_root`, or `repo_root` when the call has none. An error trigger matches a failed
+    call with the same signature. Prompt triggers do not apply to tool calls and raise `ValueError`.
+    """
+    match parse_spec(trigger.kind, trigger.spec):
+        case CommandPattern() as pattern:
+            return call.tool_kind is ToolKind.SHELL and _any_command(pattern, call.command)
+        case PathPattern() as pattern:
+            root = call.repo_root if call.repo_root is not None else repo_root
+            return bool(call.paths) and _any_path(pattern, call.paths, call.cwd, root)
+        case ErrorPattern(signature):
+            return not call.succeeded and call.error_signature == signature
+        case PromptPattern():
+            raise ValueError("prompt triggers do not apply to tool calls")
 
 
 @dataclass(frozen=True)
@@ -555,7 +651,7 @@ class Precision:
 
     @property
     def keeps_pre_trigger(self) -> bool:
-        """The miner keeps a provisional lesson's pre-trigger (R23)."""
+        """The miner keeps a provisional lesson's pre-trigger: at most 4 passing matches per failing one."""
         return self.matched_passing <= 4 * self.matched_failing
 
     @property
@@ -573,18 +669,16 @@ def precision(
     error_signature: ErrorSignature,
     repo_root: str | None = None,
 ) -> Precision:
-    """Replay a `command` or `path` pre-trigger over recorded calls (ARCHITECTURE "Precision check")."""
-    pattern = parse_spec(trigger.kind, trigger.spec)
-    if not isinstance(pattern, CommandPattern | PathPattern):
+    """Replay a `command` or `path` pre-trigger over recorded calls, using `call_matches` for each.
+
+    `repo_root` is the default for calls that do not carry their own.
+    """
+    if trigger.kind not in (TriggerKind.COMMAND, TriggerKind.PATH):
         raise ValueError(f"precision applies to command and path triggers, not {trigger.kind}")
     failing = passing = matched = total = 0
     for call in calls:
         total += 1
-        if isinstance(pattern, CommandPattern):
-            hit = _any_command(pattern, call.command)
-        else:
-            hit = _any_path(pattern, call.paths, call.cwd, repo_root)
-        if not hit:
+        if not call_matches(trigger, call, repo_root=repo_root):
             continue
         matched += 1
         if call.succeeded:
