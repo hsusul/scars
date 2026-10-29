@@ -1,5 +1,12 @@
+import os
 import random
 import re
+import shlex
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -44,8 +51,6 @@ def cmd(program, *args, cwd=None):
         ("FOO=1", ()),
         ("", ()),
         ("bash -c 'bash -c \"make\"'", (cmd("bash", "-c", "make"),)),
-        # Wrappers unwrap once each, in the spec order only.
-        ("nohup time make", (cmd("time", "make"),)),
     ],
 )
 def test_parse_golden_cases(command, expected):
@@ -354,6 +359,243 @@ def test_parse_returns_commands_or_raises_unsupported_for_random_input():
             assert _PROGRAM_NAME.fullmatch(simple.program), (command, simple)
     assert sum(outcomes.values()) == PROPERTY_CASES
     assert outcomes["parsed"] > 200 and outcomes["unsupported"] > 200, outcomes
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("env -- xcodebuild", (cmd("xcodebuild"),)),
+        ("env -u FOO -- A=1 xcodebuild", (cmd("xcodebuild"),)),
+        ("env - PATH=/bin xcodebuild", (cmd("xcodebuild"),)),
+        ("env -uFOO xcodebuild", (cmd("xcodebuild"),)),
+        ("sudo -E xcodebuild", (cmd("xcodebuild"),)),
+        ("sudo -- xcodebuild", (cmd("xcodebuild"),)),
+        ("sudo -n -u ci -E A=1 xcodebuild", (cmd("xcodebuild"),)),
+        ("uv run --with x xcodebuild", (cmd("xcodebuild"),)),
+        ("uv run --with=x --frozen -- xcodebuild -list", (cmd("xcodebuild", "-list"),)),
+        ("npx -y xcodebuild", (cmd("xcodebuild"),)),
+        ("nohup -- xcodebuild", (cmd("xcodebuild"),)),
+        ("bash -c -- 'xcodebuild'", (cmd("xcodebuild"),)),
+        ("bash -lc xcodebuild", (cmd("xcodebuild"),)),
+        ("bash -cl xcodebuild", (cmd("xcodebuild"),)),
+        ("bash -c -e xcodebuild", (cmd("xcodebuild"),)),
+        ("bash -o pipefail -c 'xcodebuild | cat'", (cmd("xcodebuild"), cmd("cat"))),
+        ("sh -ec 'xcodebuild' name arg", (cmd("xcodebuild"),)),
+        ("bash -x script.sh", (cmd("bash", "-x", "script.sh"),)),
+        ("python3 -u -m pytest -q", (cmd("pytest", "-q"),)),
+        ("python3 -c 'print(1)'", (cmd("python3", "-c", "print(1)"),)),
+        ("nohup time make", (cmd("make"),)),
+        ("echo x &> log; xcodebuild >| out 2>&1 <> f", (cmd("echo", "x"), cmd("xcodebuild"))),
+    ],
+)
+def test_parse_unwraps_only_modelled_wrapper_options(command, expected):
+    assert parse(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Options the wrapper table does not model, or that change how the command is found.
+        "env -S 'xcodebuild'",
+        "env -C /tmp xcodebuild",
+        "env -P /bin xcodebuild",
+        "env -iu FOO xcodebuild",
+        "env --ignore-environment xcodebuild",
+        "env --unset=FOO xcodebuild",
+        "sudo -i xcodebuild",
+        "sudo -s xcodebuild",
+        "sudo -En xcodebuild",
+        "uv run --directory x xcodebuild",
+        "npx -c xcodebuild",
+        "npx -- xcodebuild",
+        "python3 -I -m xcodebuild",
+        "python3 -m a/b",
+        "bash -ic xcodebuild",
+        "bash --norc -c xcodebuild",
+        "bash -c +e xcodebuild",
+        "bash -eo pipefail -c xcodebuild",
+        "bash -c",
+        "time -p xcodebuild",
+        "time -- xcodebuild",
+        "nohup -p xcodebuild",
+        # After an assignment env stops reading options, so it runs `-i`.
+        "env A=1 -i xcodebuild",
+        "sudo A=1 -u x xcodebuild",
+        # A program word never starts with `-`.
+        "-xcodebuild",
+        "env -- -i xcodebuild",
+        # Meaning differs between bash 3.2, bash 5 and zsh.
+        "true |& xcodebuild",
+        "&>>log xcodebuild",
+        "make &>> log",
+        "10>f xcodebuild",
+        "make 10>&1",
+        ">! xcodebuild make",
+        "make >>!log",
+        "repeat 1 xcodebuild",
+        "noglob xcodebuild",
+        "nocorrect xcodebuild",
+        # zsh reads `time` as a reserved word only first, and reports a parse error after a prefix.
+        "A=1 time xcodebuild",
+        "true | B=$HOME time xcodebuild",
+        "A=1 if true",
+    ],
+)
+def test_parse_rejects_round_three_findings(command):
+    with pytest.raises(Unsupported):
+        parse(command)
+
+
+DIFFERENTIAL_CASES = 2400
+_REAL_SHELLS = ("/bin/bash", "/bin/zsh")
+
+# sudo, npx and uv run are left out of the differential run: they ask for a password or reach the network.
+# `env -i`, `env -` and `bash -l` appear only with an explicit PATH or not at all, because a cleared PATH
+# or macOS `path_helper` would run the real /usr/bin/xcodebuild instead of the marker stub.
+_TARGETS = (
+    "xcodebuild",
+    '"xcodebuild"',
+    "x'code'build",
+    "\\xcodebuild",
+    "./tools/xcodebuild",
+    "tools/xcodebuild",
+    "python3 -m xcodebuild",
+    "python3 -u -m xcodebuild",
+    "python3 -mxcodebuild",
+)
+# Every other program must succeed with any argument atoms, so `bash -e` never stops before xcodebuild.
+_OTHER_PROGRAMS = ("true", "echo hi", "printf %s x", "python3 -c pass", "echo xcodebuild")
+_DECOYS = ("-xcodebuild", "python3 -I -m xcodebuild", "-S xcodebuild", "-- xcodebuild")
+_WRAPPER_ATOMS = (
+    "env",
+    "env -u FOO",
+    "env -uFOO",
+    "env --",
+    "env A=1",
+    "env -i PATH={path}",
+    "env - PATH={path}",
+)
+_WRAPPER_ATOMS += ("time", "nohup", "nohup --", "env -u FOO -- A=1")
+# Each of these makes the shell run something other than the next word, or is not modelled.
+_BAD_WRAPPER_ATOMS = ("env -u FOO A=1 --", "env A=1 -i", "env -S", "env -v", "env -C .", "env --unset=FOO")
+_BAD_WRAPPER_ATOMS += ("time -p", "time --", "nohup -p")
+_OPTION_ATOMS = ("--", "-x", "-y", "--with x", "-E", "-s", "A=1", "-u FOO")
+_REDIRECT_ATOMS = ("> out", ">>out", "2>/dev/null", "2>&1", ">|out", "&>out", "<>rw", "< /dev/null", ">&2")
+_REDIRECT_ATOMS += ("1>out", "2> out")
+_BAD_REDIRECT_ATOMS = (">! out", "&>>out", "10>out", ">>!out")
+_ARG_ATOMS = ("-list", "'a b'", '"$HOME"', "x#y", "xcodebuild", "-x", "';'", "'|'")
+_ASSIGNMENT_ATOMS = ("A=1", "A='x y'", "B=$HOME")
+_SEPARATORS = (" ; ", "; ", ";", " | ", "|", " & ")
+_BAD_SEPARATORS = (" |& ", "|&")
+_COMMENTS = (" # xcodebuild", " #; xcodebuild")
+_SHELL_WORDS = ("bash", "sh", "/bin/bash")
+_SHELL_OPTIONS = ("-c", "-c --", "-ec", "-xc", "-cx", "-e -c", "-c -e", "-o pipefail -c", "+x -c", "-c +x")
+_SHELL_OPTIONS += ("-uc", "-eo pipefail -c", "-c -- --", "--norc -c")
+_FLAT_ATOMS = _TARGETS + _OTHER_PROGRAMS + _WRAPPER_ATOMS + _BAD_WRAPPER_ATOMS + _OPTION_ATOMS + _ARG_ATOMS
+_FLAT_ATOMS += _REDIRECT_ATOMS + _BAD_REDIRECT_ATOMS + _ASSIGNMENT_ATOMS + (";", "|", "#", "bash -c", "sh -c")
+
+
+def _pick(rng: random.Random, good: tuple[str, ...], bad: tuple[str, ...]) -> str:
+    return rng.choice(bad if rng.random() < 0.08 else good)
+
+
+def _segment(rng: random.Random) -> str:
+    parts = []
+    if rng.random() < 0.3:
+        parts.append(rng.choice(_ASSIGNMENT_ATOMS))
+    if rng.random() < 0.15:
+        parts.append(_pick(rng, _REDIRECT_ATOMS, _BAD_REDIRECT_ATOMS))
+    for _ in range(rng.choice((0, 0, 1, 1, 2, 3))):
+        parts.append(_pick(rng, _WRAPPER_ATOMS, _BAD_WRAPPER_ATOMS))
+        if rng.random() < 0.05:
+            parts.append(rng.choice(_OPTION_ATOMS))
+    roll = rng.random()
+    parts.append(rng.choice(_TARGETS if roll < 0.65 else _OTHER_PROGRAMS if roll < 0.95 else _DECOYS))
+    parts.extend(rng.choice(_ARG_ATOMS) for _ in range(rng.randint(0, 2)))
+    parts.extend(_pick(rng, _REDIRECT_ATOMS, _BAD_REDIRECT_ATOMS) for _ in range(rng.randint(0, 2)))
+    return " ".join(parts)
+
+
+def _line(rng: random.Random) -> str:
+    text = _segment(rng)
+    for _ in range(rng.choice((0, 0, 1, 2))):
+        text += _pick(rng, _SEPARATORS, _BAD_SEPARATORS) + _segment(rng)
+    if rng.random() < 0.15:
+        text += rng.choice(_COMMENTS)
+    return text
+
+
+def _differential_command(rng: random.Random) -> str:
+    roll = rng.random()
+    if roll < 0.15:
+        return " ".join(rng.choice(_FLAT_ATOMS) for _ in range(rng.randint(1, 6)))
+    if roll < 0.45:
+        prefix = rng.choice(("", "", "env ", "nohup ", "time ", "A=1 "))
+        script = shlex.quote(_line(rng))
+        suffix = rng.choice(("", "", " name arg"))
+        return f"{prefix}{rng.choice(_SHELL_WORDS)} {rng.choice(_SHELL_OPTIONS)} {script}{suffix}"
+    return _line(rng)
+
+
+def _reports_xcodebuild(command: str) -> bool:
+    try:
+        return any(simple.program == "xcodebuild" for simple in parse(command))
+    except Unsupported:
+        return False
+
+
+def _runs_xcodebuild(shell: str, command: str, scratch: Path, env: dict[str, str], bin_dir: Path) -> bool:
+    scratch.mkdir()
+    # A link, not a fresh copy: macOS assesses each new executable on first run, which costs ~100 ms.
+    (scratch / "tools").symlink_to(bin_dir)
+    (scratch / "xcodebuild.py").write_text("open('xcodebuild.ran', 'w').close()\n")
+    # `wait` lets a backgrounded `xcodebuild &` finish before the shell exits.
+    subprocess.run(
+        [shell, "-c", command + "\nwait"],
+        cwd=scratch,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+        check=False,
+    )
+    marker = scratch / "xcodebuild.ran"
+    for _ in range(60):
+        if marker.exists():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.skipif(
+    not all(os.access(shell, os.X_OK) for shell in _REAL_SHELLS),
+    reason="needs /bin/bash and /bin/zsh, as on macOS",
+)
+def test_parse_reports_xcodebuild_only_when_bash_and_zsh_run_it(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("xcodebuild", "python3"):
+        body = ": > xcodebuild.ran" if name == "xcodebuild" else f'exec {shlex.quote(sys.executable)} "$@"'
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    path = f"{bin_dir}:/usr/bin:/bin"
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {"PATH": path, "HOME": str(home), "ZDOTDIR": str(home), "LC_ALL": "C"}
+
+    rng = random.Random(20261029)
+    commands = [_differential_command(rng).replace("{path}", path) for _ in range(DIFFERENTIAL_CASES)]
+    checked = [c for c in commands if "&&" not in c and "||" not in c and _reports_xcodebuild(c)]
+    runs = [
+        (shell, c, tmp_path / f"run{i}-{shell[5:]}") for i, c in enumerate(checked) for shell in _REAL_SHELLS
+    ]
+    with ThreadPoolExecutor(max_workers=min(16, (os.cpu_count() or 2) * 2)) as pool:
+        results = list(pool.map(lambda run: _runs_xcodebuild(*run, env, bin_dir), runs))
+
+    missed = [(shell, command) for (shell, command, _), ran in zip(runs, results, strict=True) if not ran]
+    assert missed == []
+    assert len(checked) > 700, len(checked)
 
 
 def test_parse_accepts_exactly_4_kb():

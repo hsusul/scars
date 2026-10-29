@@ -12,28 +12,41 @@ Accepted characters: printable Unicode, space and tab, plus newline inside quote
 other control characters, lone surrogates, Unicode line and paragraph separators, non-breaking spaces)
 is unsupported, because the shell may read it differently from Python.
 
-Modelled: words with single quotes, double quotes and backslash escapes; plain `$NAME` variables in
-arguments; the separators `&&`, `||`, `;`, `|`, `|&` and `&`; redirections (dropped with their target,
-plus a digit run written directly before a `<` or `>` operator); `#` comments; and plain `( ... )` subshell
-groups that start a command and are followed only by a separator, a redirection, a closing paren or the end.
+Only syntax that means the same in bash 3.2 (macOS `/bin/bash` and `/bin/sh`), bash 5 and zsh is accepted,
+because the command may run under any of them.
 
-The program word must be a bare name of letters, digits and `._+-`, or a path whose every component is such
-a name, optionally starting with `/` or `~/`. So a variable, a glob, a trailing `/`, an empty component or
-any other character in the program position is unsupported. Words a wrapper consumes before the program
-(`env` options, `sudo -u USER`, the `bash -c` script) must not contain a variable or a bare glob, because
-word splitting or globbing could change which program runs.
+Modelled: words with single quotes, double quotes and backslash escapes; plain `$NAME` variables in
+arguments; the separators `&&`, `||`, `;`, `|` and `&`; the redirections `<`, `>`, `>>`, `<>`, `>|`,
+`>&`, `<&` and `&>` (dropped with their target, plus a single digit written directly before a `<` or `>`
+operator); `#` comments; and plain `( ... )` subshell groups that start a command and are followed only by
+a separator, a redirection, a closing paren or the end.
+
+The program word must be a bare name of letters, digits and `._+-` that does not start with `-`, or a path
+whose every component is such a name, optionally starting with `/` or `~/`. So a variable, a glob, a
+trailing `/`, an empty component, a leading `-` or any other character in the program position is
+unsupported. Words a wrapper consumes before the program (its options, their operands, `env`
+assignments, the `bash -c` script) must not contain a variable or a bare glob, because word splitting or
+globbing could change which program runs.
 
 Unsupported: input over 4 KB, any `$` other than `$NAME` (so `${`, `$(`, `$((`, `$[`, `$'`, `$"`, `$1`,
 `$?`), backticks, bare brace expansion (`{a,b}`, `{1..3}`), heredocs and herestrings, process
 substitution, `((` and `))`, a newline outside single or double quotes, a dangling backslash or quote,
-shell keywords at the start of a command (`if`, `for`, `[[`, `{`, `function` and the rest), a `(` that
-does not start a command, a word after `)`, unbalanced parens, empty groups, and a separator with no
-command before it or a `&&`, `||` or `|` with no command after it.
+shell keywords at the start of a command (`if`, `for`, `[[`, `{`, `!`, `function` and the rest, plus the
+zsh-only `repeat`, `foreach`, `noglob` and `nocorrect`), a `(` that does not start a command, a word
+after `)`, unbalanced parens, empty groups, and a separator with no command before it or a `&&`, `||` or
+`|` with no command after it.
+
+Unsupported because the shells disagree: `|&` and `&>>` (zsh and bash 5 accept them, bash 3.2 reports a
+syntax error), a file descriptor of two or more digits such as `10>f` (bash redirects it, zsh runs `10` as
+a command), and a redirection target starting with `!` (zsh reads `>!` as a clobbering redirection, bash
+as a file named `!`). The same-meaning forms `&>`, `>|` and `<>` stay supported; `<<<` is rejected with
+the heredocs and `!` with the keywords.
 """
 
 import posixpath
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from enum import Enum
 
 MAX_COMMAND_BYTES = 4096
 
@@ -74,34 +87,129 @@ class _Op:
 
 _Token = _Word | _Op
 
-_REDIRECTS = frozenset({">", ">>", "<", ">&", "<&", "&>", "&>>", ">|", "<>"})
-_NEEDS_FOLLOWER = frozenset({"&&", "||", "|", "|&"})
+_REDIRECTS = frozenset({">", ">>", "<", ">&", "<&", "&>", ">|", "<>"})
+_NEEDS_FOLLOWER = frozenset({"&&", "||", "|"})
+_SHELL_DEPENDENT = frozenset({"|&", "&>>"})
 # Longest first, so a run like `&>>` or `>&` is read as one operator.
 _OPERATORS = ("&>>", "&&", "||", "|&", ">>", ">&", "<&", "&>", ">|", "<>", ";", "|", "&", "(", ")", "<", ">")
 _OPERATOR_CHARS = frozenset(";&|()<>")
 _KEYWORDS = frozenset(
     {"if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do", "done"}
     | {"in", "function", "coproc", "{", "}", "[[", "]]", "!"}
+    | {"repeat", "foreach", "noglob", "nocorrect"}
 )
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _VARIABLE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 _DIGITS = re.compile(r"[0-9]+")
 _NAME_PART = r"[A-Za-z0-9._+-]+"
-_PROGRAM = re.compile(rf"(?:/|~/)?(?:{_NAME_PART}/)*{_NAME_PART}")
-_SHELLS = frozenset({"bash", "sh"})
-_PYTHONS = frozenset({"python", "python3"})
+_PROGRAM = re.compile(rf"(?!-)(?:/|~/)?(?:{_NAME_PART}/)*{_NAME_PART}")
+_MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+_MAX_WRAPPERS = 8
+
+
+class _Finds(Enum):
+    """How a wrapper names what it runs."""
+
+    COMMAND = "command"
+    """The first word after the options (and assignments) is the program, possibly another wrapper."""
+    SCRIPT = "script"
+    """With the trigger option, the first word after the options is a script that is parsed again."""
+    MODULE = "module"
+    """With the trigger option, its operand is a module, reported as the program."""
+
+
+def _words(*words: str) -> frozenset[str]:
+    return frozenset(words)
+
+
+@dataclass(frozen=True)
+class _Wrapper:
+    """A command that runs another command, and the exact option grammar the parser models for it.
+
+    Unwrapping consumes only these options. Any other word starting with `-` (or `+` where `plus_options`)
+    before the wrapped command is unsupported, because an unmodelled option may take an operand or change
+    what runs. A SCRIPT or MODULE wrapper whose trigger option is absent is itself the program.
+    """
+
+    finds: _Finds
+    subcommand: str | None = None
+    """A word that must follow the wrapper name, as in `uv run`; without it the wrapper is the program."""
+    flags: frozenset[str] = field(default_factory=frozenset)
+    operands: frozenset[str] = field(default_factory=frozenset)
+    """Options followed by one operand word."""
+    attached: bool = True
+    """An operand may be attached: `-uNAME` for a short option, `--with=x` for a long one."""
+    combined: bool = False
+    """Short flags may be combined, as in `-lc`."""
+    plus_options: bool = False
+    """Words starting with `+` are options too, as in `bash +e`."""
+    double_dash: bool = False
+    """`--` ends the options."""
+    ends_options: frozenset[str] = field(default_factory=frozenset)
+    """Options after which no more options are read, as `env -`."""
+    stops: frozenset[str] = field(default_factory=frozenset)
+    """Options after which every remaining word belongs to the wrapper or its target, as `python -m`."""
+    assignments: bool = False
+    """`NAME=value` words may follow the options; the first one ends option processing."""
+    trigger: str | None = None
+
+
+_SHELL = _Wrapper(
+    _Finds.SCRIPT, attached=False, combined=True, plus_options=True, double_dash=True, trigger="-c"
+)
+_PYTHON = _Wrapper(
+    _Finds.MODULE,
+    flags=_words("-u", "-B", "-O", "-q"),
+    operands=_words("-m", "-c"),
+    double_dash=True,
+    stops=_words("-m", "-c"),
+    trigger="-m",
+)
+# The `time` keyword takes `-p` in bash but not in zsh, so it gets no options. Options that start a login
+# or interactive shell (`-i`, `-s`, `sh -l`) are left out: rc files and `path_helper` can change which
+# file a name resolves to, or define an alias or function under that name.
+_WRAPPERS: dict[str, _Wrapper] = {
+    "env": _Wrapper(
+        _Finds.COMMAND,
+        flags=_words("-i"),
+        operands=_words("-u"),
+        double_dash=True,
+        ends_options=_words("-"),
+        assignments=True,
+    ),
+    "time": _Wrapper(_Finds.COMMAND),
+    "nohup": _Wrapper(_Finds.COMMAND, double_dash=True),
+    "sudo": _Wrapper(
+        _Finds.COMMAND,
+        flags=_words("-E", "-H", "-n"),
+        operands=_words("-u", "-g"),
+        double_dash=True,
+        assignments=True,
+    ),
+    "uv": _Wrapper(
+        _Finds.COMMAND,
+        subcommand="run",
+        flags=_words("--frozen", "--locked", "--no-sync", "--offline", "-q", "--quiet"),
+        operands=_words("--with", "--python", "-p"),
+        double_dash=True,
+    ),
+    "npx": _Wrapper(_Finds.COMMAND, flags=_words("-y", "--yes")),
+    "python": _PYTHON,
+    "python3": _PYTHON,
+    "bash": replace(_SHELL, flags=_words("-c", "-e", "-u", "-x", "-l"), operands=_words("-o")),
+    "sh": replace(_SHELL, flags=_words("-c", "-e", "-u", "-x")),
+}
 
 
 def parse(command: str) -> tuple[SimpleCommand, ...]:
     """Split a shell command into simple commands with wrappers removed.
 
-    Wrappers are removed in one pass in this order, each at most once: `VAR=value` assignments, `env`
-    (with `-i`, `-u NAME`), `time` (with `-p`), `nohup`, `sudo` (with `-u USER`), `uv run`, `python -m`
-    or `python3 -m` (the module becomes the program and unwrapping stops), `npx`, and `bash -c` or
-    `sh -c` (the script is parsed again, one level deep). So `nohup time make` leaves `time` as the
-    program. A `cd DIR &&` at the start of the command, or at the start of a subshell group, sets the
-    working directory of the commands after it in that group and is not reported as a command. The
-    reported program is the basename of the program word.
+    Leading `VAR=value` assignments are dropped, then wrappers from the wrapper table are removed in any
+    order, up to eight deep: `env`, `time`, `nohup`, `sudo`, `uv run` and `npx` run the first word after
+    their options; `python -m` and `python3 -m` report the module as the program; `bash -c` and `sh -c`
+    parse their script again, one level deep. A `cd DIR &&` at the start of the command, or at the start
+    of a subshell group, sets the working directory of the commands after it in that group and is not
+    reported as a command. The reported program is the basename of the program word.
     """
     return _parse(command, depth=0)
 
@@ -210,9 +318,13 @@ def _tokenize(command: str) -> list[_Token]:
             if pair == "<<":
                 raise Unsupported("heredoc or herestring")
             op = next(o for o in _OPERATORS if command.startswith(o, i))
+            if op in _SHELL_DEPENDENT:
+                raise Unsupported(f"{op!r} means different things in bash 3.2, bash 5 and zsh")
             if op in ("<", ">") and command[i + 1 : i + 2] == "(":
                 raise Unsupported("process substitution")
             if op[0] in "<>" and word.is_fd_number():
+                if len(word.chars) > 1:
+                    raise Unsupported("zsh reads a multi-digit file descriptor as a word")
                 word = _WordBuilder()
             end_word()
             tokens.append(_Op(op))
@@ -289,8 +401,11 @@ class _Grouper:
                     self.words.append(word)
                     self.pending = True
                 case _Op(text) if text in _REDIRECTS:
-                    if i + 1 >= len(tokens) or not isinstance(tokens[i + 1], _Word):
+                    target = tokens[i + 1] if i + 1 < len(tokens) else None
+                    if not isinstance(target, _Word):
                         raise Unsupported("redirection without a target")
+                    if target.text.startswith("!") and target.bare[0]:
+                        raise Unsupported("zsh reads `>!` as a clobbering redirection")
                     self.pending = True
                     i += 1
                 case _Op("("):
@@ -344,54 +459,99 @@ class _Grouper:
 
 def _unwrap(words: list[_Word], cwd: str | None, depth: int) -> list[SimpleCommand]:
     # Only an unquoted `NAME=` is an assignment; `"FOO=1" make` runs a program named `FOO=1`.
+    prefixed = False
     while words and (m := _ASSIGNMENT.match(words[0].text)) and _unquoted_through(words[0], m.end()):
-        words = words[1:]
-    w = list(words)
-
-    def head(k: int = 0) -> str | None:
-        return w[k].text if k < len(w) else None
-
-    def take(k: int) -> None:
-        for word in w[:k]:
-            _literal(word)
-        del w[:k]
-
-    if head() == "env":
-        take(1)
-        while (arg := head()) is not None:
-            if arg in ("-i", "-", "--ignore-environment") or _ASSIGNMENT.match(arg):
-                take(1)
-            elif arg == "-u" and len(w) > 1:
-                take(2)
-            elif arg.startswith(("-u", "--unset=")):
-                take(1)
-            else:
-                break
-    if head() == "time":
-        take(1)
-        if head() == "-p":
-            take(1)
-    if head() == "nohup":
-        take(1)
-    if head() == "sudo":
-        take(1)
-        if head() == "-u" and len(w) > 1:
-            take(2)
-    if head() == "uv" and head(1) == "run":
-        take(2)
-    if len(w) > 2 and _program(w[0]) in _PYTHONS and w[1].text == "-m":
-        take(2)
-        return [_simple(w, cwd)]
-    if head() == "npx":
-        take(1)
-    if depth == 0 and len(w) > 2 and _program(w[0]) in _SHELLS and w[1].text == "-c":
-        inner = _parse(_literal(w[2]).text, depth=1)
+        words, prefixed = words[1:], True
+    # After an assignment bash runs `/usr/bin/time` while zsh still reads the reserved word and fails.
+    if prefixed and words and words[0].quoted_from is None and words[0].text in _KEYWORDS | {"time"}:
+        raise Unsupported(f"reserved word {words[0].text!r} after an assignment")
+    for _ in range(_MAX_WRAPPERS):
+        if not words:
+            return []
+        name = _program(words[0])
+        wrapper = _WRAPPERS.get(name)
+        # A nested shell is reported as itself: the parser follows one level of `-c` scripts.
+        if wrapper is None or (wrapper.finds is _Finds.SCRIPT and depth > 0):
+            return [_simple(words, cwd)]
+        args = words[1:]
+        if wrapper.subcommand is not None:
+            if not args or args[0].text != wrapper.subcommand:
+                return [_simple(words, cwd)]
+            args = args[1:]
+        seen, rest = _scan_options(name, wrapper, args)
+        if wrapper.finds is _Finds.COMMAND:
+            words = rest
+            continue
+        if wrapper.trigger not in seen:
+            return [_simple(words, cwd)]
+        if wrapper.finds is _Finds.MODULE:
+            module = seen[wrapper.trigger] or ""
+            if not _MODULE.fullmatch(module):
+                raise Unsupported(f"module {module!r} is not a dotted name")
+            return [SimpleCommand(module, tuple(word.text for word in rest), cwd)]
+        if not rest:
+            raise Unsupported(f"{name} {wrapper.trigger} has no script")
+        inner = _parse(_literal(rest[0]).text, depth=depth + 1)
         if cwd is None:
             return list(inner)
         return [SimpleCommand(c.program, c.args, posixpath.join(cwd, c.cwd) if c.cwd else cwd) for c in inner]
-    if not w:
-        return []
-    return [_simple(w, cwd)]
+    raise Unsupported(f"more than {_MAX_WRAPPERS} nested wrappers")
+
+
+def _scan_options(
+    name: str, wrapper: _Wrapper, args: list[_Word]
+) -> tuple[dict[str, str | None], list[_Word]]:
+    """Consume the wrapper's modelled options and assignments from `args`.
+
+    Returns each option seen with its operand (None for a flag), and the words after the options.
+    """
+    seen: dict[str, str | None] = {}
+    i = 0
+    while i < len(args):
+        text = _literal(args[i]).text
+        if wrapper.double_dash and text == "--":
+            i += 1
+            break
+        if text in wrapper.ends_options:
+            seen[text] = None
+            i += 1
+            break
+        if not (text.startswith("-") or (wrapper.plus_options and text.startswith("+"))):
+            break
+        i += 1
+        if text in wrapper.flags:
+            seen[text] = None
+        elif text in wrapper.operands:
+            if i >= len(args):
+                raise Unsupported(f"{name} option {text!r} has no operand")
+            seen[text] = _literal(args[i]).text
+            i += 1
+        elif wrapper.attached and (attached := _attached_operand(text, wrapper.operands)):
+            seen[attached[0]] = attached[1]
+        elif wrapper.combined and _is_flag_cluster(text, wrapper.flags):
+            seen.update(dict.fromkeys(f"-{letter}" for letter in text[1:]))
+        else:
+            raise Unsupported(f"{name} option {text!r} is not modelled")
+        if wrapper.stops & seen.keys():
+            break
+    rest = args[i:]
+    if wrapper.assignments:
+        while rest and _ASSIGNMENT.match(_literal(rest[0]).text):
+            rest = rest[1:]
+    return seen, rest
+
+
+def _attached_operand(text: str, operands: frozenset[str]) -> tuple[str, str] | None:
+    if text.startswith("--"):
+        option, equals, value = text.partition("=")
+        return (option, value) if equals and option in operands else None
+    if len(text) > 2 and text[:2] in operands:
+        return text[:2], text[2:]
+    return None
+
+
+def _is_flag_cluster(text: str, flags: frozenset[str]) -> bool:
+    return len(text) > 2 and text[0] == "-" and text[1] != "-" and all(f"-{c}" in flags for c in text[1:])
 
 
 def _literal(word: _Word) -> _Word:
