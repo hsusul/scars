@@ -206,6 +206,41 @@ def test_command_trigger(spec, command, expected):
     assert runs(spec, command) is expected
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ${x:-a; xcodebuild; b}",
+        "xcodebuild/",
+        "*/xcodebuild",
+        "echo\x00; xcodebuild",
+        "\ud800 xcodebuild",
+    ],
+    ids=["separator-in-parameter-expansion", "trailing-slash", "glob-dir", "nul", "lone-surrogate"],
+)
+def test_command_trigger_does_not_fire_on_round_two_findings(command):
+    assert runs("xcodebuild", command) is False
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("cd ios && xcodebuild -scheme App", True),
+        ("env -i xcodebuild", True),
+        ("sudo -u ci xcodebuild", True),
+        ("bash -c 'cd ios && xcodebuild'", True),
+        ("/usr/bin/xcodebuild -showsdks", True),
+        ("time nohup xcodebuild", True),
+        ("~/bin/xcodebuild", True),
+        ("echo $HOME; xcodebuild", True),
+        ("x{a,b}; xcodebuild", False),
+        ("env $X xcodebuild", False),
+        ('bash -c "echo $X; xcodebuild"', False),
+    ],
+)
+def test_command_trigger_fires_only_on_allowlisted_program_words(command, expected):
+    assert runs("xcodebuild", command) is expected
+
+
 def test_command_trigger_needs_a_command():
     assert matches(cmd_trigger("make"), event(paths=("Makefile",)), CTX) is False
 

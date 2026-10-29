@@ -1,23 +1,34 @@
 """Bounded shell parser for command triggers.
 
 The parser never guesses. A gate that fails to fire is acceptable; a gate that fires on a program the shell
-would not run is not. So any syntax the parser does not model raises `Unsupported`, and the caller skips
-command triggers for that call.
+would not run is not. So the parser accepts only what it models, by allowlist, and raises `Unsupported` for
+everything else; the caller then skips command triggers for that call. `parse` raises nothing else.
 
 The tokenizer tracks quoting itself instead of using `shlex`, because `shlex` does not report whether
 punctuation was quoted or escaped (`echo '&&' x` would read as two commands) or whether a digit run was
 attached to a redirection (`123 > out x` would drop the program `123`).
 
-Modelled: words with single quotes, double quotes and backslash escapes; the separators `&&`, `||`, `;`,
-`|`, `|&` and `&`; redirections (dropped with their target, plus a digit run written directly before a
-`<` or `>` operator); `#` comments; and plain `( ... )` subshell groups that start a command and are
-followed only by a separator, a redirection, a closing paren or the end.
+Accepted characters: printable Unicode, space and tab, plus newline inside quotes. Anything else (NUL and
+other control characters, lone surrogates, Unicode line and paragraph separators, non-breaking spaces)
+is unsupported, because the shell may read it differently from Python.
 
-Unsupported: input over 4 KB, `$(`, `$((`, backticks, `$'...'` and `$"..."` quoting, heredocs and
-herestrings, process substitution, `((` and `))`, a newline outside single or double quotes, a dangling
-backslash or quote, shell keywords at the start of a command (`if`, `for`, `[[`, `{`, `function` and the
-rest), a `(` that does not start a command, a word after `)`, unbalanced parens, empty groups, and a
-separator with no command before it or a `&&`, `||` or `|` with no command after it.
+Modelled: words with single quotes, double quotes and backslash escapes; plain `$NAME` variables in
+arguments; the separators `&&`, `||`, `;`, `|`, `|&` and `&`; redirections (dropped with their target,
+plus a digit run written directly before a `<` or `>` operator); `#` comments; and plain `( ... )` subshell
+groups that start a command and are followed only by a separator, a redirection, a closing paren or the end.
+
+The program word must be a bare name of letters, digits and `._+-`, or a path whose every component is such
+a name, optionally starting with `/` or `~/`. So a variable, a glob, a trailing `/`, an empty component or
+any other character in the program position is unsupported. Words a wrapper consumes before the program
+(`env` options, `sudo -u USER`, the `bash -c` script) must not contain a variable or a bare glob, because
+word splitting or globbing could change which program runs.
+
+Unsupported: input over 4 KB, any `$` other than `$NAME` (so `${`, `$(`, `$((`, `$[`, `$'`, `$"`, `$1`,
+`$?`), backticks, bare brace expansion (`{a,b}`, `{1..3}`), heredocs and herestrings, process
+substitution, `((` and `))`, a newline outside single or double quotes, a dangling backslash or quote,
+shell keywords at the start of a command (`if`, `for`, `[[`, `{`, `function` and the rest), a `(` that
+does not start a command, a word after `)`, unbalanced parens, empty groups, and a separator with no
+command before it or a `&&`, `||` or `|` with no command after it.
 """
 
 import posixpath
@@ -43,6 +54,17 @@ class _Word:
     text: str
     quoted_from: int | None
     """Index in `text` of the first character that came from quoting or escaping, or None if unquoted."""
+    bare: tuple[bool, ...]
+    """Per character of `text`: written unquoted and unescaped, so the shell may glob or brace-expand it."""
+    expanded: bool
+    """Holds a `$NAME` expansion, so the shell's value is unknown."""
+
+    @property
+    def literal(self) -> bool:
+        """The shell passes exactly `text` as one word: no variable and no bare glob character."""
+        return not self.expanded and not any(
+            b and c in "*?[" for c, b in zip(self.text, self.bare, strict=True)
+        )
 
 
 @dataclass(frozen=True)
@@ -62,7 +84,10 @@ _KEYWORDS = frozenset(
     | {"in", "function", "coproc", "{", "}", "[[", "]]", "!"}
 )
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_VARIABLE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 _DIGITS = re.compile(r"[0-9]+")
+_NAME_PART = r"[A-Za-z0-9._+-]+"
+_PROGRAM = re.compile(rf"(?:/|~/)?(?:{_NAME_PART}/)*{_NAME_PART}")
 _SHELLS = frozenset({"bash", "sh"})
 _PYTHONS = frozenset({"python", "python3"})
 
@@ -75,34 +100,80 @@ def parse(command: str) -> tuple[SimpleCommand, ...]:
     or `python3 -m` (the module becomes the program and unwrapping stops), `npx`, and `bash -c` or
     `sh -c` (the script is parsed again, one level deep). So `nohup time make` leaves `time` as the
     program. A `cd DIR &&` at the start of the command, or at the start of a subshell group, sets the
-    working directory of the commands after it in that group and is not reported as a command.
+    working directory of the commands after it in that group and is not reported as a command. The
+    reported program is the basename of the program word.
     """
     return _parse(command, depth=0)
 
 
 def _parse(command: str, depth: int) -> tuple[SimpleCommand, ...]:
+    if len(command) > MAX_COMMAND_BYTES:
+        raise Unsupported("command longer than 4 KB")
+    for ch in command:
+        if not (ch.isprintable() or ch in " \t\n"):
+            raise Unsupported(f"unsupported character {ch!r}")
     if len(command.encode()) > MAX_COMMAND_BYTES:
         raise Unsupported("command longer than 4 KB")
     return tuple(_Grouper(depth).run(_tokenize(command)))
 
 
+class _WordBuilder:
+    def __init__(self) -> None:
+        self.chars: list[str] = []
+        self.bare: list[bool] = []
+        self.quoted_from: int | None = None
+        self.started = False
+        """A word is open, even if still empty, as after `''`."""
+        self.expanded = False
+
+    def add(self, text: str, *, bare: bool) -> None:
+        if not bare and self.quoted_from is None:
+            self.quoted_from = len(self.chars)
+        self.chars.extend(text)
+        self.bare.extend([bare] * len(text))
+        self.started = True
+
+    def add_variable(self, text: str) -> None:
+        self.chars.extend(text)
+        self.bare.extend([False] * len(text))
+        self.started = self.expanded = True
+
+    def is_fd_number(self) -> bool:
+        return self.quoted_from is None and not self.expanded and bool(_DIGITS.fullmatch("".join(self.chars)))
+
+    def build(self) -> _Word:
+        bare = tuple(self.bare)
+        if _has_brace_expansion(self.chars, bare):
+            raise Unsupported("brace expansion")
+        return _Word("".join(self.chars), self.quoted_from, bare, self.expanded)
+
+
+def _has_brace_expansion(chars: list[str], bare: tuple[bool, ...]) -> bool:
+    """A bare `{` followed by a bare `,` or `..` and then a bare `}`. Over-approximates, never misses."""
+    opened = separated = False
+    for j, (c, b) in enumerate(zip(chars, bare, strict=True)):
+        if not b:
+            continue
+        if c == "{":
+            opened = True
+        elif opened and (
+            c == "," or (c == "." and j + 1 < len(chars) and chars[j + 1] == "." and bare[j + 1])
+        ):
+            separated = True
+        elif c == "}" and separated:
+            return True
+    return False
+
+
 def _tokenize(command: str) -> list[_Token]:
     tokens: list[_Token] = []
-    buf: list[str] = []
-    quoted_from: int | None = None
-    started = False  # a word is open, even if still empty, as after `''`
+    word = _WordBuilder()
 
     def end_word() -> None:
-        nonlocal buf, quoted_from, started
-        if started:
-            tokens.append(_Word("".join(buf), quoted_from))
-        buf, quoted_from, started = [], None, False
-
-    def mark_quoted() -> None:
-        nonlocal quoted_from, started
-        if quoted_from is None:
-            quoted_from = len("".join(buf))
-        started = True
+        nonlocal word
+        if word.started:
+            tokens.append(word.build())
+        word = _WordBuilder()
 
     i, n = 0, len(command)
     while i < n:
@@ -111,27 +182,27 @@ def _tokenize(command: str) -> list[_Token]:
         if ch in " \t":
             end_word()
             i += 1
-        elif ch in "\n\r":
+        elif ch == "\n":
             raise Unsupported("newline outside quotes")
         elif ch == "\\":
-            if i + 1 >= n or command[i + 1] in "\n\r":
+            if i + 1 >= n or command[i + 1] == "\n":
                 raise Unsupported("backslash at the end of a line")
-            mark_quoted()
-            buf.append(command[i + 1])
+            word.add(command[i + 1], bare=False)
             i += 2
         elif ch == "'":
             close = command.find("'", i + 1)
             if close < 0:
                 raise Unsupported("unterminated single quote")
-            mark_quoted()
-            buf.append(command[i + 1 : close])
+            word.add(command[i + 1 : close], bare=False)
             i = close + 1
         elif ch == '"':
-            mark_quoted()
-            i = _read_double_quoted(command, i + 1, buf)
-        elif pair in ("$(", "$'", '$"') or ch == "`":
-            raise Unsupported(f"unsupported expansion {pair if ch == '$' else ch!r}")
-        elif ch == "#" and not started:
+            word.add("", bare=False)
+            i = _read_double_quoted(command, i + 1, word)
+        elif ch == "$":
+            i = _read_variable(command, i, word)
+        elif ch == "`":
+            raise Unsupported("command substitution")
+        elif ch == "#" and not word.started:
             break
         elif ch in _OPERATOR_CHARS:
             if pair in ("((", "))"):
@@ -141,20 +212,28 @@ def _tokenize(command: str) -> list[_Token]:
             op = next(o for o in _OPERATORS if command.startswith(o, i))
             if op in ("<", ">") and command[i + 1 : i + 2] == "(":
                 raise Unsupported("process substitution")
-            if op[0] in "<>" and quoted_from is None and _DIGITS.fullmatch("".join(buf)):
-                buf, started = [], False
+            if op[0] in "<>" and word.is_fd_number():
+                word = _WordBuilder()
             end_word()
             tokens.append(_Op(op))
             i += len(op)
         else:
-            started = True
-            buf.append(ch)
+            word.add(ch, bare=True)
             i += 1
     end_word()
     return tokens
 
 
-def _read_double_quoted(command: str, i: int, buf: list[str]) -> int:
+def _read_variable(command: str, i: int, word: _WordBuilder) -> int:
+    """Append the plain `$NAME` at `i` to `word`; return the index after it. Other `$` forms raise."""
+    m = _VARIABLE.match(command, i)
+    if m is None:
+        raise Unsupported(f"unsupported expansion {command[i : i + 2]!r}")
+    word.add_variable(m.group())
+    return m.end()
+
+
+def _read_double_quoted(command: str, i: int, word: _WordBuilder) -> int:
     """Append the body of a double-quoted string starting at `i`; return the index after the closing quote."""
     n = len(command)
     while i < n:
@@ -163,14 +242,16 @@ def _read_double_quoted(command: str, i: int, buf: list[str]) -> int:
             return i + 1
         if ch == "\\" and i + 1 < n:
             nxt = command[i + 1]
-            if nxt in "\n\r":
+            if nxt == "\n":
                 raise Unsupported("line continuation inside double quotes")
-            buf.append(nxt if nxt in '$`"\\' else ch + nxt)
+            word.add(nxt if nxt in '$`"\\' else ch + nxt, bare=False)
             i += 2
-        elif command.startswith("$(", i) or ch == "`":
+        elif ch == "$":
+            i = _read_variable(command, i, word)
+        elif ch == "`":
             raise Unsupported("command substitution")
         else:
-            buf.append(ch)
+            word.add(ch, bare=False)
             i += 1
     raise Unsupported("unterminated double quote")
 
@@ -254,7 +335,7 @@ class _Grouper:
         if words[0].quoted_from is None and words[0].text in _KEYWORDS:
             raise Unsupported(f"shell keyword {words[0].text!r}")
         if frame.leading and separator == "&&" and len(words) == 2 and words[0].text == "cd":
-            target = words[1].text
+            target = _literal(words[1]).text
             frame.cwd = target if frame.cwd is None else posixpath.join(frame.cwd, target)
             return
         frame.leading = False
@@ -265,36 +346,46 @@ def _unwrap(words: list[_Word], cwd: str | None, depth: int) -> list[SimpleComma
     # Only an unquoted `NAME=` is an assignment; `"FOO=1" make` runs a program named `FOO=1`.
     while words and (m := _ASSIGNMENT.match(words[0].text)) and _unquoted_through(words[0], m.end()):
         words = words[1:]
-    w = [word.text for word in words]
-    if w[:1] == ["env"]:
-        w.pop(0)
-        while w:
-            if w[0] in ("-i", "-", "--ignore-environment") or _ASSIGNMENT.match(w[0]):
-                w.pop(0)
-            elif w[0] == "-u" and len(w) > 1:
-                del w[:2]
-            elif w[0].startswith(("-u", "--unset=")):
-                w.pop(0)
+    w = list(words)
+
+    def head(k: int = 0) -> str | None:
+        return w[k].text if k < len(w) else None
+
+    def take(k: int) -> None:
+        for word in w[:k]:
+            _literal(word)
+        del w[:k]
+
+    if head() == "env":
+        take(1)
+        while (arg := head()) is not None:
+            if arg in ("-i", "-", "--ignore-environment") or _ASSIGNMENT.match(arg):
+                take(1)
+            elif arg == "-u" and len(w) > 1:
+                take(2)
+            elif arg.startswith(("-u", "--unset=")):
+                take(1)
             else:
                 break
-    if w[:1] == ["time"]:
-        w.pop(0)
-        if w[:1] == ["-p"]:
-            w.pop(0)
-    if w[:1] == ["nohup"]:
-        w.pop(0)
-    if w[:1] == ["sudo"]:
-        w.pop(0)
-        if w[:1] == ["-u"] and len(w) > 1:
-            del w[:2]
-    if w[:2] == ["uv", "run"]:
-        del w[:2]
-    if len(w) > 2 and posixpath.basename(w[0]) in _PYTHONS and w[1] == "-m":
-        return [_simple(w[2:], cwd)]
-    if w[:1] == ["npx"]:
-        w.pop(0)
-    if depth == 0 and len(w) > 2 and posixpath.basename(w[0]) in _SHELLS and w[1] == "-c":
-        inner = _parse(w[2], depth=1)
+    if head() == "time":
+        take(1)
+        if head() == "-p":
+            take(1)
+    if head() == "nohup":
+        take(1)
+    if head() == "sudo":
+        take(1)
+        if head() == "-u" and len(w) > 1:
+            take(2)
+    if head() == "uv" and head(1) == "run":
+        take(2)
+    if len(w) > 2 and _program(w[0]) in _PYTHONS and w[1].text == "-m":
+        take(2)
+        return [_simple(w, cwd)]
+    if head() == "npx":
+        take(1)
+    if depth == 0 and len(w) > 2 and _program(w[0]) in _SHELLS and w[1].text == "-c":
+        inner = _parse(_literal(w[2]).text, depth=1)
         if cwd is None:
             return list(inner)
         return [SimpleCommand(c.program, c.args, posixpath.join(cwd, c.cwd) if c.cwd else cwd) for c in inner]
@@ -303,9 +394,25 @@ def _unwrap(words: list[_Word], cwd: str | None, depth: int) -> list[SimpleComma
     return [_simple(w, cwd)]
 
 
+def _literal(word: _Word) -> _Word:
+    if not word.literal:
+        raise Unsupported(f"{word.text!r} holds a variable or glob that decides which program runs")
+    return word
+
+
+def _program(word: _Word) -> str:
+    """The basename of a program word that passes the allowlist."""
+    if word.expanded or not _PROGRAM.fullmatch(word.text):
+        raise Unsupported(f"program word {word.text!r} is not a plain name or path")
+    name = word.text.rsplit("/", 1)[-1]
+    if name in (".", ".."):
+        raise Unsupported(f"program word {word.text!r} names a directory")
+    return name
+
+
 def _unquoted_through(word: _Word, end: int) -> bool:
     return word.quoted_from is None or word.quoted_from >= end
 
 
-def _simple(w: list[str], cwd: str | None) -> SimpleCommand:
-    return SimpleCommand(posixpath.basename(w[0].rstrip("/")) or w[0], tuple(w[1:]), cwd)
+def _simple(w: list[_Word], cwd: str | None) -> SimpleCommand:
+    return SimpleCommand(_program(w[0]), tuple(word.text for word in w[1:]), cwd)
