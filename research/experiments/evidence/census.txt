@@ -1,0 +1,7 @@
+# census 2026-10-29T20:09:02Z
+claude transcripts total:      485
+claude transcripts modified in last 30d:      474
+codex rollouts total:      300
+codex rollouts modified in last 30d:      300
+claude --version: 2.1.299 (Claude Code)
+codex --version: codex-cli 0.162.1

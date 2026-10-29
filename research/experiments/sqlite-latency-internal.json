@@ -1,0 +1,17 @@
+{
+ "dir": "/private/var/folders/v8/1mr782dx0jq56zydtc1jfsxr0000gn/T/remy-conv-c83971fa2e1906a4/sqlite-probe",
+ "lessons": 1000,
+ "idle": {
+  "p50_ms": 23.1,
+  "p95_ms": 24.6,
+  "p99_ms": 38.1,
+  "max_ms": 42.7
+ },
+ "with_16_writers": {
+  "p50_ms": 23.9,
+  "p95_ms": 25.0,
+  "p99_ms": 25.9,
+  "max_ms": 32.2
+ },
+ "hit_rows_written": 100192
+}

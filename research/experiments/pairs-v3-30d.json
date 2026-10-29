@@ -1,0 +1,75 @@
+{
+ "window_days": 30,
+ "sessions_in_window": 248,
+ "pair_signatures_recurring": 16,
+ "pair_repeats_after_first": 23,
+ "reachable_under_adr0004_second_sighting_plus_2h": 6,
+ "reachable_if_shared_after_first_sighting_plus_2h": 20,
+ "pairs_by_tool": [
+  [
+   "Bash:cd",
+   219
+  ],
+  [
+   "Workflow",
+   22
+  ],
+  [
+   "mcp__Claude_Code_iOS_Simulator__control",
+   22
+  ],
+  [
+   "Bash:git",
+   21
+  ],
+  [
+   "Read",
+   17
+  ],
+  [
+   "Bash:cat",
+   16
+  ],
+  [
+   "Agent",
+   12
+  ],
+  [
+   "Bash:grep",
+   7
+  ],
+  [
+   "mcp__ccd_turn__update_plan",
+   6
+  ],
+  [
+   "Bash:sleep",
+   5
+  ],
+  [
+   "Bash:gh",
+   5
+  ],
+  [
+   "Bash:ls",
+   4
+  ]
+ ],
+ "top": [
+  "5 sessions: Working directory \"<vol><path>\" was deleted; shell cwd recovered to \"<path>\". Re-issue you",
+  "5 sessions: No simulator with UDID <uuid>. Pass a real device, or omit 'device' to use the attached or",
+  "3 sessions: Working directory \"<vol><path>\" was deleted; shell cwd recovered to \"<path>\". Re-issue you",
+  "2 sessions: screenshot failed: mainScreenSurfaceNotFound(description: \"Could not find the Main Screen ",
+  "2 sessions: pdftoppm is not installed. Install poppler-utils (e.g. `brew install poppler` or `apt-get ",
+  "2 sessions: origin https:/<path> (fetch)",
+  "2 sessions: items also needs \"scope\": \"first_task\", \"continuation\" or \"new_task\" \u2014 what this request i",
+  "2 sessions: fatal: Needed a single revision",
+  "2 sessions: diff --git a<path> b<path>",
+  "2 sessions: Working directory \"<vol><path>\" no longer exists, so shell commands cannot run until it is",
+  "2 sessions: Unknown JSON field: \"authorAssociation\"",
+  "2 sessions: Tool permission request failed: AbortError: Tool permission stream closed before response ",
+  "2 sessions: Tool permission request failed: AbortError: Tool permission stream closed before response ",
+  "2 sessions: AReaL",
+  "2 sessions: ### Opening a PR"
+ ]
+}

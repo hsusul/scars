@@ -1,0 +1,75 @@
+[
+ {
+  "writer_files": 0,
+  "events": 0,
+  "python": {
+   "p50_ms": 20.0,
+   "p95_ms": 20.8,
+   "max_ms": 20.9
+  },
+  "python_-S_-E": {
+   "p50_ms": 19.5,
+   "p95_ms": 20.3,
+   "max_ms": 20.4
+  }
+ },
+ {
+  "writer_files": 50,
+  "events": 200,
+  "python": {
+   "p50_ms": 22.5,
+   "p95_ms": 23.8,
+   "max_ms": 27.8
+  },
+  "python_-S_-E": {
+   "p50_ms": 21.6,
+   "p95_ms": 22.4,
+   "max_ms": 22.5
+  }
+ },
+ {
+  "writer_files": 500,
+  "events": 2000,
+  "python": {
+   "p50_ms": 34.3,
+   "p95_ms": 42.1,
+   "max_ms": 50.6
+  },
+  "python_-S_-E": {
+   "p50_ms": 34.2,
+   "p95_ms": 39.4,
+   "max_ms": 41.5
+  }
+ },
+ {
+  "writer_files": 2000,
+  "events": 8000,
+  "python": {
+   "p50_ms": 82.2,
+   "p95_ms": 108.8,
+   "max_ms": 115.5
+  },
+  "python_-S_-E": {
+   "p50_ms": 79.7,
+   "p95_ms": 86.9,
+   "max_ms": 91.8
+  }
+ },
+ {
+  "writer_files": 5000,
+  "events": 20000,
+  "python": {
+   "p50_ms": 171.6,
+   "p95_ms": 180.2,
+   "max_ms": 180.9
+  },
+  "python_-S_-E": {
+   "p50_ms": 177.2,
+   "p95_ms": 188.0,
+   "max_ms": 188.5
+  }
+ },
+ {
+  "baseline_spawn_true_p50_ms": 1.8
+ }
+]

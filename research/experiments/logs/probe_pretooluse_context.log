@@ -1,0 +1,5 @@
+Failed to authenticate: OAuth session expired and could not be refreshed
+SessionEnd hook [http://127.0.0.1:8737/agents/hooks/claude/event?managed_by=headroom&version=3] failed: connect ECONNREFUSED 127.0.0.1:8737
+
+RESULT: canary not seen
+probe dir: /var/folders/v8/1mr782dx0jq56zydtc1jfsxr0000gn/T/tmp.CtsigMJ1ol
