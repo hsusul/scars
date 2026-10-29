@@ -7,9 +7,10 @@ so a hostile spec cannot cause catastrophic backtracking.
 import bisect
 import fnmatch
 import functools
+import posixpath
 import re
 import time
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 
 from scars.model import (
@@ -59,18 +60,38 @@ class AnyArgs:
 
 
 ArgToken = ExactArg | PrefixArg | OneArg | AnyArgs
+_Fixed = ExactArg | PrefixArg | OneArg
+
+_DOUBLE_DASH = "--"
 
 
 @dataclass(frozen=True)
 class CommandPattern:
     """A `command` spec, matched against one simple command.
 
-    The first spec token is the program (exact, or a prefix when it ends in `*`). `!FLAG` tokens require
-    that FLAG is absent from every argument position. The other tokens must match one contiguous run of
-    arguments, in order, starting anywhere: `xcodebuild -scheme *` matches
-    `xcodebuild -workspace W -scheme X -sdk Y`. Gaps between tokens are allowed only through `**`:
-    `git commit --amend` does not match `git commit -m x --amend`, and `git commit ** --amend` does.
-    With no argument tokens, any arguments match.
+    Grammar, with tokens split on spaces:
+
+    - The first token is the program, compared with the command's basename: exact, or a prefix when it
+      ends in `*`.
+    - `!FLAG` requires that FLAG is not one of the arguments before the command's first `--`.
+    - Every other token is an argument token: `*` matches exactly one argument, `**` matches any run of
+      arguments including none, a token ending in `*` matches one argument with that prefix, and any
+      other token matches one argument with exactly that text.
+    - Argument tokens are anchored at the first argument and matched in order, one argument each, with
+      no gaps. Only `**` skips a run and `*` skips one. Arguments after the last token are free. So
+      `git push --force` matches `git push --force origin` but not `git log push --force` or
+      `git -C x push --force`, which needs `git ** push --force`. `xcodebuild -scheme *` does not match
+      `xcodebuild -workspace W -scheme X`, which needs `xcodebuild ** -scheme *`.
+    - The command's first `--` ends its options. An exact or prefix token matches an argument after it
+      only when the pattern has its own `--` token earlier, and a pattern `--` token matches only the
+      command's first `--`. So `git push --force` never matches `git log -- push --force`, while
+      `git checkout -- *` matches `git checkout -- a.txt`. `*` and `**` may match any argument.
+    - With no argument tokens, any arguments match.
+
+    The shell decides some arguments at run time (a variable, a glob, a `~`). Such an argument may become
+    no words, several words, or `--`, so it and every argument after it are unknown. No token except
+    `**` and the free tail can match them, and a `!FLAG` check fails, so the pattern does not match,
+    unless a known `--` comes before the first unknown argument.
     """
 
     program: ExactArg | PrefixArg
@@ -87,20 +108,28 @@ class CommandPattern:
         return frozenset(t.text for t in self.args if isinstance(t, PrefixArg))
 
     @functools.cached_property
-    def runs(self) -> tuple[tuple[ExactArg | PrefixArg | OneArg, ...], ...]:
-        """Argument tokens split on `**` into fixed-length runs.
+    def anchored(self) -> bool:
+        return not (self.args and isinstance(self.args[0], AnyArgs))
 
-        Both ends are open, so matching each run at its leftmost position after the previous run is
-        exact: an earlier placement never leaves less room for the runs that follow.
+    @functools.cached_property
+    def runs(self) -> tuple[tuple[tuple[_Fixed, bool], ...], ...]:
+        """Argument tokens split on `**` into fixed-length runs of (token, after a pattern `--`).
+
+        Matching each run after the first at its leftmost allowed position is exact: whether a token may
+        sit at a position depends only on that position, so an earlier placement never leaves less room
+        for the runs that follow.
         """
-        runs: list[tuple[ExactArg | PrefixArg | OneArg, ...]] = []
-        current: list[ExactArg | PrefixArg | OneArg] = []
+        runs: list[tuple[tuple[_Fixed, bool], ...]] = []
+        current: list[tuple[_Fixed, bool]] = []
+        after_dash = False
         for token in self.args:
             if isinstance(token, AnyArgs):
                 runs.append(tuple(current))
                 current = []
-            else:
-                current.append(token)
+                continue
+            current.append((token, after_dash))
+            if token == ExactArg(_DOUBLE_DASH):
+                after_dash = True
         runs.append(tuple(current))
         return tuple(run for run in runs if run)
 
@@ -202,52 +231,73 @@ def _parse_path_spec(spec: str) -> PathPattern:
     return PathPattern(tuple(s.lower() for s in segments))
 
 
-def _arg_matches(token: ExactArg | PrefixArg | OneArg, arg: str) -> bool:
-    match token:
-        case ExactArg(text):
-            return arg == text
-        case PrefixArg(text):
-            return arg.startswith(text)
-        case OneArg():
-            return True
-
-
 @dataclass(frozen=True)
 class _Indexed:
-    """A simple command plus lookups built once per parse and shared by every lesson."""
+    """A simple command plus lookups built once per parse and shared by every lesson.
+
+    Only the known arguments, those before the first one the shell expands at run time, are indexed.
+    """
 
     command: SimpleCommand
+    known: tuple[str, ...]
     positions: dict[str, tuple[int, ...]]
     sorted_pairs: tuple[tuple[str, int], ...]
+    dash: int | None
+    """Index of the first `--` among the known arguments, or None."""
+    options_known: bool
+    """Every argument before the command's first `--` is known, so a `!FLAG` check can be decided."""
 
     @classmethod
     def of(cls, command: SimpleCommand) -> "_Indexed":
+        known = command.args[: min(command.uncertain, default=len(command.args))]
         positions: dict[str, list[int]] = {}
-        for i, arg in enumerate(command.args):
+        for i, arg in enumerate(known):
             positions.setdefault(arg, []).append(i)
-        pairs = tuple(sorted((arg, i) for i, arg in enumerate(command.args)))
-        return cls(command, {a: tuple(p) for a, p in positions.items()}, pairs)
-
-    def _prefix_range(self, prefix: str) -> range:
-        lo = bisect.bisect_left(self.sorted_pairs, (prefix,))
-        hi = lo
-        while hi < len(self.sorted_pairs) and self.sorted_pairs[hi][0].startswith(prefix):
-            hi += 1
-        return range(lo, hi)
+        pairs = tuple(sorted((arg, i) for i, arg in enumerate(known)))
+        dash = positions[_DOUBLE_DASH][0] if _DOUBLE_DASH in positions else None
+        options_known = dash is not None or len(known) == len(command.args)
+        return cls(command, known, {a: tuple(p) for a, p in positions.items()}, pairs, dash, options_known)
 
     def has_prefix(self, prefix: str) -> bool:
         lo = bisect.bisect_left(self.sorted_pairs, (prefix,))
         return lo < len(self.sorted_pairs) and self.sorted_pairs[lo][0].startswith(prefix)
 
-    def starts(self, token: ExactArg | PrefixArg | OneArg, start: int) -> Iterable[int]:
-        """Ascending argument positions at or after `start` where `token` matches."""
+    def has_option(self, flag: str) -> bool:
+        end = len(self.known) if self.dash is None else self.dash
+        return any(i < end for i in self.positions.get(flag, ()))
+
+    def starts(self, token: _Fixed, start: int) -> Iterable[int]:
+        """Ascending known positions at or after `start` where `token`'s text matches."""
         match token:
             case ExactArg(text):
                 return (i for i in self.positions.get(text, ()) if i >= start)
             case PrefixArg(text):
-                return sorted(i for k in self._prefix_range(text) if (i := self.sorted_pairs[k][1]) >= start)
+                lo = bisect.bisect_left(self.sorted_pairs, (text,))
+                found: list[int] = []
+                for arg, i in self.sorted_pairs[lo:]:
+                    if not arg.startswith(text):
+                        break
+                    if i >= start:
+                        found.append(i)
+                return sorted(found)
             case OneArg():
-                return range(start, len(self.command.args))
+                return range(start, len(self.known))
+
+    def fits(self, token: _Fixed, after_dash: bool, i: int) -> bool:
+        """Whether `token` may match the known argument at `i`, by text and by its side of `--`."""
+        arg = self.known[i]
+        match token:
+            case OneArg():
+                return True
+            case ExactArg(text) if text == _DOUBLE_DASH and not after_dash:
+                return i == self.dash
+            case ExactArg(text):
+                text_ok = arg == text
+            case PrefixArg(text):
+                text_ok = arg.startswith(text)
+        if after_dash:
+            return text_ok and self.dash is not None and i > self.dash
+        return text_ok and (self.dash is None or i < self.dash)
 
 
 def command_matches(pattern: CommandPattern, command: SimpleCommand) -> bool:
@@ -255,33 +305,49 @@ def command_matches(pattern: CommandPattern, command: SimpleCommand) -> bool:
 
 
 def _command_matches(pattern: CommandPattern, indexed: _Indexed) -> bool:
-    command = indexed.command
-    if not _arg_matches(pattern.program, command.program):
+    if not _name_matches(pattern.program, indexed.command.program):
         return False
-    if any(flag in indexed.positions for flag in pattern.absent):
+    if pattern.absent and not indexed.options_known:
+        return False
+    if any(indexed.has_option(flag) for flag in pattern.absent):
         return False
     if not all(text in indexed.positions for text in pattern.literals):
         return False
     if not all(indexed.has_prefix(prefix) for prefix in pattern.prefixes):
         return False
     position = 0
-    for run in pattern.runs:
-        found = _find_run(run, indexed, position)
+    for k, run in enumerate(pattern.runs):
+        if k == 0 and pattern.anchored:
+            found = 0 if _run_fits(run, indexed, 0) else None
+        else:
+            found = _find_run(run, indexed, position)
         if found is None:
             return False
         position = found + len(run)
     return True
 
 
-def _find_run(run: tuple[ExactArg | PrefixArg | OneArg, ...], indexed: _Indexed, start: int) -> int | None:
+def _name_matches(token: ExactArg | PrefixArg, program: str) -> bool:
+    match token:
+        case ExactArg(text):
+            return program == text
+        case PrefixArg(text):
+            return program.startswith(text)
+
+
+def _run_fits(run: tuple[tuple[_Fixed, bool], ...], indexed: _Indexed, i: int) -> bool:
+    if i + len(run) > len(indexed.known):
+        return False
+    return all(indexed.fits(token, after, i + j) for j, (token, after) in enumerate(run))
+
+
+def _find_run(run: tuple[tuple[_Fixed, bool], ...], indexed: _Indexed, start: int) -> int | None:
     """Leftmost position at or after `start` where the whole run matches."""
-    args = indexed.command.args
-    last = len(args) - len(run)
-    head, rest = run[0], run[1:]
-    for i in indexed.starts(head, start):
+    last = len(indexed.known) - len(run)
+    for i in indexed.starts(run[0][0], start):
         if i > last:
             return None
-        if all(_arg_matches(token, args[i + 1 + j]) for j, token in enumerate(rest)):
+        if _run_fits(run, indexed, i):
             return i
     return None
 
@@ -327,9 +393,13 @@ def _parsed(command: str) -> tuple[_Indexed, ...] | None:
         return None
 
 
-def _any_command(pattern: CommandPattern, command: str | None) -> bool:
+def _matching_commands(pattern: CommandPattern, command: str | None) -> tuple[_Indexed, ...]:
     commands = _parsed(command) if command is not None else None
-    return commands is not None and any(_command_matches(pattern, c) for c in commands)
+    return tuple(c for c in commands or () if _command_matches(pattern, c))
+
+
+def _any_command(pattern: CommandPattern, command: str | None) -> bool:
+    return bool(_matching_commands(pattern, command))
 
 
 def repo_relative(path: str, cwd: str, repo_root: str | None) -> str | None:
@@ -512,13 +582,16 @@ def select(
     event: HookEvent,
     context: MatchContext | None = None,
     *,
+    scores: Mapping[LessonId, float] | None = None,
     shown: Collection[tuple[LessonId, str]] = frozenset(),
     deadline_ms: int = 50,
     clock: Callable[[], float] = time.monotonic,
 ) -> Selection:
     """Eligible lessons for the event's stage, best first, capped by count, under a wall-clock deadline.
 
-    Order: promoted before provisional before candidate, then more `sessions_seen`, then lesson id.
+    Order: higher score first, then promoted before provisional before candidate, then lesson id. With a
+    `scores` mapping, a lesson's score is its entry, or 0 when it has none; without one, it is
+    `sessions_seen`. A path-scoped lesson is admitted only where its glob applies, as `_located` says.
     Only triggers whose `stage` equals the event's stage are evaluated. A trigger with a malformed spec
     is skipped, so one bad row cannot silence every other lesson.
 
@@ -533,10 +606,14 @@ def select(
     paths = event_paths(event)
     limit = clock() + deadline_ms / 1000
     chosen: list[Selected] = []
-    ranked = sorted(lessons, key=lambda le: (_STATUS_RANK.get(le.status, 3), -le.sessions_seen, le.id))
-    for lesson in ranked:
-        if _eligible(rule, lesson, event, paths, ctx):
-            hit = _fire(rule, lesson, event, ctx, seen)
+
+    def rank(le: Lesson) -> tuple[float, int, str]:
+        score = float(le.sessions_seen) if scores is None else scores.get(le.id, 0.0)
+        return (-score, _STATUS_RANK.get(le.status, 3), le.id)
+
+    for lesson in sorted(lessons, key=rank):
+        if _eligible(rule, lesson, event, ctx):
+            hit = _fire(rule, lesson, event, paths, ctx, seen)
             if hit is not None:
                 chosen.append(hit)
         if clock() > limit:
@@ -546,27 +623,58 @@ def select(
     return Selection(tuple(chosen), False)
 
 
-def _in_scope(scope: Scope, event: HookEvent, paths: tuple[str, ...], ctx: MatchContext) -> bool:
+def _in_scope(scope: Scope, event: HookEvent, ctx: MatchContext) -> bool:
+    """The scope check that needs no trigger. A path scope also needs a location, checked by `_located`."""
     match scope:
         case MachineScope():
             return True
         case RepoScope(repo_id=repo_id):
             return ctx.repo_id is not None and repo_id == ctx.repo_id
-        case PathScope(repo_id=repo_id, glob=glob):
-            if ctx.repo_id is None or repo_id != ctx.repo_id or not paths:
-                return False
-            try:
-                pattern = parse_spec(TriggerKind.PATH, glob)
-            except InvalidTrigger:
-                return False
-            return isinstance(pattern, PathPattern) and _any_path(pattern, paths, event.cwd, ctx.repo_root)
+        case PathScope(repo_id=repo_id):
+            return ctx.repo_root is not None and ctx.repo_id is not None and repo_id == ctx.repo_id
         case SessionScope(session_id=session_id):
             return session_id == event.session_id
 
 
-def _eligible(
-    rule: StageRule, lesson: Lesson, event: HookEvent, paths: tuple[str, ...], ctx: MatchContext
+def _located(
+    scope: Scope, trigger: Trigger | None, event: HookEvent, paths: tuple[str, ...], ctx: MatchContext
 ) -> bool:
+    """Whether a path-scoped lesson applies where this event happens. Other scopes always pass.
+
+    The candidate locations are the event's paths, the working directory of each simple command the
+    trigger matched (for a command trigger, when the parser knows it), and the session cwd. Each is
+    resolved against the session cwd, made relative to the repo root, and admits the lesson when it
+    matches the scope glob. A relative location with no absolute session cwd, a location outside the
+    repo or at its root, and a missing repo root admit nothing.
+    """
+    if not isinstance(scope, PathScope):
+        return True
+    root = ctx.repo_root
+    if root is None:
+        return False
+    try:
+        pattern = parse_spec(TriggerKind.PATH, scope.glob)
+    except InvalidTrigger:
+        return False
+    assert isinstance(pattern, PathPattern)
+    locations = [*paths, event.cwd]
+    if trigger is not None and trigger.kind is TriggerKind.COMMAND:
+        command = parse_spec(trigger.kind, trigger.spec)
+        assert isinstance(command, CommandPattern)
+        for c in _matching_commands(command, event.command):
+            if c.command.cwd_known:
+                locations.append(posixpath.join(event.cwd, c.command.cwd or ""))
+    for location in locations:
+        full = location if location.startswith("/") else None
+        if full is None and event.cwd.startswith("/"):
+            full = posixpath.join(event.cwd, location)
+        rel = repo_relative(full, "", root) if full is not None else None
+        if rel is not None and path_matches(pattern, rel):
+            return True
+    return False
+
+
+def _eligible(rule: StageRule, lesson: Lesson, event: HookEvent, ctx: MatchContext) -> bool:
     session_candidate = rule.session_candidates and lesson.status is Status.CANDIDATE
     session_candidate = session_candidate and isinstance(lesson.scope, SessionScope)
     return (
@@ -574,7 +682,7 @@ def _eligible(
         and (not rule.pinned_only or lesson.pinned)
         and (rule.level is None or lesson.level is rule.level)
         and lesson.scope.kind in rule.scope_kinds
-        and _in_scope(lesson.scope, event, paths, ctx)
+        and _in_scope(lesson.scope, event, ctx)
     )
 
 
@@ -582,12 +690,15 @@ def _fire(
     rule: StageRule,
     lesson: Lesson,
     event: HookEvent,
+    paths: tuple[str, ...],
     ctx: MatchContext,
     seen: Collection[tuple[LessonId, str]],
 ) -> Selected | None:
-    """The first trigger that fires and has not been shown, as a selection, or None."""
+    """The first trigger that fires, has not been shown, and leaves the lesson in scope, or None."""
     if rule.trigger_kinds is None:
-        return None if (lesson.id, PLAN_START_KEY) in seen else Selected(lesson, None, PLAN_START_KEY)
+        if (lesson.id, PLAN_START_KEY) in seen or not _located(lesson.scope, None, event, paths, ctx):
+            return None
+        return Selected(lesson, None, PLAN_START_KEY)
     for trigger in lesson.triggers:
         if trigger.kind not in rule.trigger_kinds or trigger.stage is not rule.stage:
             continue
@@ -595,10 +706,11 @@ def _fire(
         if (lesson.id, key) in seen:
             continue
         try:
-            if matches(trigger, event, ctx):
-                return Selected(lesson, trigger, key)
+            fired = matches(trigger, event, ctx)
         except InvalidTrigger:
             continue
+        if fired and _located(lesson.scope, trigger, event, paths, ctx):
+            return Selected(lesson, trigger, key)
     return None
 
 
@@ -660,6 +772,11 @@ class Precision:
         return self.matched_failing >= 3 and 100 * self.matched_passing < (
             self.matched_failing + self.matched_passing
         )
+
+    @property
+    def warns_broad(self) -> bool:
+        """`scars add` warns that the trigger is broad: it matched more than 5% of all calls."""
+        return self.total > 0 and 100 * self.matched > 5 * self.total
 
 
 def precision(

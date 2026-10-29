@@ -6,8 +6,8 @@ import pytest
 from scars.shell import SimpleCommand, Unsupported, parse
 
 
-def cmd(program, *args, cwd=None):
-    return SimpleCommand(program, tuple(args), cwd)
+def cmd(program, *args, cwd=None, uncertain=(), cwd_known=True):
+    return SimpleCommand(program, tuple(args), cwd, frozenset(uncertain), cwd_known)
 
 
 @pytest.mark.parametrize(
@@ -34,7 +34,7 @@ def cmd(program, *args, cwd=None):
         ("FOO=1 env -u X time nohup sudo uv run python3 -m pytest -q", (cmd("pytest", "-q"),)),
         ("cd a && cd b && make", (cmd("make", cwd="a/b"),)),
         ("cd a && bash -c 'cd b && make'", (cmd("make", cwd="a/b"),)),
-        ("make && cd x && make", (cmd("make"), cmd("cd", "x"), cmd("make"))),
+        ("make && cd x && make", (cmd("make"), cmd("cd", "x"), cmd("make", cwd_known=False))),
         ("cd x", (cmd("cd", "x"),)),
         ("(cd x) && make", (cmd("cd", "x"), cmd("make"))),
         ("git log --format=#%h # trailing comment", (cmd("git", "log", "--format=#%h"),)),
@@ -200,11 +200,11 @@ def test_parse_rejects_round_two_findings(command):
         ("time nohup xcodebuild", (cmd("xcodebuild"),)),
         ("~/bin/xcodebuild", (cmd("xcodebuild"),)),
         ("./scripts/build.sh -v", (cmd("build.sh", "-v"),)),
-        ("echo $HOME; xcodebuild", (cmd("echo", "$HOME"), cmd("xcodebuild"))),
-        ('echo "$HOME/x"', (cmd("echo", "$HOME/x"),)),
+        ("echo $HOME; xcodebuild", (cmd("echo", "$HOME", uncertain={0}), cmd("xcodebuild"))),
+        ('echo "$HOME/x"', (cmd("echo", "$HOME/x", uncertain={0}),)),
         ("FOO=$BAR xcodebuild", (cmd("xcodebuild"),)),
         ('"xcodebuild" -list', (cmd("xcodebuild", "-list"),)),
-        ("bash -c 'echo $X; xcodebuild'", (cmd("echo", "$X"), cmd("xcodebuild"))),
+        ("bash -c 'echo $X; xcodebuild'", (cmd("echo", "$X", uncertain={0}), cmd("xcodebuild"))),
         (
             "find . -name '*.swift' -exec rm {} \\;",
             (cmd("find", ".", "-name", "*.swift", "-exec", "rm", "{}", ";"),),
@@ -212,7 +212,7 @@ def test_parse_rejects_round_two_findings(command):
         ("git rebase HEAD@{1}", (cmd("git", "rebase", "HEAD@{1}"),)),
         ("echo '{a,b}' \"{1..3}\"", (cmd("echo", "{a,b}", "{1..3}"),)),
         ('curl -d "{\\"a\\":1,\\"b\\":2}" x', (cmd("curl", "-d", '{"a":1,"b":2}', "x"),)),
-        ("ls *.txt", (cmd("ls", "*.txt"),)),
+        ("ls *.txt", (cmd("ls", "*.txt", uncertain={0}),)),
         ("printf 'tab\there'", (cmd("printf", "tab\there"),)),
     ],
 )
@@ -359,3 +359,117 @@ def test_parse_returns_commands_or_raises_unsupported_for_random_input():
 def test_parse_accepts_exactly_4_kb():
     command = "echo " + "x" * 4091
     assert parse(command) == (cmd("echo", "x" * 4091),)
+
+
+# Arguments whose value the shell decides at run time
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "uncertain"),
+    [
+        ("xcodebuild $FLAGS", ("$FLAGS",), {0}),
+        ('xcodebuild "$FLAGS"', ("$FLAGS",), {0}),
+        ("xcodebuild -x a$B", ("-x", "a$B"), {1}),
+        ("rm *.o", ("*.o",), {0}),
+        ("rm a?c", ("a?c",), {0}),
+        ("rm -r[f] x", ("-r[f]", "x"), {0}),
+        ("cat ~/x", ("~/x",), {0}),
+        ("cp a --to=~/x", ("a", "--to=~/x"), {1}),
+        ("echo '$X' '*' \\~ \"*\"", ("$X", "*", "~", "*"), set()),
+        ("git push --force", ("push", "--force"), set()),
+    ],
+)
+def test_parse_flags_arguments_the_shell_expands(command, args, uncertain):
+    (simple,) = parse(command)
+    assert (simple.args, set(simple.uncertain)) == (args, uncertain)
+
+
+def test_bash_c_keeps_the_uncertain_flags_of_the_inner_script():
+    (simple,) = parse("cd ios && bash -c 'xcodebuild $FLAGS'")
+    assert (simple.program, simple.args, simple.cwd, simple.uncertain) == (
+        "xcodebuild",
+        ("$FLAGS",),
+        "ios",
+        frozenset({0}),
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("cd ios && make | cat", [("make", "ios", True), ("cat", "ios", True)]),
+        ("cd ios && make; xcodebuild", [("make", "ios", True), ("xcodebuild", "ios", False)]),
+        ("cd ios && make || xcodebuild", [("make", "ios", True), ("xcodebuild", "ios", False)]),
+        ("cd ios && make & xcodebuild", [("make", "ios", True), ("xcodebuild", "ios", False)]),
+        ("cd ios && (a; b); c", [("a", "ios", True), ("b", "ios", True), ("c", "ios", False)]),
+        ("make && cd x && make", [("make", None, True), ("cd", None, True), ("make", None, False)]),
+        ("(cd x; a) && b", [("cd", None, True), ("a", None, False), ("b", None, True)]),
+        ("make; xcodebuild", [("make", None, True), ("xcodebuild", None, True)]),
+    ],
+)
+def test_parse_marks_a_directory_that_depends_on_an_earlier_cd_succeeding(command, expected):
+    assert [(c.program, c.cwd, c.cwd_known) for c in parse(command)] == expected
+
+
+# Redirections
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "xcodebuild 2>&xyz",
+        "xcodebuild <&xyz",
+        "xcodebuild 2>&-x",
+        "xcodebuild 2>&log",
+        "xcodebuild >&1x",
+        "xcodebuild >&'1'",
+        "xcodebuild >&5",
+        "xcodebuild 2>&- 1>&2",
+        "xcodebuild 3<&4",
+        "xcodebuild 10>x",
+        "xcodebuild > $F",
+        'xcodebuild > "$F"',
+        "xcodebuild > *.log",
+        "xcodebuild > ~/log",
+        "xcodebuild {fd}>x",
+        "(xcodebuild) 2>&-",
+        "exec 2>&-; xcodebuild >&2",
+        "xcodebuild;;",
+        "xcodebuild \\",
+        "xcodebuild && # x",
+        "eval 'exec 2>&-'; xcodebuild >&2",
+        "command exec 2>&-; xcodebuild >&2",
+        "eval 'cd ios'; xcodebuild",
+    ],
+)
+def test_parse_rejects_redirections_bash_would_refuse_or_could_refuse(command):
+    with pytest.raises(Unsupported):
+        parse(command)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("make 2>&1", (cmd("make"),)),
+        ("make >&2", (cmd("make"),)),
+        ("make 2>& 1", (cmd("make"),)),
+        ("make 2>&-", (cmd("make"),)),
+        ("make 2<&-", (cmd("make"),)),
+        ("make <&0", (cmd("make"),)),
+        ("make 3>x 1>&3", (cmd("make"),)),
+        ("make 2>&- 2>err 1>&2", (cmd("make"),)),
+        ("make &>log", (cmd("make"),)),
+        ("make &>>log", (cmd("make"),)),
+        ("make >&log", (cmd("make"),)),
+        ("make >|log", (cmd("make"),)),
+        ("make 2>>err <in", (cmd("make"),)),
+        ("make 0<>f", (cmd("make"),)),
+        ("make '>&xyz'", (cmd("make", ">&xyz"),)),
+        ("(make) 2>&1 | cat", (cmd("make"), cmd("cat"))),
+        ("make |& cat", (cmd("make"), cmd("cat"))),
+        ("make # && rm -rf x", (cmd("make"),)),
+        ("make;# x", (cmd("make"),)),
+    ],
+)
+def test_parse_accepts_valid_redirections_and_operators(command, expected):
+    assert parse(command) == expected

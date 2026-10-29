@@ -13,9 +13,30 @@ other control characters, lone surrogates, Unicode line and paragraph separators
 is unsupported, because the shell may read it differently from Python.
 
 Modelled: words with single quotes, double quotes and backslash escapes; plain `$NAME` variables in
-arguments; the separators `&&`, `||`, `;`, `|`, `|&` and `&`; redirections (dropped with their target,
-plus a digit run written directly before a `<` or `>` operator); `#` comments; and plain `( ... )` subshell
-groups that start a command and are followed only by a separator, a redirection, a closing paren or the end.
+arguments; the separators `&&`, `||`, `;`, `|`, `|&` and `&`; redirections (dropped with their target);
+`#` comments at the start of a word; and plain `( ... )` subshell groups that start a command and are
+followed only by a separator, a redirection, a closing paren or the end.
+
+An argument the shell expands at run time is reported in `SimpleCommand.uncertain`: one holding an
+unquoted or double-quoted `$NAME`, an unquoted glob character (`*`, `?`, `[`), or an unquoted `~`. Its
+text is the source text, not the value, and it may expand to no words, several words, or `--`.
+
+Redirections are checked, because bash refuses to run a command whose redirection fails. A redirection
+may carry a descriptor number `N` (one digit, written directly before the operator) and takes one target
+word with no expansion, glob or `~`. The accepted forms are `N>file`, `N>>file`, `N>|file`, `N<file`,
+`N<>file`, `&>file`, `&>>file`, `>&file` (no `N`, and `file` a plain name that does not start with a
+digit or `-`), `N>&M` and `N<&M` (M one unquoted digit naming an open descriptor), and `N>&-` and `N<&-`.
+Descriptors 0, 1 and 2 start open for each simple command and group; file redirections and dups open
+`N`, and `-` closes it. Closing a descriptor on a `( ... )` group is unsupported, since it changes
+what the commands inside may use. Anything else after a redirection operator is unsupported, including
+`2>&xyz`, `>&5` and a `{name}>` descriptor variable. A command named `exec` or `eval` (or run through
+`command` or `builtin`) is unsupported, because it can close descriptors or change the directory of the
+commands after it.
+
+Each simple command also reports whether its working directory is known. After a leading `cd DIR &&`,
+the directory holds for commands joined by `&&`, `|` or `|&`. After a `;`, `||` or `&`, later commands in
+the same group run whether or not the `cd` succeeded, so their directory is unknown. It is also unknown
+after a `cd`, `pushd`, `popd`, `source`, `command` or `builtin` that is reported as a command.
 
 The program word must be a bare name of letters, digits and `._+-`, or a path whose every component is such
 a name, optionally starting with `/` or `~/`. So a variable, a glob, a trailing `/`, an empty component or
@@ -31,6 +52,7 @@ does not start a command, a word after `)`, unbalanced parens, empty groups, and
 command before it or a `&&`, `||` or `|` with no command after it.
 """
 
+import dataclasses
 import posixpath
 import re
 from dataclasses import dataclass
@@ -43,6 +65,11 @@ class SimpleCommand:
     program: str
     args: tuple[str, ...]
     cwd: str | None
+    """The directory set by leading `cd` commands, relative to the session cwd unless absolute."""
+    uncertain: frozenset[int] = frozenset()
+    """Indices into `args` of arguments the shell expands at run time, so their value is unknown."""
+    cwd_known: bool = True
+    """False when the directory depends on whether an earlier `cd` succeeded."""
 
 
 class Unsupported(Exception):
@@ -61,15 +88,17 @@ class _Word:
 
     @property
     def literal(self) -> bool:
-        """The shell passes exactly `text` as one word: no variable and no bare glob character."""
+        """The shell passes exactly `text` as one word: no variable, no bare glob character, no bare `~`."""
         return not self.expanded and not any(
-            b and c in "*?[" for c, b in zip(self.text, self.bare, strict=True)
+            b and c in "*?[~" for c, b in zip(self.text, self.bare, strict=True)
         )
 
 
 @dataclass(frozen=True)
 class _Op:
     text: str
+    fd: int | None = None
+    """The descriptor number written directly before a redirection operator."""
 
 
 _Token = _Word | _Op
@@ -86,6 +115,13 @@ _KEYWORDS = frozenset(
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _VARIABLE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 _DIGITS = re.compile(r"[0-9]+")
+_NAMED_FD = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+_PLAIN_FILE = re.compile(r"[A-Za-z_./][A-Za-z0-9_./+-]*")
+_STANDARD_FDS = frozenset({0, 1, 2})
+_KEEPS_CWD = frozenset({"&&", "|", "|&"})
+_DIRECTORY_CHANGERS = frozenset({"cd", "pushd", "popd", "source", "command", "builtin"})
+_SHELL_STATE = frozenset({"exec", "eval"})
+_RUNS_BUILTIN = frozenset({"command", "builtin"})
 _NAME_PART = r"[A-Za-z0-9._+-]+"
 _PROGRAM = re.compile(rf"(?:/|~/)?(?:{_NAME_PART}/)*{_NAME_PART}")
 _SHELLS = frozenset({"bash", "sh"})
@@ -140,6 +176,11 @@ class _WordBuilder:
 
     def is_fd_number(self) -> bool:
         return self.quoted_from is None and not self.expanded and bool(_DIGITS.fullmatch("".join(self.chars)))
+
+    def is_named_fd(self) -> bool:
+        return (
+            self.quoted_from is None and not self.expanded and bool(_NAMED_FD.fullmatch("".join(self.chars)))
+        )
 
     def build(self) -> _Word:
         bare = tuple(self.bare)
@@ -212,10 +253,16 @@ def _tokenize(command: str) -> list[_Token]:
             op = next(o for o in _OPERATORS if command.startswith(o, i))
             if op in ("<", ">") and command[i + 1 : i + 2] == "(":
                 raise Unsupported("process substitution")
+            fd = None
+            if op[0] in "<>" and word.is_named_fd():
+                raise Unsupported("a {name} descriptor variable before a redirection")
             if op[0] in "<>" and word.is_fd_number():
+                fd = int("".join(word.chars))
+                if fd > 9:
+                    raise Unsupported(f"descriptor {fd} above 9")
                 word = _WordBuilder()
             end_word()
-            tokens.append(_Op(op))
+            tokens.append(_Op(op, fd))
             i += len(op)
         else:
             word.add(ch, bare=True)
@@ -261,9 +308,12 @@ class _Frame:
     """One nesting level: the top level or a `( ... )` group."""
 
     cwd: str | None
+    cwd_known: bool = True
     leading: bool = True
     """No command has run yet in this group, so a `cd DIR &&` here still sets the group's directory."""
     has_command: bool = False
+    moved: bool = False
+    """A leading `cd` in this group set its directory."""
 
 
 class _Grouper:
@@ -278,6 +328,7 @@ class _Grouper:
         """The current command has content: words, a redirection or a closed group."""
         self.closed_group = False
         self.needs_follower = False
+        self.open_fds = set(_STANDARD_FDS)
 
     def run(self, tokens: list[_Token]) -> list[SimpleCommand]:
         i = 0
@@ -288,9 +339,11 @@ class _Grouper:
                         raise Unsupported("a word after a closing paren")
                     self.words.append(word)
                     self.pending = True
-                case _Op(text) if text in _REDIRECTS:
-                    if i + 1 >= len(tokens) or not isinstance(tokens[i + 1], _Word):
+                case _Op(text, fd) if text in _REDIRECTS:
+                    target = tokens[i + 1] if i + 1 < len(tokens) else None
+                    if not isinstance(target, _Word):
                         raise Unsupported("redirection without a target")
+                    self._redirect(text, fd, target)
                     self.pending = True
                     i += 1
                 case _Op("("):
@@ -298,8 +351,9 @@ class _Grouper:
                         raise Unsupported("'(' that does not start a command")
                     outer = self.frames[-1]
                     outer.leading = False
-                    self.frames.append(_Frame(outer.cwd))
+                    self.frames.append(_Frame(outer.cwd, outer.cwd_known))
                     self.needs_follower = False
+                    self.open_fds = set(_STANDARD_FDS)
                 case _Op(")"):
                     if len(self.frames) == 1:
                         raise Unsupported("unbalanced ')'")
@@ -310,6 +364,7 @@ class _Grouper:
                         raise Unsupported("empty group")
                     self.frames[-1].has_command = True
                     self.pending = self.closed_group = True
+                    self.open_fds = set(_STANDARD_FDS)
                 case _Op(text):
                     if not self.pending:
                         raise Unsupported(f"{text!r} with no command before it")
@@ -324,22 +379,61 @@ class _Grouper:
         self._finish(None)
         return self.commands
 
+    def _redirect(self, op: str, fd: int | None, target: _Word) -> None:
+        """Check one redirection against the forms bash runs, tracking which descriptors are open."""
+        if not target.literal:
+            raise Unsupported(f"redirection target {target.text!r} expands at run time")
+        plain = target.quoted_from is None
+        fds = self.open_fds
+        if op in (">&", "<&"):
+            n = fd if fd is not None else (1 if op == ">&" else 0)
+            if plain and target.text == "-":
+                if self.closed_group:
+                    raise Unsupported("closing a descriptor of a group")
+                fds.discard(n)
+            elif plain and len(target.text) == 1 and target.text.isdigit():
+                if int(target.text) not in fds:
+                    raise Unsupported(f"descriptor {target.text} may not be open")
+                fds.add(n)
+            elif op == ">&" and fd is None and plain and _PLAIN_FILE.fullmatch(target.text):
+                fds.update((1, 2))
+            else:
+                raise Unsupported(f"invalid descriptor redirection {op}{target.text!r}")
+        elif op in ("&>", "&>>"):
+            fds.update((1, 2))
+        else:
+            fds.add(fd if fd is not None else (0 if op[0] == "<" else 1))
+
     def _finish(self, separator: str | None) -> None:
         words, self.words = self.words, []
         frame = self.frames[-1]
+        self.open_fds = set(_STANDARD_FDS)
         if self.pending:
             frame.has_command = True
             self.needs_follower = False
-        if not words:
-            return
+        if words:
+            self._emit(words, frame, separator)
+        if frame.moved and separator is not None and separator not in _KEEPS_CWD:
+            frame.cwd_known = False
+
+    def _emit(self, words: list[_Word], frame: _Frame, separator: str | None) -> None:
         if words[0].quoted_from is None and words[0].text in _KEYWORDS:
             raise Unsupported(f"shell keyword {words[0].text!r}")
         if frame.leading and separator == "&&" and len(words) == 2 and words[0].text == "cd":
             target = _literal(words[1]).text
             frame.cwd = target if frame.cwd is None else posixpath.join(frame.cwd, target)
+            frame.moved = True
             return
         frame.leading = False
-        self.commands.extend(_unwrap(words, frame.cwd, self.depth))
+        emitted = _unwrap(words, frame.cwd, self.depth)
+        for c in emitted:
+            if c.program in _SHELL_STATE or (c.program in _RUNS_BUILTIN and _SHELL_STATE & set(c.args)):
+                raise Unsupported(f"{c.program} can change the descriptors or directory of later commands")
+        if not frame.cwd_known:
+            emitted = [dataclasses.replace(c, cwd_known=False) for c in emitted]
+        self.commands.extend(emitted)
+        if any(c.program in _DIRECTORY_CHANGERS for c in emitted):
+            frame.cwd_known = False
 
 
 def _unwrap(words: list[_Word], cwd: str | None, depth: int) -> list[SimpleCommand]:
@@ -388,7 +482,7 @@ def _unwrap(words: list[_Word], cwd: str | None, depth: int) -> list[SimpleComma
         inner = _parse(_literal(w[2]).text, depth=1)
         if cwd is None:
             return list(inner)
-        return [SimpleCommand(c.program, c.args, posixpath.join(cwd, c.cwd) if c.cwd else cwd) for c in inner]
+        return [dataclasses.replace(c, cwd=posixpath.join(cwd, c.cwd) if c.cwd else cwd) for c in inner]
     if not w:
         return []
     return [_simple(w, cwd)]
@@ -396,7 +490,7 @@ def _unwrap(words: list[_Word], cwd: str | None, depth: int) -> list[SimpleComma
 
 def _literal(word: _Word) -> _Word:
     if not word.literal:
-        raise Unsupported(f"{word.text!r} holds a variable or glob that decides which program runs")
+        raise Unsupported(f"{word.text!r} holds a variable, glob or '~' that decides what runs")
     return word
 
 
@@ -415,4 +509,6 @@ def _unquoted_through(word: _Word, end: int) -> bool:
 
 
 def _simple(w: list[_Word], cwd: str | None) -> SimpleCommand:
-    return SimpleCommand(_program(w[0]), tuple(word.text for word in w[1:]), cwd)
+    args = w[1:]
+    uncertain = frozenset(i for i, word in enumerate(args) if not word.literal)
+    return SimpleCommand(_program(w[0]), tuple(word.text for word in args), cwd, uncertain)

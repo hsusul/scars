@@ -3,7 +3,6 @@ import time
 import pytest
 
 from scars.match import (
-    STAGE_RULES,
     AnyArgs,
     CommandPattern,
     ErrorPattern,
@@ -17,6 +16,7 @@ from scars.match import (
     PromptPattern,
     RecordedCall,
     call_matches,
+    command_matches,
     matches,
     parse_spec,
     precision,
@@ -47,6 +47,7 @@ from scars.model import (
     TriggerKind,
     TrustClass,
 )
+from scars.shell import SimpleCommand, Unsupported, parse
 
 ROOT = "/Volumes/990 Pro/OpenSource/app"
 REPO = RepoId("repo-1")
@@ -169,7 +170,8 @@ def test_parse_spec_rejects_invalid_specs(kind, spec, reason):
         ("xcodebuild", "xcrun xcodebuild", False),
         ("xcodebuild", "/usr/bin/xcodebuild -showsdks", True),
         ("xcodebuild -scheme *", "xcodebuild -scheme App", True),
-        ("xcodebuild -scheme *", "xcodebuild -workspace W -scheme App -sdk ios", True),
+        ("xcodebuild -scheme *", "xcodebuild -workspace W -scheme App -sdk ios", False),
+        ("xcodebuild ** -scheme *", "xcodebuild -workspace W -scheme App -sdk ios", True),
         ("xcodebuild -scheme *", "xcodebuild -scheme", False),
         ("xcodebuild !-showsdks", "xcodebuild -scheme X", True),
         ("xcodebuild !-showsdks", "xcodebuild -showsdks", False),
@@ -186,13 +188,16 @@ def test_parse_spec_rejects_invalid_specs(kind, spec, reason):
         ("pytest -k", "pytest -kx", False),
         ("make * *", "make a", False),
         ("make * *", "make a b", True),
-        ("make * x", "make a b x", True),
+        ("make * x", "make a b x", False),
+        ("make * x", "make a x", True),
+        ("make ** x", "make a b x", True),
         ("make * x", "make x", False),
         ("git a * ** b", "git a x a y b", True),
         ("git a b ** c", "git c a b", False),
         ("make -j* ** --keep", "make --keep -j4", False),
         ("make -j* ** --keep", "make -j4 -s --keep", True),
-        ("make -j* -s", "make -j4 x -j8 -s", True),
+        ("make -j* -s", "make -j4 x -j8 -s", False),
+        ("make ** -j* -s", "make -j4 x -j8 -s", True),
         ("npm test", "cd apps/web && npm test", True),
         ("xcodebuild", "make && bash -c 'xcodebuild -scheme X'", True),
         ("xcodebuild", "echo 'a && xcodebuild'", False),
@@ -367,16 +372,6 @@ def ids(selection):
     return [le.id for le in selection.lessons]
 
 
-def test_stage_table_caps():
-    assert {kind: rule.cap for kind, rule in STAGE_RULES.items()} == {
-        HookEventKind.SESSION_START: None,
-        HookEventKind.COMPACT: None,
-        HookEventKind.PROMPT: 2,
-        HookEventKind.PRE_TOOL: 1,
-        HookEventKind.TOOL_FAILED: 2,
-    }
-
-
 def test_plan_start_selects_promoted_pinned_in_scope_ranked():
     lessons = [
         lesson("L-c", pinned=True, seen=2),
@@ -498,7 +493,8 @@ def test_repair_ranks_promoted_then_provisional_and_admits_this_sessions_candida
     ]
     failed = event(HookEventKind.TOOL_FAILED)
     assert ids(select(lessons, failed, ctx)) == ["L-prov", "L-cand"]
-    assert ids(select([*lessons, lesson("L-prom", err)], failed, ctx)) == ["L-prom", "L-prov"]
+    assert ids(select([*lessons, lesson("L-prom", err, seen=9)], failed, ctx)) == ["L-prom", "L-prov"]
+    assert ids(select([*lessons, lesson("L-prom", err, seen=1)], failed, ctx)) == ["L-prov", "L-prom"]
 
 
 def test_path_scope_glob_must_match_an_event_path():
@@ -512,7 +508,7 @@ def test_path_scope_glob_must_match_an_event_path():
     assert ids(select([scoped], event(paths=(f"{ROOT}/ios/app.py",)), CTX)) == ["L-ios"]
 
 
-def test_path_scope_is_not_eligible_without_event_paths():
+def test_path_scope_is_not_admitted_at_the_repo_root_without_a_path_inside_the_glob():
     gate = lesson("L-gate", cmd_trigger("xcodebuild"), level=Level.BLOCK, scope=PathScope(REPO, "ios/**"))
     assert ids(select([gate], event(command="xcodebuild"), CTX)) == []
     plan = lesson(
@@ -615,9 +611,9 @@ def test_thousand_command_lessons_against_a_4_kb_command_finish_well_inside_the_
     command = command[: 4096 - 20] + " && make"
     assert 4000 < len(command) <= 4096
     # Worst case: every token of every lesson occurs in the command, so the set and prefix pre-checks pass,
-    # but `-arg0` never follows `-argN*`, so each lesson scans all ~600 arguments.
+    # but `-arg0` never follows `-argN*`, so each lesson's `**` scans all ~600 arguments.
     lessons = [
-        lesson(f"L-{i:04}", cmd_trigger(f"xcodebuild -arg{i % 500 + 1}* -arg0 !-no{i}"), level=Level.BLOCK)
+        lesson(f"L-{i:04}", cmd_trigger(f"xcodebuild ** -arg{i % 500 + 1}* -arg0 !-no{i}"), level=Level.BLOCK)
         for i in range(999)
     ]
     # Ranks last, so the scan visits every other lesson before the gate cap stops it.
@@ -755,3 +751,196 @@ def test_keep_pre_trigger_rule(failing, passing, keeps):
 )
 def test_block_rule(failing, passing, allowed):
     assert Precision(failing, passing, failing + passing, 1000).allows_block is allowed
+
+
+@pytest.mark.parametrize(
+    ("matched", "total", "broad"),
+    [(0, 0, False), (5, 100, False), (6, 100, True), (1, 20, False), (1, 19, True), (1, 1, True)],
+)
+def test_broad_trigger_warning_is_above_5_percent_of_all_calls(matched, total, broad):
+    assert Precision(0, 0, matched, total).warns_broad is broad
+
+
+def test_precision_reports_a_broad_trigger_end_to_end():
+    sig = ErrorSignature("boom")
+    hit = call("xcodebuild", ok=True)
+    assert precision(
+        cmd_trigger("xcodebuild"), [hit] + [call("make", ok=True)] * 19, error_signature=sig
+    ) == (Precision(0, 1, 1, 20))
+    assert precision(
+        cmd_trigger("xcodebuild"), [hit] * 2 + [call("make", ok=True)] * 18, error_signature=sig
+    ).warns_broad
+    assert not precision(
+        cmd_trigger("xcodebuild"), [hit] + [call("make", ok=True)] * 19, error_signature=sig
+    ).warns_broad
+    assert precision(cmd_trigger("xcodebuild"), [], error_signature=sig).warns_broad is False
+
+
+# Every matcher entry point agrees
+
+
+def entry_points(spec, command):
+    """What each public matcher says about one command trigger and one shell command."""
+    trigger = cmd_trigger(spec)
+    pattern = parse_spec(TriggerKind.COMMAND, spec)
+    try:
+        simple = parse(command)
+    except Unsupported:
+        simple = ()
+    recorded = RecordedCall(ToolKind.SHELL, command, (), True, None)
+    gate = lesson("L-gate", trigger, level=Level.BLOCK)
+    return {
+        "matches": matches(trigger, event(command=command), CTX),
+        "command_matches": any(command_matches(pattern, c) for c in simple),
+        "call_matches": call_matches(trigger, recorded),
+        "precision": precision(trigger, [recorded], error_signature=ErrorSignature("x")).matched == 1,
+        "select": ids(select([gate], event(command=command), CTX)) == ["L-gate"],
+    }
+
+
+def assert_everywhere(spec, command, expected):
+    assert entry_points(spec, command) == dict.fromkeys(
+        ("matches", "command_matches", "call_matches", "precision", "select"), expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "command", "expected"),
+    [
+        ("git push --force", "git push --force", True),
+        ("git push --force", "git push --force origin", True),
+        ("git push --force", "git log -- push --force", False),
+        ("git push --force", "git log push --force", False),
+        ("git push --force", "git -C x push --force", False),
+        ("git ** push --force", "git -C x push --force", True),
+        ("git ** push --force", "git log -- push --force", False),
+        ("git push * --force", "git push origin --force", True),
+        ("git push * --force", "git push --force", False),
+        ("xcodebuild -scheme *", "xcodebuild -workspace W -scheme X", False),
+        ("xcodebuild ** -scheme *", "xcodebuild -workspace W -scheme X", True),
+        ("xcodebuild -scheme *", "xcodebuild -scheme X -sdk Y", True),
+        ("git checkout -- *", "git checkout -- a.txt", True),
+        ("git checkout * a.txt", "git checkout -- a.txt", False),
+        ("git checkout ** --force", "git checkout -- --force", False),
+        ("git checkout ** -- --force", "git checkout x -- --force", True),
+        ("git checkout ** -- --force", "git checkout -- x -- --force", False),
+        ("rm -- -rf", "rm -- -rf", True),
+        ("rm !-f", "rm -- -f", True),
+        ("rm !-f", "rm -f -- x", False),
+        ("rm !-f", "rm x -f", False),
+        ("make ** --keep", "make --keep", True),
+    ],
+)
+def test_argument_tokens_anchor_at_the_first_argument_and_stop_at_double_dash(spec, command, expected):
+    assert_everywhere(spec, command, expected)
+
+
+@pytest.mark.parametrize(
+    ("spec", "command", "expected"),
+    [
+        ("xcodebuild !-showsdks", "xcodebuild $FLAGS", False),
+        ("xcodebuild !-showsdks", 'xcodebuild "$FLAGS"', False),
+        ("xcodebuild !-showsdks", "xcodebuild -scheme X *", False),
+        ("xcodebuild !-showsdks", "xcodebuild -- $FLAGS", True),
+        ("xcodebuild !-showsdks", "xcodebuild -scheme X", True),
+        ("git push $REMOTE", "git push $REMOTE", False),
+        ("cat ~/x", "cat ~/x", False),
+        ("rm -r*", "rm -r[f] x", False),
+        ("rm -rf *", "rm -rf $DIR", False),
+        ("git ** --force", "git $X --force", False),
+        ("git ** --force", 'git "$X" --force', False),
+        ("git push --force", "git push --force $X", True),
+        ("git push --force **", "git push --force *.txt", True),
+        ("rm *", "rm '*'", True),
+        ("xcodebuild", '"$CC"', False),
+        ("xcodebuild", "$X -scheme", False),
+        ("x*", "x* -a", False),
+    ],
+)
+def test_unresolved_expansions_never_count_as_literal_arguments(spec, command, expected):
+    assert_everywhere(spec, command, expected)
+
+
+def test_command_matches_on_a_hand_built_command_with_uncertain_arguments():
+    pattern = parse_spec(TriggerKind.COMMAND, "xcodebuild !-showsdks")
+    assert command_matches(pattern, SimpleCommand("xcodebuild", ("-scheme", "X"), None)) is True
+    uncertain = SimpleCommand("xcodebuild", ("-scheme", "$S"), None, frozenset({1}))
+    assert command_matches(pattern, uncertain) is False
+
+
+# Path scope admission
+
+
+def ios_gate(trigger=None):
+    return lesson(
+        "L-ios", trigger or cmd_trigger("xcodebuild"), level=Level.BLOCK, scope=PathScope(REPO, "ios/**")
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "paths", "cwd", "context", "admitted"),
+    [
+        ("cd ios && xcodebuild", (), ROOT, CTX, True),
+        ("cd web && xcodebuild", (), ROOT, CTX, False),
+        ("bash -c 'cd ios && xcodebuild'", (), ROOT, CTX, True),
+        ("cd ios && make; xcodebuild", (), ROOT, CTX, False),
+        ("make; cd ios; xcodebuild", (), ROOT, CTX, False),
+        ("xcodebuild", (), f"{ROOT}/ios", CTX, True),
+        ("xcodebuild", (), f"{ROOT}/ios/App", CTX, True),
+        ("xcodebuild", (), f"{ROOT}/web", CTX, False),
+        ("xcodebuild", (), ROOT, CTX, False),
+        ("xcodebuild", (), "", CTX, False),
+        ("xcodebuild", (f"{ROOT}/ios/a.swift",), "/elsewhere", CTX, True),
+        ("xcodebuild", ("a.swift",), f"{ROOT}/ios", CTX, True),
+        ("xcodebuild", ("ios/a.swift",), f"{ROOT}/web", CTX, False),
+        ("xcodebuild", ("ios/a.swift",), "", CTX, False),
+        ("xcodebuild", ("ios/a.swift",), ROOT, MatchContext(repo_id=REPO), False),
+        ("cd ios && xcodebuild", (), ROOT, MatchContext(repo_id=REPO), False),
+        ("xcodebuild", ("ios/a.swift",), ROOT, MatchContext(repo_root=ROOT), False),
+    ],
+)
+def test_path_scope_needs_a_repo_root_and_a_location_inside_the_glob(command, paths, cwd, context, admitted):
+    gate = event(command=command, paths=paths, cwd=cwd)
+    assert ids(select([ios_gate()], gate, context)) == (["L-ios"] if admitted else [])
+
+
+def test_path_scope_uses_the_directory_of_the_command_the_trigger_matched():
+    gate = event(command="cd ios && make", cwd=ROOT)
+    assert ids(select([ios_gate(cmd_trigger("make"))], gate, CTX)) == ["L-ios"]
+    other = event(command="(cd ios && make) ; xcodebuild", cwd=ROOT)
+    assert ids(select([ios_gate()], other, CTX)) == []
+
+
+def test_path_scope_admits_a_plan_lesson_from_the_session_cwd():
+    plan = lesson(
+        "L-plan",
+        Trigger(TriggerKind.PROMPT, "deploy", Stage.PLAN),
+        pinned=True,
+        scope=PathScope(REPO, "ios/**"),
+    )
+    prompt = event(HookEventKind.PROMPT, prompt="deploy now", cwd=f"{ROOT}/ios")
+    assert ids(select([plan], prompt, CTX)) == ["L-plan"]
+    assert ids(select([plan], prompt, MatchContext(repo_id=REPO))) == []
+
+
+# Ranking by score
+
+
+def test_select_ranks_by_score_then_status_then_id():
+    err = Trigger(TriggerKind.ERROR, "boom", Stage.REPAIR)
+    ctx = MatchContext(repo_root=ROOT, repo_id=REPO, error_signature=ErrorSignature("boom"))
+    failed = event(HookEventKind.TOOL_FAILED)
+    lessons = [
+        lesson("L-a", err, seen=9),
+        lesson("L-b", err, seen=1),
+        lesson("L-c", err, seen=1, status=Status.PROVISIONAL),
+        lesson("L-d", err, seen=1),
+    ]
+    assert ids(select(lessons, failed, ctx)) == ["L-a", "L-b"]
+    assert ids(select(lessons, failed, ctx, scores={LessonId("L-d"): 2.0, LessonId("L-a"): 1.0})) == [
+        "L-d",
+        "L-a",
+    ]
+    assert ids(select(lessons, failed, ctx, scores={LessonId("L-c"): 0.5})) == ["L-c", "L-a"]
+    assert ids(select(lessons, failed, ctx, scores={})) == ["L-a", "L-b"]
+    assert ids(select(lessons[1:], failed, ctx, scores={})) == ["L-b", "L-d"]
