@@ -1,6 +1,6 @@
 create table hits (
   seq integer primary key, at real not null,
-  harness text not null, harness_version text, model_id text,   -- model_id may be null and is backfilled by the miner (R05)
+  harness text not null, harness_version text, model_id text,   -- model_id may be null and is backfilled by the miner
   session_id text not null, tool_use_id text, event text not null, stage text,
   lesson_id text, lesson_revision integer, status_at_injection text, trigger_key text,
   outcome text not null check (outcome in ('shown','blocked','no_match','log_only','error')),
@@ -8,12 +8,12 @@ create table hits (
 );
 create index hits_session on hits(session_id, at);
 
-create table outcomes (                        -- delayed outcomes, computed by the miner (R08)
+create table outcomes (                        -- delayed outcomes, computed by the miner
   hit_seq integer primary key,
   outcome text not null check (outcome in ('heeded','ignored_then_failed','fired_unneeded','no_attempt','unknown'))
 );
 
-create table shown (                           -- advisory deduplication only (R07)
+create table shown (                           -- advisory deduplication only
   session_id text not null, context_epoch integer not null, lesson_id text not null, trigger_key text not null,
   primary key (session_id, context_epoch, lesson_id, trigger_key)
 );

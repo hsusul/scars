@@ -45,7 +45,7 @@ create table triggers (
 );
 create index triggers_kind on triggers(kind, stage);
 
-create table observations (                    -- one row per mined failure-then-fix pair (R11)
+create table observations (                    -- one row per mined failure-then-fix pair
   id integer primary key,
   lesson_id text not null references lessons(id),
   harness text not null, session_id text not null, failed_tool_use_id text not null unique,
@@ -68,7 +68,7 @@ create table events (                          -- audit log, read by scars why a
 
 create table miner_offsets (path text primary key, offset integer not null, inode integer not null, mtime real not null);
 create table seen_tool_use (tool_use_id text primary key);   -- copied-history dedupe across batches
-create table pending_failures (                -- failures still waiting for a fix across batch boundaries (R11)
+create table pending_failures (                -- failures still waiting for a fix across batch boundaries
   tool_use_id text primary key, harness text not null, session_id text not null,
   tool text not null, program text, input text not null, error_signature text not null,
   calls_since integer not null default 0, last_call_at real not null
