@@ -406,16 +406,17 @@ PROPOSAL = {
 
 def test_replay_rejects_promoting_a_session_lesson_without_a_scope():
     with pytest.raises(Rejected, match="session"):
-        next_state(next_state(None, EventType.PROPOSED, PROPOSAL), EventType.PROMOTED, {})
+        next_state(next_state(None, EventType.PROPOSED, PROPOSAL, at=T0), EventType.PROMOTED, {}, at=T0)
 
 
 def test_replay_applies_an_edited_scope():
     edited = next_state(
-        next_state(None, EventType.PROPOSED, PROPOSAL),
+        next_state(None, EventType.PROPOSED, PROPOSAL, at=T0),
         EventType.EDITED,
         {"scope": {"kind": "path", "repo_id": "ow", "glob": "src/**"}},
+        at=T0 + 5,
     )
-    assert edited.scope == PathScope(OW, "src/**")
+    assert (edited.scope, edited.created_at, edited.updated_at) == (PathScope(OW, "src/**"), T0, T0 + 5)
 
 
 @pytest.mark.parametrize(
@@ -729,6 +730,220 @@ def test_verify_reports_an_out_of_band_scope_change(db):
         f"{a}: scope_kind is path in lessons but repo from events",
         f"{a}: path_glob is src/** in lessons but None from events",
     ]
+
+
+def timed_history(db):
+    """Four lessons whose timestamps come from observed, edited, promoted and expired events."""
+    a = new(db, fingerprint="a", at=T0)
+    step(db, a, EventType.OBSERVED, at=T0 + 100)
+    step(db, a, EventType.EDITED, {"text": {"avoid": "a", "instead": "b", "reason": "c"}}, at=T0 + 200)
+    step(db, a, EventType.PROMOTED, at=T0 + 300)
+    b = new(db, fingerprint="b", at=T0 + 1)
+    step(db, b, EventType.OBSERVED, at=T0 + 50)
+    step(db, b, EventType.PROVISIONALIZED, at=T0 + 60)
+    step(db, b, EventType.EXPIRED, at=T0 + 70)
+    c = new(db, fingerprint="c", at=T0 + 2)
+    step(db, c, EventType.OBSERVED, at=T0 + 400)
+    step(db, c, EventType.EDITED, {}, at=T0 + 500)
+    d = new(db, fingerprint="d", at=T0 + 3)
+    step(db, d, EventType.PROMOTED, at=T0 + 600)
+    step(db, d, EventType.EDITED, {}, at=T0 + 700)
+    return {"a": a, "b": b, "c": c, "d": d}
+
+
+def times(db, lesson_id):
+    return db.execute(
+        "select status, created_at, updated_at, last_seen_at, expires_at from lessons where id = ?",
+        (lesson_id,),
+    ).fetchone()
+
+
+def test_timestamps_follow_the_events_and_verify_agrees(db):
+    ids = timed_history(db)
+    assert times(db, ids["a"]) == ("promoted", 1000000.0, 1000300.0, 1000100.0, None)
+    assert times(db, ids["b"]) == ("retired", 1000001.0, 1000070.0, 1000050.0, None)
+    assert times(db, ids["c"]) == ("candidate", 1000002.0, 1000500.0, 1000400.0, 2210000.0)
+    # An edit returns a promoted lesson to candidate, expiring 14 days after its last sighting.
+    assert times(db, ids["d"]) == ("candidate", 1000003.0, 1000700.0, 1000003.0, 2209603.0)
+    assert verify(db) == []
+
+
+@pytest.mark.parametrize(
+    ("sql", "problem"),
+    [
+        (
+            "update lessons set expires_at = null where id = :c",
+            "{c}: expires_at is None in lessons but 2210000.0",
+        ),
+        (
+            "update lessons set expires_at = expires_at + 86400 where id = :c",
+            "{c}: expires_at is 2296400.0 in lessons but 2210000.0",
+        ),
+        (
+            "update lessons set expires_at = null where id = :d",
+            "{d}: expires_at is None in lessons but 2209603.0",
+        ),
+        (
+            "update lessons set expires_at = 5e6 where id = :a",
+            "{a}: expires_at is 5000000.0 in lessons but None",
+        ),
+        (
+            "update lessons set expires_at = 5e6 where id = :b",
+            "{b}: expires_at is 5000000.0 in lessons but None",
+        ),
+        (
+            "update lessons set created_at = 0 where id = :a",
+            "{a}: created_at is 0.0 in lessons but 1000000.0",
+        ),
+        (
+            "update lessons set created_at = 0 where id = :c",
+            "{c}: created_at is 0.0 in lessons but 1000002.0",
+        ),
+        (
+            "update lessons set updated_at = 0 where id = :a",
+            "{a}: updated_at is 0.0 in lessons but 1000300.0",
+        ),
+        (
+            "update lessons set updated_at = 0 where id = :b",
+            "{b}: updated_at is 0.0 in lessons but 1000070.0",
+        ),
+        (
+            "update lessons set updated_at = 0 where id = :c",
+            "{c}: updated_at is 0.0 in lessons but 1000500.0",
+        ),
+        (
+            "update lessons set updated_at = 0 where id = :d",
+            "{d}: updated_at is 0.0 in lessons but 1000700.0",
+        ),
+        (
+            "update lessons set last_seen_at = 0 where id = :a",
+            "{a}: last_seen_at is 0.0 in lessons but 1000100.0",
+        ),
+        (
+            "update lessons set last_seen_at = 0 where id = :b",
+            "{b}: last_seen_at is 0.0 in lessons but 1000050.0",
+        ),
+        (
+            "update lessons set last_seen_at = 0 where id = :c",
+            "{c}: last_seen_at is 0.0 in lessons but 1000400.0",
+        ),
+        (
+            "update lessons set last_seen_at = 0 where id = :d",
+            "{d}: last_seen_at is 0.0 in lessons but 1000003.0",
+        ),
+    ],
+)
+def test_verify_reports_a_tampered_timestamp(db, sql, problem):
+    ids = timed_history(db)
+    db.execute(sql, ids)
+    assert verify(db) == [problem.format(**ids) + " from events"]
+
+
+def test_verify_reports_a_payload_edited_to_another_valid_shape_through_the_next_hash(db):
+    run_history(db)
+    # The edit replays to the same state, so only the hash chain can see it.
+    db.execute("""update events set payload = '{"fix_program":"xcodebuild"}' where seq = 2""")
+    assert verify(db) == ["event 3: prev_hash does not extend the chain"]
+
+
+@pytest.mark.parametrize(
+    ("seq", "sql", "reason"),
+    [
+        (1, "update events set payload = 'null' where seq = 1", "payload must be an object, got None"),
+        (1, "update events set payload = '[1,2]' where seq = 1", "payload must be an object, got [1, 2]"),
+        (1, "update events set payload = '5' where seq = 1", "payload must be an object, got 5"),
+        (1, """update events set payload = '"x"' where seq = 1""", "payload must be an object, got 'x'"),
+        (
+            1,
+            "update events set payload = json_remove(payload, '$.fingerprint') where seq = 1",
+            "payload is missing fingerprint",
+        ),
+        (
+            1,
+            "update events set payload = json_set(payload, '$.fingerprint', 5) where seq = 1",
+            "payload fingerprint must be a string, got 5",
+        ),
+        (
+            1,
+            "update events set payload = json_set(payload, '$.text', 'x') where seq = 1",
+            "payload text must be an object, got 'x'",
+        ),
+        (
+            1,
+            "update events set payload = json_set(payload, '$.triggers', json('{}')) where seq = 1",
+            "payload triggers must be a list, got {}",
+        ),
+        (
+            1,
+            "update events set payload = json_set(payload, '$.text.avoid', json('[1]')) where seq = 1",
+            "text avoid must be a string, got [1]",
+        ),
+        (
+            1,
+            "update events set payload = json_set(payload, '$.triggers[0].spec', 7) where seq = 1",
+            "invalid trigger {'kind': 'error', 'spec': 7, 'stage': 'repair'}",
+        ),
+        (
+            3,
+            "update events set payload = json_set(payload, '$.fix_program', 5) where seq = 3",
+            "payload fix_program must be a string, got 5",
+        ),
+        (
+            3,
+            "update events set payload = json_set(payload, '$.bogus', 1) where seq = 3",
+            "payload has unknown key 'bogus'",
+        ),
+        (3, "update events set payload = X'ff' where seq = 3", "payload must be JSON text, got b'\\xff'"),
+        (
+            3,
+            "update events set payload = 'nope' where seq = 3",
+            "payload is not JSON: Expecting value: line 1 column 1 (char 0)",
+        ),
+        (3, "update events set at = 'later' where seq = 3", "at must be a number, got 'later'"),
+    ],
+)
+def test_verify_reports_a_malformed_event_and_keeps_verifying_other_lessons(db, seq, sql, reason):
+    a = new(db, fingerprint="a")
+    b = new(db, fingerprint="b")
+    step(db, a, EventType.OBSERVED, {"fix_program": "xcrun"})
+    step(db, b, EventType.OBSERVED)
+    db.execute(sql)
+    db.execute("update lessons set sessions_seen = 9 where id = ?", (b,))
+    kind = "proposed" if seq == 1 else "observed"
+    assert verify(db) == [
+        f"event {seq}: {a} cannot replay {kind}: {reason}",
+        f"event {seq + 1}: prev_hash does not extend the chain",
+        f"{b}: sessions_seen is 9 in lessons but 2 from events",
+    ]
+
+
+def test_verify_reports_a_non_integer_revision_without_raising(db):
+    a = new(db, fingerprint="a")
+    b = new(db, fingerprint="b")
+    step(db, a, EventType.OBSERVED)
+    db.execute("update events set to_revision = 'two' where seq = 3")
+    db.execute("update lessons set sessions_seen = 9 where id = ?", (b,))
+    assert verify(db) == [
+        f"event 3: {a} revisions 1->two, expected 1->2",
+        f"{b}: sessions_seen is 9 in lessons but 1 from events",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event", "payload", "reason"),
+    [
+        (EventType.OBSERVED, {"bogus": 1}, "payload has unknown key 'bogus'"),
+        (EventType.OBSERVED, {"fix_program": 5}, "payload fix_program must be a string, got 5"),
+        (EventType.LEVEL_SET, {}, "payload is missing level"),
+        (EventType.SUPERSEDED, {"superseded_by": 3}, "payload superseded_by must be a string, got 3"),
+    ],
+)
+def test_apply_event_rejects_a_payload_replay_would_reject(db, event, payload, reason):
+    lesson_id = promoted(db)
+    with pytest.raises(Rejected) as exc:
+        step(db, lesson_id, event, payload)
+    assert str(exc.value) == reason
+    assert get_lesson(db, lesson_id).revision == 2
 
 
 # read snapshots
