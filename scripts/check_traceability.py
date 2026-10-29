@@ -9,6 +9,7 @@ Usage: python3 scripts/check_traceability.py
 
 import pathlib
 import re
+import subprocess
 import sys
 
 MIN_TRACKED = {"C": 30, "R": 26}
@@ -16,6 +17,18 @@ REQUIRED = ["PRD.md", "ARCHITECTURE.md", "THREAT-MODEL.md", "EVAL-PLAN.md", "CRI
 
 root = pathlib.Path(__file__).resolve().parent.parent
 docs = root / "docs"
+tracked_files = set(
+    subprocess.run(
+        ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
+    ).stdout.splitlines()
+)
+
+
+def committed(path: pathlib.Path) -> bool:
+    rel = path.resolve().relative_to(root).as_posix()
+    return rel in tracked_files or any(f.startswith(rel + "/") for f in tracked_files)
+
+
 problems = [f"required doc missing: {name}" for name in REQUIRED if not (docs / name).exists()]
 if problems:
     print("\n".join("FAIL " + p for p in problems))
@@ -53,11 +66,11 @@ for p in [docs / "CRITIQUE.md", *design_docs]:
         if num not in adr_files:
             problems.append(f"{p.name} cites ADR-{num}, which has no file")
     for link in re.findall(r"\]\((?!https?://)([^)#\s]+)", text):
-        if not (p.parent / link).exists():
-            problems.append(f"{p.name} links to missing file {link}")
+        if not committed(p.parent / link):
+            problems.append(f"{p.name} links to a file git does not track: {link}")
     for path in sorted(set(re.findall(r"`(?:\.\./)*(research/[\w./-]+)`", text))):
-        if not (root / path).exists():
-            problems.append(f"{p.name} names missing file {path}")
+        if not committed(root / path):
+            problems.append(f"{p.name} names a file git does not track: {path}")
 
 print(
     f"{len(tracked)} tracked findings, {sum(1 for f in tracked if f in cited)} cited, {len(design_docs)} design docs"
