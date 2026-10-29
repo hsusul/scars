@@ -23,3 +23,10 @@ jobs:
       - run: uv run ruff check
       - run: uv run ruff format --check
       - run: uv run pytest
+
+  no-spec-citations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Code states its rules instead of citing the planning docs
+        run: "! git grep -nP 'ARCHITECTURE|docs/|ADR-|adr/|research/|\\b[CR][0-9]{2}\\b' -- src tests"
