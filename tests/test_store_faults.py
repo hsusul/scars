@@ -1,4 +1,4 @@
-"""Process-level fault tests from ARCHITECTURE "Fault tests" that target lessons.db."""
+"""Process-level fault tests that target lessons.db: racing writers and SIGKILL mid-write."""
 
 import random
 import re

@@ -296,7 +296,7 @@ def next_state(state: State | None, event: EventType, payload: object, *, at: fl
                 if scope.kind == "machine" and state.scope.kind != "machine":
                     raise Rejected("an edit cannot move a lesson into machine scope; promote it instead")
                 new = replace(new, scope=scope)
-            # ADR-0004: a machine-scope lesson cannot be a candidate, so the edit keeps it promoted.
+            # A machine-scope lesson cannot be a candidate, so the edit keeps it promoted.
             if new.scope.kind == "machine":
                 new = replace(new, status=Status.PROMOTED)
         case EventType.SUPERSEDED:
@@ -343,7 +343,7 @@ def _proposed(payload: dict[str, object], at: float) -> State:
 def _columns(state: State) -> dict[str, object]:
     """The `lessons` columns a state determines, as stored. Writes and `verify` share this mapping.
 
-    ADR-0004: candidate and provisional lessons expire 14 days after their last sighting, others never.
+    Candidate and provisional lessons expire 14 days after their last sighting, others never.
     """
     return {
         "revision": state.revision,

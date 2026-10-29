@@ -22,7 +22,7 @@ create table lessons (
   instead text not null check (length(instead) <= 240),
   reason text not null check (length(reason) <= 240),
   trust_class text not null check (trust_class in ('own_code','third_party_repo','web','human')),
-  fingerprint text not null,                   -- see "Miner", step 6
+  fingerprint text not null,                   -- sha256 of scope and error signature, not command text
   sessions_seen integer not null default 1,
   fix_programs text not null default '[]',     -- JSON list of distinct programs used in the passing call
   precision_ok integer not null default 0,     -- 1 when the last scars test passed (cleared on edit)
@@ -58,11 +58,11 @@ create table observations (                    -- one row per mined failure-then
 create table events (                          -- audit log, read by scars why and scars doctor
   seq integer primary key,
   lesson_id text references lessons(id),
-  type text not null,                          -- see "Lifecycle"
+  type text not null,                          -- an EventType value
   actor text not null,                         -- 'human' | 'miner' | 'agent:<harness>:<session>'
   from_revision integer, to_revision integer,
   payload text not null,                       -- canonical JSON of the change
-  prev_hash text not null,                     -- sha256 of the previous row's canonical JSON (ADR-0003)
+  prev_hash text not null,                     -- sha256 of the previous row's canonical JSON
   at real not null
 );
 
