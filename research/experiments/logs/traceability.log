@@ -1,0 +1,58 @@
+57 tracked findings, 57 cited, 10 design docs
+  C01 act on   <- 0001-delivery-stages.md, EVAL-PLAN.md, PRD.md
+  C02 act on   <- 0001-delivery-stages.md, 0005-batch-capture.md, ARCHITECTURE.md, PRD.md
+  C03 act on   <- 0003-promotion-authenticity.md, PRD.md, THREAT-MODEL.md
+  C04 act on   <- ARCHITECTURE.md, PRD.md, THREAT-MODEL.md
+  C05 act on   <- PRD.md
+  C06 act on   <- 0004-trust-tiers.md, PRD.md
+  C07 act on   <- 0002-sqlite-store.md, ARCHITECTURE.md
+  C08 act on   <- 0006-independent-safety-guards.md, ARCHITECTURE.md, PRD.md, THREAT-MODEL.md
+  C09 act on   <- 0006-independent-safety-guards.md, ARCHITECTURE.md, PRD.md
+  C10 act on   <- EVAL-PLAN.md, PRD.md
+  C11 act on   <- EVAL-PLAN.md, PRD.md
+  C12 act on   <- ARCHITECTURE.md, PRD.md, THREAT-MODEL.md
+  C13 act on   <- 0004-trust-tiers.md, ARCHITECTURE.md, PRD.md, THREAT-MODEL.md
+  C14 act on   <- ARCHITECTURE.md, PRD.md, THREAT-MODEL.md
+  C15 act on   <- 0001-delivery-stages.md, PRD.md
+  C16 consider <- ARCHITECTURE.md, EVAL-PLAN.md, PRD.md
+  C17 consider <- 0005-batch-capture.md, ARCHITECTURE.md, PRD.md
+  C18 consider <- ARCHITECTURE.md, PRD.md
+  C19 consider <- ARCHITECTURE.md, PRD.md
+  C20 consider <- ARCHITECTURE.md, PRD.md, THREAT-MODEL.md
+  C21 consider <- 0002-sqlite-store.md, ARCHITECTURE.md
+  C22 consider <- ARCHITECTURE.md, PRD.md
+  C23 consider <- PRD.md
+  C24 consider <- PRD.md
+  C25 consider <- PRD.md
+  C26 consider <- EVAL-PLAN.md, PRD.md
+  C27 consider <- 0002-sqlite-store.md, ARCHITECTURE.md
+  C28 consider <- PRD.md
+  C29 consider <- PRD.md
+  C30 consider <- EVAL-PLAN.md
+  R01 act on   <- 0003-promotion-authenticity.md, THREAT-MODEL.md
+  R02 act on   <- 0002-sqlite-store.md, ARCHITECTURE.md
+  R03 act on   <- 0004-trust-tiers.md, PRD.md
+  R04 act on   <- 0005-batch-capture.md, PRD.md
+  R05 act on   <- 0001-delivery-stages.md, ARCHITECTURE.md
+  R06 act on   <- 0004-trust-tiers.md, ARCHITECTURE.md
+  R07 act on   <- ARCHITECTURE.md, PRD.md
+  R08 act on   <- ARCHITECTURE.md, EVAL-PLAN.md
+  R09 act on   <- ARCHITECTURE.md, PRD.md
+  R10 consider <- 0006-independent-safety-guards.md
+  R11 act on   <- ARCHITECTURE.md, PRD.md
+  R12 act on   <- ARCHITECTURE.md, PRD.md, THREAT-MODEL.md
+  R13 act on   <- EVAL-PLAN.md, PRD.md
+  R14 consider <- ARCHITECTURE.md, PRD.md, THREAT-MODEL.md
+  R15 consider <- 0003-promotion-authenticity.md, PRD.md
+  R16 consider <- ARCHITECTURE.md
+  R17 consider <- ARCHITECTURE.md, PRD.md
+  R18 consider <- PRD.md
+  R19 act on   <- 0002-sqlite-store.md, ARCHITECTURE.md
+  R20 act on   <- ARCHITECTURE.md
+  R21 act on   <- ARCHITECTURE.md
+  R22 act on   <- ARCHITECTURE.md
+  R23 act on   <- ARCHITECTURE.md
+  R24 act on   <- ARCHITECTURE.md
+  R25 act on   <- THREAT-MODEL.md
+  R26 act on   <- EVAL-PLAN.md
+  R27 act on   <- ARCHITECTURE.md, PRD.md

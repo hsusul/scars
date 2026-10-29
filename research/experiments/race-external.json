@@ -1,0 +1,45 @@
+{
+ "dir": "/Volumes/990 Pro/OpenSource/lessons-log-research/experiments/tmp-race",
+ "writers": 16,
+ "records_per_writer": 200,
+ "append": [
+  {
+   "record_bytes": 256,
+   "expected": 3200,
+   "parsed": 3200,
+   "corrupt_lines": 0,
+   "missing": 0,
+   "secs": 0.1
+  },
+  {
+   "record_bytes": 4096,
+   "expected": 3200,
+   "parsed": 3200,
+   "corrupt_lines": 0,
+   "missing": 0,
+   "secs": 0.09
+  },
+  {
+   "record_bytes": 65536,
+   "expected": 320,
+   "parsed": 320,
+   "corrupt_lines": 0,
+   "missing": 0,
+   "secs": 0.09
+  },
+  {
+   "record_bytes": 1048576,
+   "expected": 320,
+   "parsed": 320,
+   "corrupt_lines": 0,
+   "missing": 0,
+   "secs": 0.38
+  }
+ ],
+ "rmw": {
+  "expected": 800,
+  "kept": 15,
+  "file_corrupt": false,
+  "secs": 0.11
+ }
+}
