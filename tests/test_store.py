@@ -1037,6 +1037,26 @@ def test_verify_accepts_a_chain_with_non_ascii_text(db):
     assert verify(db) == []
 
 
+def test_verify_never_hashes_invalid_utf8_like_the_text_it_replaced(db):
+    # Byte FF read as latin-1 is the text it replaced, so the hash must keep invalid bytes distinct.
+    create_lesson(
+        db,
+        text=TEXT,
+        scope=RepoScope(OW),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=[ERR],
+        fingerprint="a",
+        actor="ÿ",
+        at=T0,
+    )
+    new(db, fingerprint="b")
+    db.execute("update events set actor = cast(X'FF' as text) where seq = 1")
+    assert verify(db) == [
+        "events row 1: actor is not valid UTF-8",
+        "event 2: prev_hash does not extend the chain",
+    ]
+
+
 def test_verify_restores_the_callers_text_factory(db):
     two_lessons_with_b_tampered(db)
     db.text_factory = bytes
