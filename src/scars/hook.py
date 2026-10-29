@@ -1,4 +1,4 @@
-"""Entry point for `scars hook <harness> <event>`. See ARCHITECTURE "Hook contract".
+"""Entry point for `scars hook <harness> <event>`.
 
 The hook fails open. Every path returns exit code 0, and stdout carries either nothing or one valid
 JSON object. A fault in scars must never block or slow an agent's tool call.
