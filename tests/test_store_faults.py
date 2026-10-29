@@ -5,7 +5,6 @@ import re
 import signal
 import subprocess
 import sys
-import time
 
 from scars.model import EventType, LessonText, RepoId, RepoScope, Stage, Trigger, TriggerKind, TrustClass
 from scars.store import add_repo, apply_event, connect, create_lesson, get_lesson, init_lessons, verify
@@ -16,6 +15,7 @@ from scars.model import EventType
 from scars.store import Conflict, apply_event, connect
 path, lesson_id, event, go = sys.argv[1:]
 db = connect(pathlib.Path(path))
+print("ready", flush=True)
 while not pathlib.Path(go).exists():
     time.sleep(0.001)
 try:
@@ -80,7 +80,7 @@ def test_two_processes_racing_one_revision_have_exactly_one_winner(tmp_path):
             )
             for event in ("promoted", "retired")
         ]
-        time.sleep(0.3)
+        assert [p.stdout.readline() for p in racers] == ["ready\n", "ready\n"]
         go.touch()
         outcomes = sorted(p.communicate(timeout=30)[0].strip() for p in racers)
         assert outcomes == ["conflict", "won"]

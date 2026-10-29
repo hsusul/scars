@@ -6,7 +6,8 @@ import os
 import secrets
 import sqlite3
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
@@ -106,10 +107,15 @@ def _init(path: Path, schema: str, synchronous: str) -> sqlite3.Connection:
 
 
 def init_lessons(path: Path) -> sqlite3.Connection:
+    """Create lessons.db (mode 0600, parent 0700) with the schema if it is new, and return a connection.
+
+    Safe to call on an existing store: the schema is applied once, under the write lock.
+    """
     return _init(path, "lessons", "FULL")
 
 
 def init_telemetry(path: Path) -> sqlite3.Connection:
+    """Create telemetry.db like `init_lessons`, with `synchronous = NORMAL`: hooks write it best-effort."""
     return _init(path, "telemetry", "NORMAL")
 
 
@@ -123,13 +129,20 @@ class Rejected(Exception):
 
 @dataclass(frozen=True)
 class State:
-    """The lesson fields the event log determines, and that `verify` recomputes."""
+    """Every lesson field the event log determines. `apply_event` writes it and `verify` recomputes it."""
 
     status: Status
     level: Level
     pinned: bool
-    scope_kind: str
+    scope: Scope
     revision: int
+    text: LessonText
+    trust_class: TrustClass
+    triggers: frozenset[Trigger]
+    fingerprint: str
+    sessions_seen: int
+    fix_programs: tuple[str, ...]
+    superseded_by: str | None
 
 
 def _parse_scope(data: object) -> Scope:
@@ -196,18 +209,23 @@ def next_state(state: State | None, event: EventType, payload: dict[str, object]
     if event is EventType.PROPOSED:
         if state is not None:
             raise Rejected("proposed applies only to a new lesson")
-        kind = _parse_scope(payload.get("scope")).kind
-        if kind == "machine":
-            raise Rejected("a machine-scope lesson cannot be a candidate")
-        return State(Status.CANDIDATE, Level.NOTE, False, kind, 1)
+        return _proposed(payload)
     if state is None:
         raise Rejected(f"{event} needs an existing lesson")
     if state.status not in rule.allowed_from:
         raise Rejected(f"{event} is not allowed from {state.status}")
     new = replace(state, status=rule.to or state.status, revision=state.revision + 1)
     match event:
-        case EventType.PROMOTED if "scope" in payload:
-            new = replace(new, scope_kind=_parse_scope(payload["scope"]).kind)
+        case EventType.OBSERVED:
+            new = replace(new, sessions_seen=state.sessions_seen + 1)
+            fix_program = payload.get("fix_program")
+            if isinstance(fix_program, str) and fix_program not in state.fix_programs:
+                new = replace(new, fix_programs=(*state.fix_programs, fix_program))
+        case EventType.PROMOTED:
+            scope = _parse_scope(payload["scope"]) if "scope" in payload else state.scope
+            if scope.kind == "session":
+                raise Rejected("promotion needs repo, path or machine scope, not session scope")
+            new = replace(new, scope=scope)
         case EventType.PINNED:
             new = replace(new, pinned=True)
         case EventType.UNPINNED:
@@ -219,13 +237,77 @@ def next_state(state: State | None, event: EventType, payload: dict[str, object]
                 raise Rejected(f"invalid level {payload.get('level')!r}") from None
         case EventType.EDITED:
             new = replace(new, pinned=False, level=Level.NOTE)
-            if state.scope_kind == "machine":
+            if "text" in payload:
+                new = replace(new, text=_parse_text(payload["text"]))
+            if "triggers" in payload:
+                new = replace(new, triggers=frozenset(_parse_triggers(payload["triggers"])))
+            if "scope" in payload:
+                scope = _parse_scope(payload["scope"])
+                if scope.kind == "machine" and state.scope.kind != "machine":
+                    raise Rejected("an edit cannot move a lesson into machine scope; promote it instead")
+                new = replace(new, scope=scope)
+            # ADR-0004: a machine-scope lesson cannot be a candidate, so the edit keeps it promoted.
+            if new.scope.kind == "machine":
                 new = replace(new, status=Status.PROMOTED)
-        case EventType.SUPERSEDED if not isinstance(payload.get("superseded_by"), str):
-            raise Rejected("superseded needs superseded_by")
+        case EventType.SUPERSEDED:
+            successor = payload.get("superseded_by")
+            if not isinstance(successor, str):
+                raise Rejected("superseded needs superseded_by")
+            new = replace(new, superseded_by=successor)
     if new.status is not Status.PROMOTED:
         new = replace(new, pinned=False, level=Level.NOTE)
     return new
+
+
+def _proposed(payload: dict[str, object]) -> State:
+    scope = _parse_scope(payload.get("scope"))
+    if scope.kind == "machine":
+        raise Rejected("a machine-scope lesson cannot be a candidate")
+    try:
+        trust_class = TrustClass(payload.get("trust_class"))
+    except ValueError:
+        raise Rejected(f"invalid trust_class {payload.get('trust_class')!r}") from None
+    fingerprint = payload.get("fingerprint")
+    if not isinstance(fingerprint, str):
+        raise Rejected(f"invalid fingerprint {fingerprint!r}")
+    fix_program = payload.get("fix_program")
+    return State(
+        status=Status.CANDIDATE,
+        level=Level.NOTE,
+        pinned=False,
+        scope=scope,
+        revision=1,
+        text=_parse_text(payload.get("text")),
+        trust_class=trust_class,
+        triggers=frozenset(_parse_triggers(payload.get("triggers"))),
+        fingerprint=fingerprint,
+        sessions_seen=1,
+        fix_programs=(fix_program,) if isinstance(fix_program, str) and fix_program else (),
+        superseded_by=None,
+    )
+
+
+def _columns(state: State) -> dict[str, object]:
+    """The `lessons` columns a state determines, as stored. Writes and `verify` share this mapping."""
+    return {
+        "revision": state.revision,
+        "status": str(state.status),
+        "level": str(state.level),
+        "pinned": int(state.pinned),
+        **_scope_columns(state.scope),
+        "avoid": state.text.avoid,
+        "instead": state.text.instead,
+        "reason": state.text.reason,
+        "trust_class": str(state.trust_class),
+        "fingerprint": state.fingerprint,
+        "sessions_seen": state.sessions_seen,
+        "fix_programs": _canonical(list(state.fix_programs)),
+        "superseded_by": state.superseded_by,
+    }
+
+
+def _trigger_keys(triggers: Iterable[Trigger]) -> list[tuple[str, str, str]]:
+    return sorted({(str(t.kind), t.spec, str(t.stage)) for t in triggers})
 
 
 def _canonical(value: object) -> str:
@@ -292,8 +374,8 @@ def _parse_text(data: object) -> LessonText:
 def _write_triggers(db: sqlite3.Connection, lesson_id: str, triggers: Iterable[Trigger]) -> None:
     db.execute("delete from triggers where lesson_id = ?", (lesson_id,))
     db.executemany(
-        "insert or ignore into triggers (lesson_id,kind,spec,stage) values (?,?,?,?)",
-        [(lesson_id, str(t.kind), t.spec, str(t.stage)) for t in triggers],
+        "insert into triggers (lesson_id,kind,spec,stage) values (?,?,?,?)",
+        [(lesson_id, *key) for key in _trigger_keys(triggers)],
     )
 
 
@@ -332,42 +414,29 @@ def create_lesson(
         "triggers": [_trigger_json(t) for t in triggers],
         "fingerprint": fingerprint,
     }
+    if fix_program:
+        payload["fix_program"] = fix_program
     state = next_state(None, EventType.PROPOSED, payload)
-    cols = _scope_columns(scope)
+    cols: dict[str, object] = {
+        "id": lesson_id,
+        **_columns(state),
+        "created_at": at,
+        "updated_at": at,
+        "last_seen_at": at,
+        "expires_at": at + EXPIRY_SECONDS,
+    }
     db.execute("begin immediate")
     try:
         try:
             db.execute(
-                "insert into lessons (id,revision,status,level,pinned,scope_kind,repo_id,path_glob,"
-                "session_id,avoid,instead,reason,trust_class,fingerprint,fix_programs,created_at,updated_at,"
-                "last_seen_at,expires_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    lesson_id,
-                    state.revision,
-                    str(state.status),
-                    str(state.level),
-                    int(state.pinned),
-                    cols["scope_kind"],
-                    cols["repo_id"],
-                    cols["path_glob"],
-                    cols["session_id"],
-                    text.avoid,
-                    text.instead,
-                    text.reason,
-                    str(trust_class),
-                    fingerprint,
-                    _canonical([fix_program] if fix_program else []),
-                    at,
-                    at,
-                    at,
-                    at + EXPIRY_SECONDS,
-                ),
+                f"insert into lessons ({','.join(cols)}) values ({','.join('?' * len(cols))})",
+                tuple(cols.values()),
             )
         except sqlite3.IntegrityError as exc:
             if "fingerprint" in str(exc):
                 raise Conflict(f"an active lesson already has fingerprint {fingerprint}") from None
             raise
-        _write_triggers(db, lesson_id, triggers)
+        _write_triggers(db, lesson_id, state.triggers)
         _append_event(
             db,
             lesson_id=lesson_id,
@@ -385,9 +454,51 @@ def create_lesson(
     return lesson_id
 
 
-def _state_of(row: sqlite3.Row) -> State:
+@contextmanager
+def _snapshot(db: sqlite3.Connection) -> Iterator[None]:
+    """Run several reads against one snapshot, so a concurrent commit cannot land between them.
+
+    A caller's open transaction already pins a snapshot, so it is left alone.
+    """
+    if db.in_transaction:
+        yield
+        return
+    db.execute("begin")
+    try:
+        yield
+    finally:
+        _rollback(db)
+
+
+def _triggers_where(db: sqlite3.Connection, where: str, params: Iterable[object]) -> dict[str, list[Trigger]]:
+    """Triggers of the lessons matching `where`, grouped by lesson id."""
+    out: dict[str, list[Trigger]] = {}
+    for t in _rows(
+        db,
+        f"select lesson_id, kind, spec, stage from triggers where lesson_id in "
+        f"(select id from lessons where {where}) order by lesson_id, kind, stage, spec",
+        params,
+    ):
+        out.setdefault(t["lesson_id"], []).append(
+            Trigger(TriggerKind(t["kind"]), t["spec"], Stage(t["stage"]))
+        )
+    return out
+
+
+def _state_of(row: sqlite3.Row, triggers: Iterable[Trigger]) -> State:
     return State(
-        Status(row["status"]), Level(row["level"]), bool(row["pinned"]), row["scope_kind"], row["revision"]
+        status=Status(row["status"]),
+        level=Level(row["level"]),
+        pinned=bool(row["pinned"]),
+        scope=_scope_from_row(row),
+        revision=row["revision"],
+        text=LessonText(row["avoid"], row["instead"], row["reason"]),
+        trust_class=TrustClass(row["trust_class"]),
+        triggers=frozenset(triggers),
+        fingerprint=row["fingerprint"],
+        sessions_seen=row["sessions_seen"],
+        fix_programs=tuple(json.loads(row["fix_programs"])),
+        superseded_by=row["superseded_by"],
     )
 
 
@@ -417,9 +528,9 @@ def apply_event(
 ) -> int:
     """Apply one lifecycle event in one transaction and return the new revision.
 
-    Payload keys by event: `observed` takes an optional `fix_program`, `promoted` an optional `scope`,
-    `level_set` needs `level`, `edited` takes optional `text` and `triggers`, and `superseded` needs
-    `superseded_by`.
+    Payload keys by event: `observed` takes an optional `fix_program`, `promoted` an optional `scope`
+    (required when the lesson is session-scoped), `level_set` needs `level`, `edited` takes optional
+    `text`, `triggers` and `scope` (never machine scope), and `superseded` needs `superseded_by`.
     """
     if event is EventType.PROPOSED:
         raise Rejected("use create_lesson to propose a lesson")
@@ -432,44 +543,25 @@ def apply_event(
         row = found[0]
         if row["revision"] != expected_revision:
             raise Conflict(f"{lesson_id} is at revision {row['revision']}, expected {expected_revision}")
-        new = next_state(_state_of(row), event, payload)
-        sets: dict[str, object] = {
-            "status": str(new.status),
-            "level": str(new.level),
-            "pinned": int(new.pinned),
-            "revision": new.revision,
-            "updated_at": at,
-        }
+        old = _state_of(row, _triggers_where(db, "id = ?", (lesson_id,)).get(lesson_id, ()))
+        new = next_state(old, event, payload)
+        sets = {**_columns(new), "updated_at": at}
         expires_at = row["expires_at"]
         match event:
             case EventType.OBSERVED:
-                sets["sessions_seen"] = row["sessions_seen"] + 1
                 sets["last_seen_at"] = at
                 expires_at = at + EXPIRY_SECONDS
-                programs = json.loads(row["fix_programs"])
-                fix_program = payload.get("fix_program")
-                if isinstance(fix_program, str) and fix_program not in programs:
-                    sets["fix_programs"] = _canonical([*programs, fix_program])
-            case EventType.PROMOTED if "scope" in payload:
-                scope = _parse_scope(payload["scope"])
-                if scope.kind == "session":
-                    raise Rejected("promotion needs repo, path or machine scope")
-                sets.update(_scope_columns(scope))
             case EventType.LEVEL_SET if new.level is Level.BLOCK:
                 _check_block(db, row)
             case EventType.EDITED:
                 sets["precision_ok"] = 0
-                if "text" in payload:
-                    text = _parse_text(payload["text"])
-                    sets.update(avoid=text.avoid, instead=text.instead, reason=text.reason)
-                if "triggers" in payload:
-                    _write_triggers(db, lesson_id, _parse_triggers(payload["triggers"]))
             case EventType.SUPERSEDED:
-                successor = payload["superseded_by"]
+                successor = new.superseded_by
                 exists = db.execute("select 1 from lessons where id = ?", (successor,)).fetchone()
                 if successor == lesson_id or exists is None:
                     raise Rejected(f"superseded_by {successor!r} is not another lesson")
-                sets["superseded_by"] = successor
+        if new.triggers != old.triggers:
+            _write_triggers(db, lesson_id, new.triggers)
         if new.status in EXPIRING:
             sets["expires_at"] = (
                 expires_at if expires_at is not None else row["last_seen_at"] + EXPIRY_SECONDS
@@ -501,11 +593,18 @@ def apply_event(
 
 
 def verify(db: sqlite3.Connection) -> list[str]:
-    """Walk the hash chain and replay every lesson's events. Each string is one problem; empty is healthy."""
+    """Walk the hash chain and replay every lesson's events. Each string is one problem; empty is healthy.
+
+    Replay rebuilds every column in `_columns` plus the trigger set, and each must match the stored row.
+    """
+    with _snapshot(db):
+        events = _rows(db, "select * from events order by seq")
+        lessons = {row["id"]: row for row in _rows(db, "select * from lessons order by id")}
+        triggers = _triggers_where(db, "1", ())
     problems: list[str] = []
     expected_hash = GENESIS_HASH
     replayed: dict[str, State | None] = {}
-    for row in _rows(db, "select * from events order by seq"):
+    for row in events:
         seq, lesson_id = row["seq"], row["lesson_id"]
         if row["prev_hash"] != expected_hash:
             problems.append(f"event {seq}: prev_hash does not extend the chain")
@@ -526,7 +625,6 @@ def verify(db: sqlite3.Connection) -> list[str]:
                 f"expected {expected_from}->{new.revision}"
             )
         replayed[lesson_id] = new
-    lessons = {row["id"]: row for row in _rows(db, "select * from lessons order by id")}
     for lesson_id, row in lessons.items():
         if lesson_id not in replayed:
             problems.append(f"{lesson_id}: has no events")
@@ -534,30 +632,27 @@ def verify(db: sqlite3.Connection) -> list[str]:
         state = replayed[lesson_id]
         if state is None:
             continue
-        actual = _state_of(row)
-        for field in ("status", "revision", "pinned", "level", "scope_kind"):
-            have, want = getattr(actual, field), getattr(state, field)
-            if have != want:
-                problems.append(f"{lesson_id}: {field} is {have} in lessons but {want} from events")
+        for name, want in _columns(state).items():
+            if row[name] != want:
+                problems.append(f"{lesson_id}: {name} is {row[name]} in lessons but {want} from events")
+        have_triggers = _trigger_keys(triggers.get(lesson_id, ()))
+        want_triggers = _trigger_keys(state.triggers)
+        if have_triggers != want_triggers:
+            problems.append(
+                f"{lesson_id}: triggers are {have_triggers} in lessons but {want_triggers} from events"
+            )
     for lesson_id in sorted(set(replayed) - set(lessons)):
         problems.append(f"{lesson_id}: has events but no lessons row")
     return problems
 
 
 def _load(db: sqlite3.Connection, where: str, params: Iterable[object]) -> list[Lesson]:
-    rows = _rows(db, f"select * from lessons where {where} order by id", params)
-    if not rows:
-        return []
-    ids = [row["id"] for row in rows]
-    by_lesson: dict[str, list[Trigger]] = {i: [] for i in ids}
-    placeholders = ",".join("?" * len(ids))
-    for t in _rows(
-        db,
-        f"select lesson_id, kind, spec, stage from triggers where lesson_id in ({placeholders}) "
-        "order by lesson_id, kind, stage, spec",
-        ids,
-    ):
-        by_lesson[t["lesson_id"]].append(Trigger(TriggerKind(t["kind"]), t["spec"], Stage(t["stage"])))
+    params = tuple(params)
+    with _snapshot(db):
+        rows = _rows(db, f"select * from lessons where {where} order by id", params)
+        if not rows:
+            return []
+        by_lesson = _triggers_where(db, where, params)
     return [
         Lesson(
             id=LessonId(row["id"]),
@@ -568,7 +663,7 @@ def _load(db: sqlite3.Connection, where: str, params: Iterable[object]) -> list[
             scope=_scope_from_row(row),
             text=LessonText(row["avoid"], row["instead"], row["reason"]),
             trust_class=TrustClass(row["trust_class"]),
-            triggers=tuple(by_lesson[row["id"]]),
+            triggers=tuple(by_lesson.get(row["id"], ())),
             fingerprint=row["fingerprint"],
             sessions_seen=row["sessions_seen"],
         )
@@ -577,6 +672,7 @@ def _load(db: sqlite3.Connection, where: str, params: Iterable[object]) -> list[
 
 
 def get_lesson(db: sqlite3.Connection, lesson_id: LessonId) -> Lesson | None:
+    """The lesson with this id in any status, with its triggers, or None when no such lesson exists."""
     found = _load(db, "id = ?", (lesson_id,))
     return found[0] if found else None
 
