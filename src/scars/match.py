@@ -628,10 +628,8 @@ def _in_scope(scope: Scope, event: HookEvent, ctx: MatchContext) -> bool:
     match scope:
         case MachineScope():
             return True
-        case RepoScope(repo_id=repo_id):
+        case RepoScope(repo_id=repo_id) | PathScope(repo_id=repo_id):
             return ctx.repo_id is not None and repo_id == ctx.repo_id
-        case PathScope(repo_id=repo_id):
-            return ctx.repo_root is not None and ctx.repo_id is not None and repo_id == ctx.repo_id
         case SessionScope(session_id=session_id):
             return session_id == event.session_id
 
