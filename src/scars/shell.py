@@ -27,9 +27,21 @@ word with no expansion, glob or `~`. The accepted forms are `N>file`, `N>>file`,
 Descriptors 0, 1 and 2 start open for each simple command and group; file redirections and dups open
 `N`, and `-` closes it. Closing a descriptor on a `( ... )` group is unsupported, since it changes
 what the commands inside may use. Anything else after a redirection operator is unsupported, including
-`2>&xyz`, `>&5` and a `{name}>` descriptor variable. A command named `exec` or `eval` (or run through
-`command` or `builtin`) is unsupported, because it can close descriptors or change the directory of the
-commands after it.
+`2>&xyz`, `>&5` and a `{name}>` descriptor variable. A file target that is empty or names a directory by
+its spelling (`/`, `.`, `..`, or a trailing `/`) is unsupported too, because bash cannot open it. A command
+named `exec` or `eval` (or run through `command` or `builtin`) is unsupported, because it can close
+descriptors or change the directory of the commands after it.
+
+A command that can stop or rewire the commands after it is allowed only as the last command: `exit`,
+`return`, `logout`, `hash`, `trap`, `ulimit`, `unset`, a `set` with any option other than `-e`, `-u`,
+`-x` and `-o pipefail|errexit|nounset|xtrace`, a bare `PATH=` assignment, and `export` (or `declare`,
+`typeset`, `readonly`, `local`) of `PATH`. `set -n` and `set -o noexec` run nothing after them, and a new
+`PATH` or hash entry can make a name run a different file or none. A `PATH=` prefix on a command is
+unsupported for the same reason.
+
+A leading `cd` must have exactly one operand: a literal, non-empty path that does not start with `-` or
+`+`. Otherwise (`cd`, `cd -`, `cd --`, `cd -L dir`, `cd ~`, `cd a b`, zsh `cd +1`) the parse is
+unsupported, because the directory it moves to is not the operand.
 
 Each simple command also reports whether its working directory is known. After a leading `cd DIR &&`,
 the directory holds for commands joined by `&&` or `|`. After a `;`, `||` or `&`, later commands in the
@@ -140,6 +152,10 @@ _NAME_PART = r"[A-Za-z0-9._+-]+"
 _PROGRAM = re.compile(rf"(?!-)(?:/|~/)?(?:{_NAME_PART}/)*{_NAME_PART}")
 _MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 _MAX_WRAPPERS = 8
+_SAFE_SHELL_OPTIONS = frozenset({"pipefail", "errexit", "nounset", "xtrace"})
+_SAFE_SET_LETTERS = frozenset("eux")
+_ALTERS_LATER = frozenset({"exit", "return", "logout", "hash", "trap", "ulimit", "unset"})
+_DECLARES = frozenset({"export", "declare", "typeset", "readonly", "local"})
 
 
 class _Finds(Enum):
@@ -187,6 +203,8 @@ class _Wrapper:
     assignments: bool = False
     """`NAME=value` words may follow the options; the first one ends option processing."""
     trigger: str | None = None
+    choices: dict[str, frozenset[str]] = field(default_factory=dict)
+    """Operand options that accept only these values, as `bash -o pipefail`."""
 
 
 _SHELL = _Wrapper(
@@ -202,7 +220,9 @@ _PYTHON = _Wrapper(
 )
 # The `time` keyword takes `-p` in bash but not in zsh, so it gets no options. Options that start a login
 # or interactive shell (`-i`, `-s`, `sh -l`) are left out: rc files and `path_helper` can change which
-# file a name resolves to, or define an alias or function under that name.
+# file a name resolves to, or define an alias or function under that name. A shell takes only the options
+# that never stop the script from running; `-n`, `-o noexec` and every other `-o` name, `+` options and
+# long options are unsupported. `sh` gets no `-o` at all, since dash may lack `pipefail` and then exits.
 _WRAPPERS: dict[str, _Wrapper] = {
     "env": _Wrapper(
         _Finds.COMMAND,
@@ -231,7 +251,12 @@ _WRAPPERS: dict[str, _Wrapper] = {
     "npx": _Wrapper(_Finds.COMMAND, flags=_words("-y", "--yes")),
     "python": _PYTHON,
     "python3": _PYTHON,
-    "bash": replace(_SHELL, flags=_words("-c", "-e", "-u", "-x", "-l"), operands=_words("-o")),
+    "bash": replace(
+        _SHELL,
+        flags=_words("-c", "-e", "-u", "-x", "-l"),
+        operands=_words("-o"),
+        choices={"-o": _SAFE_SHELL_OPTIONS},
+    ),
     "sh": replace(_SHELL, flags=_words("-c", "-e", "-u", "-x")),
 }
 
@@ -438,6 +463,8 @@ class _Grouper:
         self.closed_group = False
         self.needs_follower = False
         self.open_fds = set(_STANDARD_FDS)
+        self.altered = False
+        """A command that can stop or rewire later commands has been emitted."""
 
     def run(self, tokens: list[_Token]) -> list[SimpleCommand]:
         i = 0
@@ -494,6 +521,9 @@ class _Grouper:
         """Check one redirection against the forms bash runs, tracking which descriptors are open."""
         if not target.literal:
             raise Unsupported(f"redirection target {target.text!r} expands at run time")
+        if target.text == "":
+            raise Unsupported("bash cannot open an empty redirection target")
+
         plain = target.quoted_from is None
         fds = self.open_fds
         if op in (">&", "<&"):
@@ -507,12 +537,15 @@ class _Grouper:
                     raise Unsupported(f"descriptor {target.text} may not be open")
                 fds.add(n)
             elif op == ">&" and fd is None and plain and _PLAIN_FILE.fullmatch(target.text):
+                _check_file_target(target.text)
                 fds.update((1, 2))
             else:
                 raise Unsupported(f"invalid descriptor redirection {op}{target.text!r}")
         elif op == "&>":
+            _check_file_target(target.text)
             fds.update((1, 2))
         else:
+            _check_file_target(target.text)
             fds.add(fd if fd is not None else (0 if op[0] == "<" else 1))
 
     def _finish(self, separator: str | None) -> None:
@@ -530,16 +563,25 @@ class _Grouper:
     def _emit(self, words: list[_Word], frame: _Frame, separator: str | None) -> None:
         if words[0].quoted_from is None and words[0].text in _KEYWORDS:
             raise Unsupported(f"shell keyword {words[0].text!r}")
-        if frame.leading and separator == "&&" and len(words) == 2 and words[0].text == "cd":
-            target = _literal(words[1]).text
-            frame.cwd = target if frame.cwd is None else posixpath.join(frame.cwd, target)
-            frame.moved = True
-            return
+        if frame.leading and words[0].text == "cd":
+            if len(words) != 2 or not _plain_directory(words[1]):
+                raise Unsupported("a leading cd needs exactly one plain directory operand")
+            if separator == "&&":
+                target = words[1].text
+                frame.cwd = target if frame.cwd is None else posixpath.join(frame.cwd, target)
+                frame.moved = True
+                return
         frame.leading = False
+        if self.altered:
+            raise Unsupported("an earlier command can stop or rewire this one")
+        if _assigns_path(words):
+            self.altered = True
         emitted = _unwrap(words, frame.cwd, self.depth)
         for c in emitted:
             if c.program in _SHELL_STATE or (c.program in _RUNS_BUILTIN and _SHELL_STATE & set(c.args)):
                 raise Unsupported(f"{c.program} can change the descriptors or directory of later commands")
+        if any(_alters_later(c) for c in emitted):
+            self.altered = True
         if not frame.cwd_known:
             emitted = [replace(c, cwd_known=False) for c in emitted]
         self.commands.extend(emitted)
@@ -547,10 +589,54 @@ class _Grouper:
             frame.cwd_known = False
 
 
+def _check_file_target(text: str) -> None:
+    if text.endswith("/") or text.rsplit("/", 1)[-1] in (".", ".."):
+        raise Unsupported(f"redirection target {text!r} is a directory")
+
+
+def _plain_directory(word: _Word) -> bool:
+    return word.literal and word.text != "" and word.text[0] not in "-+"
+
+
+def _is_assignment(word: _Word) -> bool:
+    """Only an unquoted `NAME=` is an assignment; `"FOO=1" make` runs a program named `FOO=1`."""
+    m = _ASSIGNMENT.match(word.text)
+    return m is not None and _unquoted_through(word, m.end())
+
+
+def _assigns_path(words: list[_Word]) -> bool:
+    """The words are only shell assignments, and one of them sets `PATH`."""
+    return all(_is_assignment(w) for w in words) and any(w.text.startswith("PATH=") for w in words)
+
+
+def _alters_later(c: SimpleCommand) -> bool:
+    """The command can stop the commands after it, or change which file a name runs."""
+    if c.program in _RUNS_BUILTIN:
+        return bool((_ALTERS_LATER | _DECLARES | {"set"}) & set(c.args))
+    if c.program in _DECLARES:
+        return any(a.startswith("PATH") for a in c.args)
+    if c.program == "set":
+        return not _safe_set(c.args)
+    return c.program in _ALTERS_LATER
+
+
+def _safe_set(args: tuple[str, ...]) -> bool:
+    i = 0
+    while i < len(args):
+        if args[i] == "-o" and i + 1 < len(args) and args[i + 1] in _SAFE_SHELL_OPTIONS:
+            i += 2
+        elif len(args[i]) > 1 and args[i][0] == "-" and set(args[i][1:]) <= _SAFE_SET_LETTERS:
+            i += 1
+        else:
+            return False
+    return True
+
+
 def _unwrap(words: list[_Word], cwd: str | None, depth: int) -> list[SimpleCommand]:
-    # Only an unquoted `NAME=` is an assignment; `"FOO=1" make` runs a program named `FOO=1`.
     prefixed = False
-    while words and (m := _ASSIGNMENT.match(words[0].text)) and _unquoted_through(words[0], m.end()):
+    while words and _is_assignment(words[0]):
+        if words[0].text.startswith("PATH=") and len(words) > 1:
+            raise Unsupported("a PATH= prefix changes which file the command runs")
         words, prefixed = words[1:], True
     # After an assignment bash runs `/usr/bin/time` while zsh still reads the reserved word and fails.
     if prefixed and words and words[0].quoted_from is None and words[0].text in _KEYWORDS | {"time"}:
@@ -614,10 +700,10 @@ def _scan_options(
         elif text in wrapper.operands:
             if i >= len(args):
                 raise Unsupported(f"{name} option {text!r} has no operand")
-            seen[text] = _literal(args[i]).text
+            seen[text] = _operand(name, wrapper, text, _literal(args[i]).text)
             i += 1
         elif wrapper.attached and (attached := _attached_operand(text, wrapper.operands)):
-            seen[attached[0]] = attached[1]
+            seen[attached[0]] = _operand(name, wrapper, attached[0], attached[1])
         elif wrapper.combined and _is_flag_cluster(text, wrapper.flags):
             seen.update(dict.fromkeys(f"-{letter}" for letter in text[1:]))
         else:
@@ -629,6 +715,15 @@ def _scan_options(
         while rest and _ASSIGNMENT.match(_literal(rest[0]).text):
             rest = rest[1:]
     return seen, rest
+
+
+def _operand(name: str, wrapper: _Wrapper, option: str, value: str) -> str:
+    """An empty operand, or one that looks like an option, makes the wrapper fail or parse it differently."""
+    if value == "" or value.startswith("-"):
+        raise Unsupported(f"{name} option {option!r} has operand {value!r}")
+    if option in wrapper.choices and value not in wrapper.choices[option]:
+        raise Unsupported(f"{name} option {option} {value!r} is not modelled")
+    return value
 
 
 def _attached_operand(text: str, operands: frozenset[str]) -> tuple[str, str] | None:

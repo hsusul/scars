@@ -715,3 +715,106 @@ def test_parse_rejects_redirections_bash_would_refuse_or_could_refuse(command):
 )
 def test_parse_accepts_valid_redirections_and_operators(command, expected):
     assert parse(command) == expected
+
+
+# Each of these runs nothing, or runs the command somewhere other than the directory a parse would record.
+ROUND_FOUR_FALSE_FIRES = [
+    # A shell option outside the small modelled set: `noexec` and `-n` read the script and run nothing.
+    "bash -o noexec -c 'git push --force'",
+    "bash -o posix -c 'git push --force'",
+    "bash -o errexit -o noexec -c 'git push --force'",
+    "bash -c -o noexec 'git push --force'",
+    "bash +o pipefail -c 'git push --force'",
+    "bash -n -c 'git push --force'",
+    "bash -nc 'git push --force'",
+    "bash -s -c 'git push --force'",
+    "bash --noprofile -c 'git push --force'",
+    "sh -o noexec -c 'git push --force'",
+    "sh -n -c 'git push --force'",
+    # bash cannot open an empty path or write to a directory, so it skips the command.
+    "git push --force < ''",
+    "git push --force > ''",
+    'git push --force 2>""',
+    "git push --force >> ''",
+    "git push --force >| ''",
+    "git push --force <> ''",
+    "git push --force &> ''",
+    "git push --force > /",
+    "git push --force > .",
+    "git push --force 2> ..",
+    "git push --force > out/",
+    "git push --force > a/..",
+    # A leading `cd` with an option, no operand, `~` or several operands.
+    "cd -L && git push --force",
+    "cd -P && git push --force",
+    "cd - && git push --force",
+    "cd -- && git push --force",
+    "cd '-L' && git push --force",
+    "cd && git push --force",
+    "cd '' && git push --force",
+    "cd +1 && git push --force",
+    "cd -L ios && git push --force",
+    "cd -P ios && git push --force",
+    "cd -- ios && git push --force",
+    "cd ~ && git push --force",
+    "cd a b && git push --force",
+    "cd ios && cd -L && git push --force",
+    "(cd -L && git push --force)",
+    "bash -c 'cd -L && git push --force'",
+    # A wrapper option whose operand is empty or another option makes the wrapper fail.
+    "sudo -u '' git push --force",
+    "sudo -u -n git push --force",
+    "sudo -g '' git push --force",
+    "env -u '' git push --force",
+    "env -u -- git push --force",
+    "uv run --with '' git push --force",
+    "uv run --with= git push --force",
+    "uv run -p '' git push --force",
+    "uv run --python -q git push --force",
+    # A builtin that stops or rewires the commands after it.
+    "set -n; git push --force",
+    "set -o noexec; git push --force",
+    "set -eo noexec; git push --force",
+    "exit; git push --force",
+    "exit 0 && git push --force",
+    "true || return; git push --force",
+    "hash -p /usr/bin/true git; git push --force",
+    "trap exit DEBUG; git push --force",
+    "ulimit -u 0; git push --force",
+    "unset PATH; git push --force",
+    "PATH=/nowhere; git push --force",
+    "PATH=/nowhere git push --force",
+    "builtin exit; git push --force",
+]
+
+
+@pytest.mark.parametrize("command", ROUND_FOUR_FALSE_FIRES)
+def test_parse_rejects_round_four_false_fires(command):
+    with pytest.raises(Unsupported):
+        parse(command)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("bash -o pipefail -c 'make | cat'", (cmd("make"), cmd("cat"))),
+        ("bash -o errexit -o nounset -o xtrace -c make", (cmd("make"),)),
+        ("bash -e -u -x -l -c make", (cmd("make"),)),
+        ("sh -eux -c make", (cmd("make"),)),
+        ("cd ios && make", (cmd("make", cwd="ios"),)),
+        ("cd 'my dir' && make", (cmd("make", cwd="my dir"),)),
+        ("cd ./-L && make", (cmd("make", cwd="./-L"),)),
+        ("cd /tmp && make > out/log", (cmd("make", cwd="/tmp"),)),
+        ("sudo -u ci make", (cmd("make"),)),
+        ("env -u FOO make", (cmd("make"),)),
+        ("uv run --with x -p 3.12 make", (cmd("make"),)),
+        ("set -e; make", (cmd("set", "-e"), cmd("make"))),
+        ("set -o pipefail; make", (cmd("set", "-o", "pipefail"), cmd("make"))),
+        ("set -eux && make", (cmd("set", "-eux"), cmd("make"))),
+        ("make || exit 1", (cmd("make"), cmd("exit", "1"))),
+        ("make; set -n", (cmd("make"), cmd("set", "-n"))),
+        ("PATH=/opt/bin:$PATH", ()),
+    ],
+)
+def test_parse_keeps_round_four_neighbours_working(command, expected):
+    assert parse(command) == expected

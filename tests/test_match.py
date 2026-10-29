@@ -911,6 +911,47 @@ def test_path_scope_uses_the_directory_of_the_command_the_trigger_matched():
     assert ids(select([ios_gate()], other, CTX)) == []
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -o noexec -c 'git push --force'",
+        "bash -n -c 'git push --force'",
+        "sh -o noexec -c 'git push --force'",
+        "git push --force < ''",
+        "git push --force > ''",
+        "git push --force > /",
+        "cd -L && git push --force",
+        "cd - && git push --force",
+        "cd -L ios && git push --force",
+        "sudo -u '' git push --force",
+        "env -u '' git push --force",
+        "uv run --with '' git push --force",
+        "set -o noexec; git push --force",
+        "exit; git push --force",
+        "PATH=/nowhere git push --force",
+        # Not unwrapped, so the program is the wrapper itself and nothing fires.
+        "command git push --force",
+        "command -v git push --force",
+        "builtin git push --force",
+        "nice -n 5 git push --force",
+        "env '' git push --force",
+        "nohup '' git push --force",
+        "time '' git push --force",
+    ],
+)
+def test_command_trigger_does_not_fire_on_round_four_findings(command):
+    assert_everywhere("git push --force", command, False)
+
+
+@pytest.mark.parametrize("command", ["cd -L && git push --force", "cd - && git push --force"])
+def test_path_scope_is_not_admitted_from_a_cd_option(command):
+    anywhere = lesson(
+        "L-any", cmd_trigger("git push --force"), level=Level.BLOCK, scope=PathScope(REPO, "**")
+    )
+    assert ids(select([anywhere], event(command=command, cwd=ROOT), CTX)) == []
+    assert ids(select([anywhere], event(command="cd sub && git push --force", cwd=ROOT), CTX)) == ["L-any"]
+
+
 def test_path_scope_admits_a_plan_lesson_from_the_session_cwd():
     plan = lesson(
         "L-plan",
