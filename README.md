@@ -14,4 +14,4 @@ Status: under construction. Nothing is usable yet.
 - [Critique](docs/CRITIQUE.md) records every expert-panel and review finding and where the docs resolve it. Decision records are in `docs/adr/`.
 - [Research](research/README.md) holds the original market and engineering research, and `research/experiments/` holds the probes behind the numbers.
 
-`scripts/check_traceability.py` and `scripts/check_schema.py` check that the docs stay consistent. CI runs both.
+`scripts/check_traceability.py` checks that every critique finding is answered in the docs. `tests/test_schema.py` checks that the SQL in `docs/ARCHITECTURE.md` matches the shipped schema in `src/scars/schema/`. CI runs both.
