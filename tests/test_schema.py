@@ -1,21 +1,13 @@
-import pathlib
-import re
 import sqlite3
 
 import pytest
 
 from scars.store import schema_sql
 
-DOCS = pathlib.Path(__file__).resolve().parent.parent / "docs" / "ARCHITECTURE.md"
 LESSON_INSERT = (
     "insert into lessons (id,status,level,pinned,scope_kind,repo_id,avoid,instead,reason,trust_class,"
     "fingerprint,created_at,updated_at,last_seen_at) values (?,?,?,?,?,?,'a','b','c','own_code',?,0,0,0)"
 )
-
-
-def test_architecture_doc_sql_matches_shipped_schema():
-    blocks = re.findall(r"```sql\n(.*?)```", DOCS.read_text(), re.S)
-    assert blocks == [schema_sql("lessons"), schema_sql("telemetry")]
 
 
 @pytest.fixture

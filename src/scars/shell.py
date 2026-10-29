@@ -1,4 +1,4 @@
-"""Bounded shell parser for command triggers. See ARCHITECTURE "Matching", "Shell parsing"."""
+"""Bounded shell parser for command triggers."""
 
 from dataclasses import dataclass
 

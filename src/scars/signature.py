@@ -1,4 +1,4 @@
-"""Error-signature normalizer shared by the hook and the miner. See ARCHITECTURE "Miner", step 4."""
+"""Error-signature normalizer shared by the hook and the miner."""
 
 import re
 

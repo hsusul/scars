@@ -1,4 +1,4 @@
-"""SQLite persistence for lessons.db and telemetry.db. See docs/adr/0002-sqlite-store.md."""
+"""SQLite persistence for lessons.db and telemetry.db."""
 
 import hashlib
 import json
