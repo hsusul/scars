@@ -1,6 +1,6 @@
 # Working on scars
 
-scars is a local Python CLI that mines Claude Code and Codex transcripts for failure-then-fix pairs and delivers the resulting lessons through agent hooks. The spec lives in `docs/`. Start with `docs/PRD.md` and `docs/ARCHITECTURE.md`.
+scars is a local Python CLI that mines Claude Code and Codex transcripts for failure-then-fix pairs and delivers the resulting lessons through agent hooks. `src/scars/model.py` holds the shared domain types, and `src/scars/schema/` holds the SQLite schema.
 
 ## Commands
 

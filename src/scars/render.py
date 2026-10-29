@@ -1,4 +1,4 @@
-"""Lesson template, sanitizer, lints and secret scan. See ARCHITECTURE "Rendering"."""
+"""Lesson template, sanitizer, lints and secret scan."""
 
 from scars.model import Lesson, LessonText, Scope
 

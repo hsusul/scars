@@ -1,4 +1,4 @@
-"""Domain types shared by every module. See docs/ARCHITECTURE.md "Data model" and "Lifecycle"."""
+"""Domain types shared by every module."""
 
 from dataclasses import dataclass
 from enum import StrEnum
@@ -216,4 +216,5 @@ PRIVILEGED_COMMANDS = frozenset(
         "quarantine",
     }
 )
-"""The single privileged-command list from ARCHITECTURE "Hook contract" (R21)."""
+"""Commands that change a lesson's reach, level or status, or toggle the kill switch. Agents may not run them.
+"""
