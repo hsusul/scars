@@ -378,10 +378,30 @@ def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+@dataclass(frozen=True)
+class InvalidText:
+    """A stored TEXT value whose bytes are not valid UTF-8, as `verify` reads it."""
+
+    raw: bytes
+
+    def __str__(self) -> str:
+        return f"<invalid UTF-8 {self.raw.hex()}>"
+
+
+def _decode_text(raw: bytes) -> str | InvalidText:
+    try:
+        return raw.decode()
+    except UnicodeDecodeError:
+        return InvalidText(raw)
+
+
 def _blob_json(value: object) -> object:
-    # Writes never store blobs, but a tampered column can; hash its bytes so verify reports it.
+    # Writes never store blobs or invalid text, but a tampered column can; hash its bytes so verify
+    # reports it. Neither shape can equal the JSON string a valid value hashes as.
     if isinstance(value, bytes):
         return {"blob": value.hex()}
+    if isinstance(value, InvalidText):
+        return {"invalid_utf8": value.raw.hex()}
     raise TypeError(f"cannot hash {type(value).__name__}")
 
 
@@ -461,6 +481,8 @@ def _decode_payload(raw: object) -> object:
         return json.loads(raw)
     except ValueError as exc:
         raise Rejected(f"payload is not JSON: {exc}") from None
+    except RecursionError:
+        raise Rejected("payload nests too deeply") from None
 
 
 def _event_at(raw: object) -> float:
@@ -683,15 +705,38 @@ def verify(db: sqlite3.Connection) -> list[str]:
     Timestamps compare exactly: a write stores the same float in the event's `at` and the lesson row,
     and replay redoes the same arithmetic on it. Never raises on stored data: a malformed event is
     reported and ends replay of its lesson, and the other lessons are still checked.
+
+    TEXT that is not valid UTF-8 is reported by table, rowid and column. Such an event ends its
+    lesson's replay, such a lessons cell is not compared, and such a trigger row is left out of the
+    trigger set. Valid text hashes exactly as the default decoder reads it, so existing chains hold.
     """
-    with _snapshot(db):
-        events = _rows(db, "select * from events order by seq")
-        lessons = {row["id"]: row for row in _rows(db, "select * from lessons order by id")}
-        trigger_rows = db.execute("select lesson_id, kind, spec, stage from triggers").fetchall()
+    factory = db.text_factory
+    db.text_factory = _decode_text
+    try:
+        with _snapshot(db):
+            events = _rows(db, "select * from events order by seq")
+            lesson_rows = _rows(db, "select rowid as row_id, * from lessons order by id")
+            trigger_rows = _rows(
+                db, "select rowid as row_id, lesson_id, kind, spec, stage from triggers order by rowid"
+            )
+    finally:
+        db.text_factory = factory
+    problems = [
+        f"{table} row {row[key]}: {name} is not valid UTF-8"
+        for table, key, rows in (
+            ("events", "seq", events),
+            ("lessons", "row_id", lesson_rows),
+            ("triggers", "row_id", trigger_rows),
+        )
+        for row in rows
+        for name, value in zip(row.keys(), row, strict=True)
+        if isinstance(value, InvalidText)
+    ]
+    lessons = {row["id"]: row for row in lesson_rows}
     triggers: dict[object, list[tuple[object, ...]]] = {}
-    for lesson_id, *key in trigger_rows:
-        triggers.setdefault(lesson_id, []).append(tuple(key))
-    problems: list[str] = []
+    for t in trigger_rows:
+        if not any(isinstance(value, InvalidText) for value in t):
+            triggers.setdefault(t["lesson_id"], []).append((t["kind"], t["spec"], t["stage"]))
     expected_hash = GENESIS_HASH
     replayed: dict[str, State | None] = {}
     for row in events:
@@ -700,6 +745,9 @@ def verify(db: sqlite3.Connection) -> list[str]:
             problems.append(f"event {seq}: prev_hash does not extend the chain")
         expected_hash = _row_hash(row)
         if lesson_id is None or (lesson_id in replayed and replayed[lesson_id] is None):
+            continue
+        if any(isinstance(value, InvalidText) for value in row):
+            replayed[lesson_id] = None
             continue
         state = replayed.get(lesson_id)
         try:
@@ -724,7 +772,7 @@ def verify(db: sqlite3.Connection) -> list[str]:
         if state is None:
             continue
         for name, want in _columns(state).items():
-            if row[name] != want:
+            if row[name] != want and not isinstance(row[name], InvalidText):
                 problems.append(f"{lesson_id}: {name} is {row[name]} in lessons but {want} from events")
         have_triggers = _sorted_keys(triggers.get(lesson_id, ()))
         want_triggers = _trigger_keys(state.triggers)

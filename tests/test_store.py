@@ -929,6 +929,121 @@ def test_verify_reports_a_non_integer_revision_without_raising(db):
     ]
 
 
+def two_lessons_with_b_tampered(db):
+    a = new(db, fingerprint="a")
+    b = new(db, fingerprint="b")
+    step(db, a, EventType.OBSERVED, {"fix_program": "xcrun"})
+    step(db, b, EventType.OBSERVED)
+    db.execute("update lessons set sessions_seen = 9 where id = ?", (b,))
+    # A tamperer is not bound by the schema's checks.
+    db.execute("pragma ignore_check_constraints = on")
+    db.execute("pragma foreign_keys = off")
+    return a, b
+
+
+def test_verify_reports_a_payload_nested_too_deeply_and_keeps_verifying_other_lessons(db):
+    a, b = two_lessons_with_b_tampered(db)
+    db.execute("update events set payload = ? where seq = 1", ("[" * 10000 + "0" + "]" * 10000,))
+    assert verify(db) == [
+        f"event 1: {a} cannot replay proposed: payload nests too deeply",
+        "event 2: prev_hash does not extend the chain",
+        f"{b}: sessions_seen is 9 in lessons but 2 from events",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "rowid", "chain"),
+    [
+        ("events", "payload", 3, ["event 4: prev_hash does not extend the chain"]),
+        ("events", "type", 3, ["event 4: prev_hash does not extend the chain"]),
+        ("events", "actor", 3, ["event 4: prev_hash does not extend the chain"]),
+        ("events", "at", 3, ["event 4: prev_hash does not extend the chain"]),
+        (
+            "events",
+            "prev_hash",
+            3,
+            ["event 3: prev_hash does not extend the chain", "event 4: prev_hash does not extend the chain"],
+        ),
+        ("events", "payload", 1, ["event 2: prev_hash does not extend the chain"]),
+        ("lessons", "avoid", 1, []),
+        ("lessons", "status", 1, []),
+        ("lessons", "fix_programs", 1, []),
+    ],
+)
+def test_verify_reports_invalid_utf8_text_and_keeps_verifying_other_lessons(db, table, column, rowid, chain):
+    _, b = two_lessons_with_b_tampered(db)
+    db.execute(f"update {table} set {column} = cast(X'FF' as text) where rowid = ?", (rowid,))
+    assert verify(db) == [
+        f"{table} row {rowid}: {column} is not valid UTF-8",
+        *chain,
+        f"{b}: sessions_seen is 9 in lessons but 2 from events",
+    ]
+    assert db.text_factory is str
+
+
+@pytest.mark.parametrize("column", ["spec", "kind", "stage", "lesson_id"])
+def test_verify_reports_an_invalid_utf8_trigger_and_keeps_verifying_other_lessons(db, column):
+    a, b = two_lessons_with_b_tampered(db)
+    # a's triggers are rows 1 (command) and 2 (error), written in sorted order.
+    db.execute(f"update triggers set {column} = cast(X'FF' as text) where rowid = 2")
+    by_lesson = {
+        a: f"{a}: triggers are [('command', 'xcodebuild -sdk *', 'gate')] in lessons but "
+        "[('command', 'xcodebuild -sdk *', 'gate'), ('error', 'sig:abc', 'repair')] from events",
+        b: f"{b}: sessions_seen is 9 in lessons but 2 from events",
+    }
+    assert verify(db) == [
+        f"triggers row 2: {column} is not valid UTF-8",
+        *(by_lesson[lesson_id] for lesson_id in sorted(by_lesson)),
+    ]
+
+
+def test_verify_reports_an_invalid_utf8_lesson_id_in_events_and_keeps_verifying(db):
+    a, b = two_lessons_with_b_tampered(db)
+    db.execute("update events set lesson_id = cast(X'FF' as text) where seq = 1")
+    assert verify(db) == [
+        "events row 1: lesson_id is not valid UTF-8",
+        "event 2: prev_hash does not extend the chain",
+        f"event 3: {a} cannot replay observed: observed needs an existing lesson",
+        f"{b}: sessions_seen is 9 in lessons but 2 from events",
+        "<invalid UTF-8 ff>: has events but no lessons row",
+    ]
+
+
+def test_verify_reports_an_invalid_utf8_lesson_id_in_lessons_and_keeps_verifying(db):
+    a, b = two_lessons_with_b_tampered(db)
+    db.execute("update lessons set id = cast(X'FF' as text) where id = ?", (a,))
+    assert verify(db) == [
+        "lessons row 1: id is not valid UTF-8",
+        f"{b}: sessions_seen is 9 in lessons but 2 from events",
+        "<invalid UTF-8 ff>: has no events",
+        f"{a}: has events but no lessons row",
+    ]
+
+
+def test_verify_accepts_a_chain_with_non_ascii_text(db):
+    text = LessonText(avoid="rm -rf ~/Übung", instead="trash 日本語/", reason="keeps files 🗂")
+    lesson_id = create_lesson(
+        db,
+        text=text,
+        scope=RepoScope(OW),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=[Trigger(TriggerKind.COMMAND, "rm -rf ~/Ü*", Stage.GATE)],
+        fingerprint="fp-é",
+        actor="miner",
+        at=T0,
+    )
+    step(db, lesson_id, EventType.OBSERVED, {"fix_program": "trash-ü"})
+    new(db, fingerprint="after")
+    assert verify(db) == []
+
+
+def test_verify_restores_the_callers_text_factory(db):
+    two_lessons_with_b_tampered(db)
+    db.text_factory = bytes
+    assert len(verify(db)) == 1
+    assert db.text_factory is bytes
+
+
 @pytest.mark.parametrize(
     ("event", "payload", "reason"),
     [
