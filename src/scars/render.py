@@ -1,16 +1,22 @@
 """Lesson template, sanitizer, lints and secret scan.
 
 Lesson text is untrusted: the miner lifts it from tool output. `check` runs four stages in a fixed order
-and raises `RejectedText` at the first rule that fires. A rejected candidate is dropped whole; nothing is
-ever stripped or redacted. The same `check` runs again inside `render`, so text edited in the database
-behind the CLI's back is never shown.
+and raises `RejectedText` at the first rule that fires. Within a stage, fields go in the order avoid,
+instead, reason, and each field meets the stage's rules in table order. A rejected candidate is dropped
+whole; nothing is ever stripped or redacted. The same checks run again inside `render`, so text edited
+in the database behind the CLI's back is never shown.
 
-1. Sanitizer: control characters (every C0 and C1 character, tab and newline included), ANSI escapes,
-   bidi controls, zero-width characters, Unicode tag characters, URLs, code fences and over-cap fields.
+The policy is blunt on purpose. These checks sit behind trust tiers and human review, so dropping a
+harmless candidate is cheap and showing a harmful one is not. Where a rule cannot be complete, it is
+written as an allowlist (printable ASCII only, known programs only, allowed path roots only) rather than
+a list of bad phrases.
+
+1. Sanitizer: empty and over-cap fields, ANSI escapes, control characters (every C0 and C1 character,
+   tab and newline included), anything outside printable ASCII, code fences and URLs.
 2. Imperative lint: the fixed `IMPERATIVE_RULES` table, plus the backticked-command rule for `instead`.
-3. Secret scan: known token formats and a high-entropy backstop.
+3. Secret scan: known token formats, matched wherever they start, and a high-entropy fallback.
 4. Machine-scope lint: machine lessons reach every repo, so they may not name a repo, a GitHub
-   `owner/name`, or an absolute path outside `ALLOWED_ROOTS`.
+   `owner/name`, a `..` path segment, or an absolute path outside `ALLOWED_ROOTS`.
 
 Rejection messages name the field and the rule, never the matched text, so a secret or a private repo
 name cannot leak through an error message or a log line.
@@ -18,15 +24,15 @@ name cannot leak through an error message or a log line.
 
 import math
 import re
-import shlex
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 
 from scars.model import (
     TEXT_CAP,
     Lesson,
+    LessonId,
     LessonText,
     MachineScope,
     PathScope,
@@ -35,6 +41,7 @@ from scars.model import (
     SessionScope,
     Status,
 )
+from scars.shell import Unsupported, parse
 
 FIELDS = ("avoid", "instead", "reason")
 
@@ -69,19 +76,14 @@ def _chars(*ranges: tuple[int, int]) -> Callable[[str], bool]:
 # ---------------------------------------------------------------- sanitizer
 
 SANITIZER_RULES: tuple[Rule, ...] = (
+    Rule("sanitizer.empty", lambda text: text == ""),
     Rule("sanitizer.over_cap", lambda text: len(text) > TEXT_CAP),
     # Checked before plain control characters so an escape sequence gets the more specific name.
     Rule("sanitizer.ansi_escape", _chars((0x1B, 0x1B), (0x9B, 0x9B))),
     Rule("sanitizer.control_char", _chars((0x00, 0x1F), (0x7F, 0x9F))),
-    Rule(
-        "sanitizer.bidi_control",
-        _chars((0x061C, 0x061C), (0x200E, 0x200F), (0x202A, 0x202E), (0x2066, 0x2069)),
-    ),
-    Rule(
-        "sanitizer.zero_width",
-        _chars((0x180E, 0x180E), (0x200B, 0x200D), (0x2060, 0x2060), (0xFEFF, 0xFEFF)),
-    ),
-    Rule("sanitizer.tag_char", _chars((0xE0000, 0xE007F))),
+    # Printable ASCII only. This one rule covers Unicode line separators, non-breaking and other
+    # Unicode spaces, homoglyphs, fullwidth forms, combining marks, bidi, zero-width and tag characters.
+    Rule("sanitizer.non_ascii", lambda text: any(ord(ch) > 0x7E for ch in text)),
     Rule("sanitizer.code_fence", lambda text: "```" in text),
     Rule(
         "sanitizer.url",
@@ -97,6 +99,16 @@ SANITIZER_RULES: tuple[Rule, ...] = (
 
 # ---------------------------------------------------------------- imperative lint
 
+_OVERRIDE_VERBS = r"(?:ignor|disregard|forget|overrid|overrul|bypass|supersed)\w*"
+_OVERRIDE_TARGETS = (
+    r"(?:previous\w*|prior|above|earlier|everything|all|other|instructions?|rules?|prompts?|system"
+    r"|guidelines?|directions?|directives?)"
+)
+_FEW_WORDS = r"\W+(?:\w+\W+){0,4}?"
+_INTERPRETER_FLAG = r"\b.*?\s-[a-z]*"
+_SECRET_NOUNS = r"(?:tokens?|secrets?|passwords?|passwd|credentials?|api[ _-]?keys?)"
+_LEAK_VERBS = r"(?:print|cat|echo|send|upload|paste|dump|post|share|reveal|copy|show)\w*"
+
 IMPERATIVE_RULES: tuple[Rule, ...] = (
     # `git fetch` is an ordinary local-repo command, so `fetch` only counts when `git` does not precede it.
     Rule(
@@ -106,8 +118,39 @@ IMPERATIVE_RULES: tuple[Rule, ...] = (
     Rule(
         "lint.pipe_to_shell",
         _pattern(
-            r"\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh|fish|python[0-9.]*|perl|ruby|node)\b|\beval\b"
-            r"|\b(?:sh|bash|zsh)\s+<\(",
+            r"\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh|csh|tcsh|fish|i?python[0-9.]*|py|perl|ruby|node"
+            r"|deno|bun|osascript|pwsh|powershell|source)\b"
+            r"|\b(?:sh|bash|zsh|dash|ksh|fish|source)\s+<\(|\bxargs\b.*?\b(?:sh|bash|zsh)\b",
+            re.I,
+        ),
+    ),
+    # Inline code runs whatever the lesson author wrote, so it is rejected anywhere, backticked or not.
+    # `osascript` is rejected outright: it runs AppleScript from a file as easily as from `-e`.
+    Rule(
+        "lint.inline_code",
+        _pattern(
+            r"\b(?:i?python[0-9.]*|pypy[0-9.]*|py)" + _INTERPRETER_FLAG + r"c\b"
+            r"|\b(?:node|nodejs|deno|bun)\b.*?\s(?:-[a-z]*[ep]\b|--eval\b|--print\b)|\bdeno\s+eval\b"
+            r"|\b(?:perl|ruby)" + _INTERPRETER_FLAG + r"e\b"
+            r"|\b(?:bash|sh|zsh|fish|dash|ksh|csh|tcsh)" + _INTERPRETER_FLAG + r"c\b"
+            r"|\bosascript\b"
+            r"|\b(?:powershell|pwsh)\b.*?\s-(?:c|command|e|ec|encodedcommand)\b"
+            r"|\beval\b|\bexec\b|\bos\s*\.\s*(?:system|popen|exec\w*|spawn\w*)|\bsubprocess\b"
+            r"|\bpopen\b|\b__import__\b|-execdir\b|-okdir\b|-ok\b",
+            re.I,
+        ),
+    ),
+    # A known program can be told to run another through its own options, config keys or environment.
+    Rule(
+        "lint.exec_hook",
+        _pattern(
+            r"\bgit\b.*?\s(?:-c|--config-env|--exec-path|--upload-pack|--receive-pack)\b"
+            r"|\b(?:core\.(?:pager|editor|sshcommand|askpass|hookspath|fsmonitor|gitproxy)|alias\.[\w-]"
+            r"|(?:diff|merge|filter)\.[\w-]+\.(?:command|driver|clean|smudge|process|textconv)"
+            r"|credential\.helper|sequence\.editor)"
+            r"|\b(?:\w*(?:_COMMAND|SHELL|PAGER|EDITOR|VISUAL|ASKPASS)|LD_\w+|DYLD_\w+|BASH_ENV|ENV"
+            r"|PROMPT_COMMAND|PYTHONSTARTUP|PYTHONPATH|NODE_OPTIONS|PERL5OPT|PERL5LIB|RUBYOPT"
+            r"|GIT_EXTERNAL_DIFF|GIT_EXEC_PATH|GIT_CONFIG\w*|GIT_DIR|GIT_TEMPLATE_DIR)=",
             re.I,
         ),
     ),
@@ -115,17 +158,29 @@ IMPERATIVE_RULES: tuple[Rule, ...] = (
         "lint.credentials",
         _pattern(
             r"\.ssh\b|\bid_(?:rsa|dsa|ecdsa|ed25519)\b|(?<![\w.])\.env\b|\bkeychain\b"
-            r"|find-(?:generic|internet)-password|\.netrc\b|\.npmrc\b|\.pypirc\b|\.git-credentials\b"
-            r"|\.aws/credentials|\.docker/config\.json|\bgh/hosts\.yml|\bprivate key\b"
-            r"|\b[\w-]*tokens?\.(?:txt|json|ya?ml)\b",
+            r"|\bsecurity\s+(?:find|dump|export)-|find-(?:generic|internet)-password"
+            r"|\.netrc\b|\.npmrc\b|\.pypirc\b|\.git-credentials\b|\.aws/credentials|\.azure\b"
+            r"|\.kube/config|\bkubeconfig\b|\.docker/config\.json|\bgh/hosts\.yml"
+            r"|application_default_credentials|\.config/gcloud\b|(?<![\w.-])op\s"
+            r"|\bprivate key\b|\b[\w-]*tokens?\.(?:txt|json|ya?ml)\b"
+            r"|/etc/(?:passwd|shadow|master\.passwd|sudoers|ssh)\b"
+            r"|\b" + _LEAK_VERBS + r"\b.{0,40}?\b" + _SECRET_NOUNS + r"\b"
+            r"|\b" + _SECRET_NOUNS + r"\b.{0,40}?\b" + _LEAK_VERBS + r"\b",
             re.I,
         ),
     ),
     Rule(
         "lint.override_instructions",
         _pattern(
-            r"\b(?:ignore|disregard|override|overrule|forget|bypass)\b.{0,40}?"
-            r"\b(?:instructions?|prompts?|rules|guidelines|directions)\b|\bsystem prompt\b|\byou are now\b",
+            r"\b" + _OVERRIDE_VERBS + _FEW_WORDS + _OVERRIDE_TARGETS + r"\b"
+            r"|\b(?:instructions?|prompts?|guidelines?|directives?)"
+            + _FEW_WORDS
+            + _OVERRIDE_VERBS
+            + r"|\bobey\w*|\bonly follow\b|\byou are now\b|\bnew instructions?\b|\bsystem prompt\b"
+            r"|\bdeveloper message\b|\bfrom now on\b|\bpay no (?:attention|heed)\b|\bcame before\b"
+            r"|\bfollow (?:only )?(?:this|these)\b|\bthis lesson\b|\b(?:priority|precedence)\b"
+            r"|\byou (?:must|should|shall|will|need to|have to|are)\b"
+            r"|\b(?:assistant|claude|codex|chatgpt|llm)\b",
             re.I,
         ),
     ),
@@ -136,29 +191,65 @@ IMPERATIVE_RULES: tuple[Rule, ...] = (
             r"\b(?:safety|sandbox\w*|guard\w*|permissions?|security|hooks?|scars|verification|ssl|tls"
             r"|certificates?)\b"
             r"|--dangerously|--no-verify|--no-sandbox|--yolo|danger-full-access|bypasspermissions"
-            r"|\bscars_off\b|\bscars off\b|git_ssl_no_verify|node_tls_reject_unauthorized",
+            r"|\bscars_off\b|\bscars off\b|git_ssl_no_verify|node_tls_reject_unauthorized"
+            r"|\bsudo\b|\bdoas\b",
             re.I,
         ),
     ),
 )
 
-SHELL_BUILTINS = frozenset({"cd", "pushd", "popd", "export", "unset", "true", "false"})
+SHELL_BUILTINS = frozenset({"cd", "pushd", "popd", "true", "false"})
 """Builtins that run no program, so they need no entry in `known_programs`."""
 
-_COMMAND_SPLIT = frozenset({"&&", "||", ";", "|", "&", "(", ")", ";;", "|&"})
-_REDIRECTS = frozenset({"<", ">", ">>", "<<", "<<<", ">&", "<&", ">|", "&>", "&>>"})
+WRAPPER_PROGRAMS = frozenset({"env", "time", "nohup", "sudo", "uv", "npx", "python", "python3", "bash", "sh"})
+"""Words the shell parser unwraps to reach the program they run. The parser reports only the inner
+program, so a wrapper named in a backticked command must be a known program too."""
+
+LAUNCHERS = frozenset(
+    {"xargs", "nice", "timeout", "gtimeout", "watch", "nohup", "command", "builtin", "exec", "eval"}
+    | {"env", "sudo", "doas", "su", "caffeinate", "open", "launchctl", "script", "flock", "parallel"}
+    | {"strace", "ltrace", "dtrace", "dtruss", "lldb", "gdb", "entr", "chroot", "unshare", "nsenter"}
+    | {"osascript", "at", "batch", "crontab", "ssh", "sshpass", "uvx", "pipx", "bunx", "source", "."}
+)
+"""Programs whose job is to run another program named in their arguments, which the known-program
+rule cannot see. A backticked command may not run one."""
+
+LAUNCHING_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "npm": frozenset({"exec", "x"}),
+    "pnpm": frozenset({"dlx", "exec"}),
+    "yarn": frozenset({"dlx", "exec"}),
+    "bun": frozenset({"x"}),
+    "uv": frozenset({"tool"}),
+}
+
+XCRUN_TOOLS = frozenset(
+    {"simctl", "xcodebuild", "devicectl", "notarytool", "stapler", "xctrace", "swift", "swiftc"}
+    | {"clang", "clang++", "lipo", "otool", "codesign", "actool", "ibtool", "altool"}
+)
+"""`xcrun` runs a developer tool by name, so its first operand must be one of these."""
+
+
+def _launches(program: str, args: tuple[str, ...]) -> bool:
+    if program in LAUNCHERS:
+        return True
+    if program == "xcrun":
+        operands = [a for a in args if not a.startswith("-")]
+        return "-r" in args or "--run" in args or (bool(operands) and operands[0] not in XCRUN_TOOLS)
+    return bool(args) and args[0] in LAUNCHING_SUBCOMMANDS.get(program, frozenset())
+
+
 _SUBSTITUTION_PLACEHOLDER = "SUBST"
 _MAX_SUBSTITUTION_DEPTH = 3
 
 
-class _Unparseable(Exception):
-    pass
-
-
 def _split_substitutions(command: str, depth: int = 0) -> list[str]:
-    """Return the outer command with each `$(...)` replaced by a placeholder, then each inner command."""
+    """The outer command with each `$(...)` body replaced by a placeholder word, then each body.
+
+    The shell parser rejects `$(`, so each body is parsed as a command of its own. Parentheses are
+    counted without regard to quoting; a miscount leaves a fragment that fails to parse, which rejects.
+    """
     if depth > _MAX_SUBSTITUTION_DEPTH:
-        raise _Unparseable
+        raise Unsupported("substitutions nested too deep")
     outer: list[str] = []
     inner: list[str] = []
     i = 0
@@ -169,7 +260,7 @@ def _split_substitutions(command: str, depth: int = 0) -> list[str]:
                 level += {"(": 1, ")": -1}.get(command[j], 0)
                 j += 1
             if level:
-                raise _Unparseable
+                raise Unsupported("unbalanced $(")
             inner.extend(_split_substitutions(command[i + 2 : j - 1], depth + 1))
             outer.append(_SUBSTITUTION_PLACEHOLDER)
             i = j
@@ -179,41 +270,16 @@ def _split_substitutions(command: str, depth: int = 0) -> list[str]:
     return ["".join(outer), *inner]
 
 
-def command_programs(command: str) -> frozenset[str]:
-    """Programs a backticked shell command would run: the first word of every simple command.
+def _words(command: str) -> set[str]:
+    return {w.strip("\"'") for w in command.split()}
 
-    Simple commands are split at `&&`, `||`, `;`, `|`, `&` and parentheses, `$(...)` bodies are parsed
-    as commands of their own, leading `VAR=value` words are skipped, redirections and their targets are
-    dropped, and a program is the basename of its word. Shell builtins that run nothing are left out.
-    Raises `_Unparseable` on unbalanced quotes or parentheses.
+
+def _check_instead_command(instead: str, known_programs: frozenset[str] | None) -> None:
+    """At most one backticked command, parsed by the shell parser, running only known programs.
+
+    A program word that contains `/` is rejected: the parser reports only its basename, and an explicit
+    path can run any file under a known name. `known_programs=None` skips only the membership rule.
     """
-    programs: set[str] = set()
-    for part in _split_substitutions(command):
-        lexer = shlex.shlex(part, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        try:
-            tokens = list(lexer)
-        except ValueError as error:
-            raise _Unparseable from error
-        at_start, skip_next = True, False
-        for token in tokens:
-            if skip_next:
-                skip_next = False
-            elif token in _COMMAND_SPLIT:
-                at_start = True
-            elif token in _REDIRECTS:
-                skip_next = True
-            elif at_start and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
-                continue
-            elif at_start:
-                at_start = False
-                program = token.rsplit("/", 1)[-1]
-                if program not in SHELL_BUILTINS:
-                    programs.add(program)
-    return frozenset(programs)
-
-
-def _check_instead_command(instead: str, known_programs: frozenset[str]) -> None:
     ticks = instead.count("`")
     if ticks == 0:
         return
@@ -221,12 +287,23 @@ def _check_instead_command(instead: str, known_programs: frozenset[str]) -> None
         raise RejectedText("lint.instead_unbalanced_backticks", "instead")
     if ticks > 2:
         raise RejectedText("lint.instead_multiple_commands", "instead")
-    command = instead.split("`")[1].strip()
+    command = instead.split("`")[1]
     try:
-        programs = command_programs(command)
-    except _Unparseable:
+        pieces = _split_substitutions(command)
+        parsed = [c for piece in pieces for c in parse(piece)]
+    except Unsupported:
         raise RejectedText("lint.instead_unparseable_command", "instead") from None
-    if not command or not programs <= known_programs:
+    if not parsed:
+        raise RejectedText("lint.instead_unknown_program", "instead")
+    for c in parsed:
+        if re.search("/" + re.escape(c.program) + r"(?![A-Za-z0-9._+-])", command):
+            raise RejectedText("lint.instead_program_path", "instead")
+        if _launches(c.program, c.args):
+            raise RejectedText("lint.instead_launcher", "instead")
+    if known_programs is None:
+        return
+    programs = {c.program for c in parsed} | (_words(command) & WRAPPER_PROGRAMS)
+    if not programs - SHELL_BUILTINS <= known_programs:
         raise RejectedText("lint.instead_unknown_program", "instead")
 
 
@@ -243,7 +320,7 @@ characters) away from the entropy check entirely. Hex strings of any length, inc
 commit SHAs, top out at exactly 4.0 bits per character (log2 of 16 symbols), so the strictly-greater
 threshold never fires on them. The cost: a base64 secret containing `/` is scored per segment, and a
 uniformly random 20-character alphanumeric token only exceeds 4.0 bits about two times in three. The
-named token formats are the main defense; entropy is the backstop.
+named token formats are the main defense; entropy is the fallback.
 """
 
 
@@ -257,14 +334,22 @@ def _high_entropy(text: str) -> bool:
     return any(shannon_entropy(t) > ENTROPY_THRESHOLD for t in _ENTROPY_TOKEN.findall(text))
 
 
-_NOT_TOKEN_BEFORE = r"(?<![A-Za-z0-9_-])"
-
 SECRET_RULES: tuple[Rule, ...] = (
-    Rule("secret.github_token", _pattern(_NOT_TOKEN_BEFORE + r"(?:ghp_|gho_|github_pat_)[A-Za-z0-9_]")),
-    Rule("secret.openai_key", _pattern(_NOT_TOKEN_BEFORE + r"sk-[A-Za-z0-9_-]")),
-    Rule("secret.slack_token", _pattern(_NOT_TOKEN_BEFORE + r"xox[abp]-[A-Za-z0-9-]")),
-    Rule("secret.aws_key", _pattern(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
-    Rule("secret.jwt", _pattern(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")),
+    # Named formats match wherever they start, so a prefix such as `-` or `x` cannot hide them.
+    Rule("secret.github_token", _pattern(r"(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]")),
+    # `sk-` also occurs inside words (`task-runner`, `disk-usage`), so a bare `sk-` counts only when no
+    # letter or digit precedes it; the project prefixes and long `sk-` runs count anywhere.
+    Rule(
+        "secret.openai_key",
+        _pattern(r"sk-(?:proj|svcacct|admin|ant)-|sk-[A-Za-z0-9_-]{16,}|(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]"),
+    ),
+    Rule("secret.slack_token", _pattern(r"xox[abposr]-[A-Za-z0-9-]")),
+    Rule("secret.aws_key", _pattern(r"(?:AKIA|ASIA)[0-9A-Z]{16}")),
+    Rule("secret.gitlab_token", _pattern(r"glpat-[A-Za-z0-9_-]")),
+    Rule("secret.google_api_key", _pattern(r"AIza[0-9A-Za-z_-]{20,}")),
+    Rule("secret.npm_token", _pattern(r"npm_[A-Za-z0-9]{20,}")),
+    Rule("secret.stripe_key", _pattern(r"(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]")),
+    Rule("secret.jwt", _pattern(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")),
     Rule("secret.url_userinfo", _pattern(r"//[^\s/@:]+:[^\s/@]*@")),
     Rule("secret.pem_header", _pattern(r"-----BEGIN [A-Z0-9 ]*-----")),
     Rule("secret.high_entropy", _high_entropy),
@@ -273,19 +358,73 @@ SECRET_RULES: tuple[Rule, ...] = (
 # ---------------------------------------------------------------- machine-scope lint
 
 ALLOWED_ROOTS = ("~/.scars", "/Volumes/990 Pro", "/tmp", "/usr", "/opt")
-"""Absolute path roots a machine-scope lesson may name. A root matches only at a path boundary, so
-`/tmpfiles` and `/Volumes/990 Profile` are outside it."""
+"""Absolute path roots a machine-scope lesson may name. A path is normalized first (repeated `/` and
+`.` segments removed, `$HOME` read as `~`), then matches a root only when it equals the root or
+continues it with `/`, so `/tmpfiles` and `/Volumes/990 Profile` are outside it."""
 
 _GIT_REMOTES = frozenset({"origin", "upstream"})
 """Owners that are git remote names, so `origin/main` reads as a branch, not a GitHub repo."""
 
-_ALLOWED_PATH = re.compile(
-    r"(?<![\w.~$/-])(?:" + "|".join(re.escape(r) for r in ALLOWED_ROOTS) + r")(?![^\s/`'\")])[^\s`'\"]*"
-)
-_ABSOLUTE_PATH = re.compile(r"(?<![\w.~$/-])(?:~/|/)[\w.~-]|~[A-Za-z_]|\$HOME\b|\$\{HOME\}")
+_PATH_START = re.compile(r"(?<![\w.~$/-])(?:~/|/+(?=[\w.~-])|~(?=[A-Za-z_])|\$HOME\b|\$\{HOME\})")
+_PATH_BODY = re.compile(r"[^\s`'\"]*")
+_QUOTED = re.compile(r"\"([^\"]*)\"|'([^']*)'")
+_DOTDOT = re.compile(r"(?<![^\s/`'\"])\.\.(?![^\s/`'\"])")
+_SENTENCE_END = ".,;:!?"
+_ROOTS_LONGEST_FIRST = sorted(ALLOWED_ROOTS, key=len, reverse=True)
 _OWNER_NAME = re.compile(r"(?<![\w.~$/@:-])([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?![\w./-])")
 """Exactly two slash-separated segments in GitHub's owner and repo alphabets. This also flags two-segment
 relative paths such as `apps/web`; a machine-scope lesson should describe a layout in words instead."""
+
+
+@dataclass(frozen=True)
+class _PathSpan:
+    start: int
+    end: int
+    path: str
+    quoted: bool
+
+
+def _unquoted_paths(text: str, lo: int, hi: int) -> Iterator[_PathSpan]:
+    """Absolute paths in `text[lo:hi]`. An allowed root that contains a space is read whole."""
+    pos = lo
+    while (m := _PATH_START.search(text, pos, hi)) is not None:
+        start = m.start()
+        root = next((r for r in _ROOTS_LONGEST_FIRST if text.startswith(r, start, hi)), "")
+        body = _PATH_BODY.match(text, start + len(root), hi)
+        end = body.end() if body else start + len(root)
+        path = text[start:end].rstrip(")")
+        if path[-1:] in _SENTENCE_END and path[-2:-1] not in _SENTENCE_END:
+            path = path[:-1].rstrip(")")
+        yield _PathSpan(start, end, path, quoted=False)
+        pos = max(end, start + 1)
+
+
+def _paths(text: str) -> Iterator[_PathSpan]:
+    """Every absolute path in `text`. A quoted string that starts with a path is one path, spaces included."""
+    pos = 0
+    for q in _QUOTED.finditer(text):
+        yield from _unquoted_paths(text, pos, q.start())
+        inner = q.group(1) if q.group(1) is not None else q.group(2)
+        if _PATH_START.match(inner):
+            yield _PathSpan(q.start(), q.end(), inner, quoted=True)
+        else:
+            yield from _unquoted_paths(text, q.start() + 1, q.end() - 1)
+        pos = q.end()
+    yield from _unquoted_paths(text, pos, len(text))
+
+
+def _normalize(path: str) -> str:
+    path = re.sub(r"^(?:\$HOME|\$\{HOME\})", "~", path)
+    head, *segments = path.split("/")
+    kept = [s for s in segments if s not in ("", ".")]
+    return "/".join([head, *kept]) if kept else (head or "/")
+
+
+def _allowed(path: str) -> bool:
+    if re.search(r"\s(?:/|~|\$HOME|\$\{HOME\})", path):
+        return False
+    normal = _normalize(path)
+    return any(normal == root or normal.startswith(root + "/") for root in ALLOWED_ROOTS)
 
 
 def _names_repo(text: str, registered_repos: Iterable[str]) -> bool:
@@ -297,47 +436,82 @@ def _names_repo(text: str, registered_repos: Iterable[str]) -> bool:
     )
 
 
-def _check_machine_scope(text: LessonText, registered_repos: Sequence[str]) -> None:
+def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[str]) -> None:
     for field in FIELDS:
-        value = getattr(text, field)
+        value = values[field]
         if _names_repo(value, registered_repos):
             raise RejectedText("machine.repo_name", field)
-        masked = _ALLOWED_PATH.sub(" ", value)
-        if _ABSOLUTE_PATH.search(masked):
-            raise RejectedText("machine.absolute_path", field)
-        if any(m.group(1).lower() not in _GIT_REMOTES for m in _OWNER_NAME.finditer(masked)):
+        if _DOTDOT.search(value):
+            raise RejectedText("machine.dotdot_path", field)
+        masked = list(value)
+        for span in _paths(value):
+            if not _allowed(span.path):
+                raise RejectedText("machine.absolute_path", field)
+            masked[span.start : span.end] = " " * (span.end - span.start)
+        rest = "".join(masked)
+        if any(m.group(1).lower() not in _GIT_REMOTES for m in _OWNER_NAME.finditer(rest)):
             raise RejectedText("machine.github_repo", field)
 
 
 # ---------------------------------------------------------------- check
 
 
-def _run(rules: Sequence[Rule], text: LessonText) -> None:
+def _run(rules: Sequence[Rule], values: Mapping[str, str]) -> None:
     for field in FIELDS:
-        value = getattr(text, field)
         for rule in rules:
-            if rule.hits(value):
+            if rule.hits(values[field]):
                 raise RejectedText(rule.name, field)
+
+
+def _check_values(
+    values: Mapping[str, str],
+    scope: Scope,
+    known_programs: frozenset[str] | None,
+    registered_repos: Sequence[str],
+) -> None:
+    _run(SANITIZER_RULES, values)
+    _run(IMPERATIVE_RULES, values)
+    _check_instead_command(values["instead"], known_programs)
+    _run(SECRET_RULES, values)
+    if isinstance(scope, MachineScope):
+        _check_machine_scope(values, registered_repos)
 
 
 def check(
     text: LessonText,
     scope: Scope,
     *,
-    known_programs: frozenset[str] = frozenset(),
+    known_programs: frozenset[str] | None,
     registered_repos: Sequence[str] = (),
 ) -> None:
-    """Raise `RejectedText` unless every field passes every stage. Returns None on success.
+    """Raise `RejectedText` unless every field passes every stage.
 
-    `known_programs` holds the programs this machine ran successfully, as the miner records them.
+    `known_programs` holds the programs this machine ran successfully, as the miner records them. It is
+    required so that a caller cannot skip the membership rule by accident; `None` skips that one rule.
     `registered_repos` holds the display names of every registered repo.
     """
-    _run(SANITIZER_RULES, text)
-    _run(IMPERATIVE_RULES, text)
-    _check_instead_command(text.instead, known_programs)
-    _run(SECRET_RULES, text)
-    if isinstance(scope, MachineScope):
-        _check_machine_scope(text, registered_repos)
+    values = {field: getattr(text, field) for field in FIELDS}
+    _check_values(values, scope, known_programs, registered_repos)
+
+
+def check_fields(
+    avoid: str,
+    instead: str,
+    reason: str,
+    scope: Scope,
+    *,
+    known_programs: frozenset[str] | None,
+    registered_repos: Sequence[str] = (),
+) -> LessonText:
+    """Check raw field strings and return them as `LessonText`.
+
+    Unlike constructing `LessonText` first, an empty or over-cap field comes back as `RejectedText`
+    (`sanitizer.empty`, `sanitizer.over_cap`) naming the field, so the miner can drop the candidate the
+    same way it drops any other rejection.
+    """
+    values = {"avoid": avoid, "instead": instead, "reason": reason}
+    _check_values(values, scope, known_programs, registered_repos)
+    return LessonText(avoid=avoid, instead=instead, reason=reason)
 
 
 # ---------------------------------------------------------------- render
@@ -358,8 +532,8 @@ def scope_label(scope: Scope) -> str:
 
 
 def _check_header(lesson: Lesson) -> None:
-    """The header carries values that `check` never sees, so hold them to the sanitizer and secret scan
-    too, and keep `|` out so a value cannot forge another header column."""
+    """The header carries values that `check` never sees, so hold them to the sanitizer (printable
+    ASCII only) and the secret scan too, and keep `|` out so a value cannot forge another header column."""
     if not _LESSON_ID.fullmatch(lesson.id):
         raise RejectedText("header.lesson_id", "id")
     label = scope_label(lesson.scope)
@@ -381,7 +555,7 @@ def _header(lesson: Lesson, reviewed_on: date | None) -> str:
     return f"[scars {lesson.id} {lesson.level} | {label} | seen in {sessions} | {reviewed}]"
 
 
-def _recheck(lesson: Lesson, known_programs: frozenset[str], registered_repos: Sequence[str]) -> None:
+def _recheck(lesson: Lesson, known_programs: frozenset[str] | None, registered_repos: Sequence[str]) -> None:
     _check_header(lesson)
     check(lesson.text, lesson.scope, known_programs=known_programs, registered_repos=registered_repos)
 
@@ -390,15 +564,16 @@ def render(
     lesson: Lesson,
     *,
     reviewed_on: date | None = None,
-    known_programs: frozenset[str] = frozenset(),
+    known_programs: frozenset[str] | None = None,
     registered_repos: Sequence[str] = (),
 ) -> str:
     """Render one lesson as quoted, advisory data with its provenance.
 
     The lesson record has no review date, so the caller passes `reviewed_on`, the date of the lesson's
     latest promotion event. Only a promoted lesson with a date says `reviewed <date>`; every other lesson
-    says `unreviewed`. `check` runs again first, with the same `known_programs` and `registered_repos`
-    the store used, and its `RejectedText` propagates so stale or tampered text is never shown.
+    says `unreviewed`. Every check runs again first and its `RejectedText` propagates, so stale or
+    tampered text is never shown. With `known_programs=None` (a hook that lacks the miner's program list)
+    only the program-membership rule is skipped.
     """
     _recheck(lesson, known_programs, registered_repos)
     return "\n".join(
@@ -430,28 +605,39 @@ LESSON_SEPARATOR = "\n"
 
 
 @dataclass(frozen=True)
+class Rendered:
+    lesson_id: LessonId
+    text: str
+
+
+@dataclass(frozen=True)
 class Fitted:
-    lessons: tuple[str, ...]
+    kept: tuple[Rendered, ...]
     dropped: int
 
     @property
+    def ids(self) -> tuple[LessonId, ...]:
+        """The lessons actually shown, for the hook's `shown` rows."""
+        return tuple(r.lesson_id for r in self.kept)
+
+    @property
     def text(self) -> str:
-        return LESSON_SEPARATOR.join(self.lessons)
+        return LESSON_SEPARATOR.join(r.text for r in self.kept)
 
 
-def fit(rendered: Sequence[str], budget: Budget) -> Fitted:
+def fit(rendered: Sequence[Rendered], budget: Budget) -> Fitted:
     """Keep whole rendered lessons, in their given order, while the joined text stays within the budget.
 
     The cost counts the separator between kept lessons. A lesson that does not fit is skipped, never cut,
     and a later, shorter lesson may still take the space it left.
     """
-    kept: list[str] = []
+    kept: list[Rendered] = []
     used = 0
-    for lesson in rendered:
-        cost = len(lesson) + (len(LESSON_SEPARATOR) if kept else 0)
+    for item in rendered:
+        cost = len(item.text) + (len(LESSON_SEPARATOR) if kept else 0)
         full = budget.max_lessons is not None and len(kept) >= budget.max_lessons
         if not full and used + cost <= budget.chars:
-            kept.append(lesson)
+            kept.append(item)
             used += cost
     return Fitted(tuple(kept), len(rendered) - len(kept))
 
@@ -459,7 +645,7 @@ def fit(rendered: Sequence[str], budget: Budget) -> Fitted:
 def render_deny(
     lesson: Lesson,
     *,
-    known_programs: frozenset[str] = frozenset(),
+    known_programs: frozenset[str] | None = None,
     registered_repos: Sequence[str] = (),
 ) -> str:
     """A PreToolUse deny reason of at most `DENY_CAP` characters, without cutting any field.
