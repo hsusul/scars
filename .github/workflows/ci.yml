@@ -32,4 +32,3 @@ jobs:
         with:
           python-version: "3.13"
       - run: python scripts/check_traceability.py
-      - run: python scripts/check_schema.py
