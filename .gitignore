@@ -9,5 +9,5 @@ dist/
 build/
 *.egg-info/
 .DS_Store
-decisions.tsv
-children.tsv
+/decisions.tsv
+/children.tsv
