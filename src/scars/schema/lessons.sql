@@ -73,6 +73,14 @@ create table pending_failures (                -- failures still waiting for a f
   tool text not null, program text, input text not null, error_signature text not null,
   calls_since integer not null default 0, last_call_at real not null
 );
+create table if not exists mined_calls (       -- the last 30 days of mined tool calls, for the precision check and outcomes
+  seq integer primary key,                     -- transcript order within a session
+  tool_use_id text not null unique, harness text not null, session_id text not null, at real not null,
+  tool text not null, tool_kind text not null, command text,   -- command after secret scan, else null
+  paths text not null default '[]', status text not null check (status in ('ok','failed','unknown')),
+  error_signature text, cwd text not null, model_id text
+);
+create index if not exists mined_calls_session on mined_calls(session_id, seq);
 create table precision_runs (lesson_id text not null, revision integer not null, matched_failing integer not null,
                              matched_passing integer not null, window_days integer not null, at real not null,
                              primary key (lesson_id, revision));

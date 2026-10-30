@@ -1,0 +1,78 @@
+from scars import store
+from scars.model import LessonId, LessonText, RepoId, RepoScope, Stage, Trigger, TriggerKind, TrustClass
+
+T0 = 1_800_000_000.0
+
+
+def call(tool_use_id: str, session_id: str, at: float, command: str | None = "ls") -> store.MinedCall:
+    return store.MinedCall(
+        tool_use_id, "claude", session_id, at, "Bash", "shell", command, ("a",), "ok", None, "/r", "m"
+    )
+
+
+def pending(tool_use_id: str) -> store.PendingFailure:
+    return store.PendingFailure(tool_use_id, "claude", "s", "Bash", "ls", "ls x", "E: x", 3, T0)
+
+
+def test_commit_batch_replaces_pending_and_prunes_old_calls(tmp_path):
+    db = store.init_lessons(tmp_path / "lessons.db")
+    store.commit_batch(
+        db,
+        offsets=[store.Offset("/t/a.jsonl", 10, 7, 1.5)],
+        seen=["x1", "x2"],
+        pending=[pending("p1"), pending("p2")],
+        calls=[call("x1", "s", T0), call("x2", "s", T0 + 1), call("old", "s", T0 - 100)],
+        prune_before=T0 - 10,
+    )
+    store.commit_batch(
+        db,
+        offsets=[store.Offset("/t/a.jsonl", 20, 7, 2.5)],
+        seen=["x2", "x3"],
+        pending=[pending("p2")],
+        calls=[call("x3", "t", T0 + 2)],
+        prune_before=T0 - 10,
+    )
+    assert store.miner_offsets(db) == {"/t/a.jsonl": store.Offset("/t/a.jsonl", 20, 7, 2.5)}
+    assert store.seen_tool_uses(db, ["x1", "x3", "nope"]) == frozenset({"x1", "x3"})
+    assert store.pending_failures(db) == [pending("p2")]
+    assert [c.tool_use_id for c in store.mined_calls_since(db, 0)] == ["x1", "x2", "x3"]
+    assert store.session_calls(db, "s") == [call("x1", "s", T0), call("x2", "s", T0 + 1)]
+    assert store.mined_call(db, "x3") == call("x3", "t", T0 + 2)
+    assert store.mined_call(db, "old") is None
+
+
+def test_observations_precision_runs_and_clones(tmp_path):
+    db = store.init_lessons(tmp_path / "lessons.db")
+    store.add_repo(db, RepoId("r"), "app", "upstream")
+    store.add_clone(db, "/git/a", RepoId("r"), at=T0)
+    assert store.repo_for_common_dir(db, ["/git/a"]) == "r"
+    assert store.repo_owner_class(db, RepoId("r")) == "upstream"
+    assert store.repo_owner_class(db, RepoId("none")) is None
+    lesson = store.create_lesson(
+        db,
+        text=LessonText("ls x", "run `ls` instead", "E: x"),
+        scope=RepoScope(RepoId("r")),
+        trust_class=TrustClass.THIRD_PARTY_REPO,
+        triggers=[Trigger(TriggerKind.ERROR, "E: x", Stage.REPAIR)],
+        fingerprint="f",
+        actor="miner",
+        at=T0,
+    )
+    obs = store.Observation(LessonId(lesson), "claude", "s", "t1", "ls x", "E: x", "ls", T0)
+    assert store.add_observation(db, obs) is True
+    assert store.add_observation(db, obs) is False
+    assert store.has_observation(db, "t1") is True
+    assert store.passing_inputs(db, [lesson]) == {lesson: frozenset({"ls"})}
+    store.record_precision(db, lesson, 1, matched_failing=1, matched_passing=2, window_days=30, at=T0)
+    store.record_precision(db, lesson, 1, matched_failing=3, matched_passing=0, window_days=30, at=T0 + 1)
+    assert db.execute("select * from precision_runs").fetchall() == [(lesson, 1, 3, 0, 30, T0 + 1)]
+    assert store.lesson_last_seen(db, lesson) == T0
+    assert store.expiring_lessons(db, T0 + store.EXPIRY_SECONDS) == [(lesson, 1)]
+
+
+def test_ensure_miner_schema_adds_the_calls_table_to_an_older_store(tmp_path):
+    db = store.init_lessons(tmp_path / "lessons.db")
+    db.execute("drop table mined_calls")
+    store.ensure_miner_schema(db)
+    store.ensure_miner_schema(db)
+    assert store.mined_calls_since(db, 0) == []

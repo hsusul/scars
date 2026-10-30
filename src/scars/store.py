@@ -937,3 +937,265 @@ def promoted_at(db: sqlite3.Connection, lesson_ids: Iterable[LessonId]) -> dict[
         "group by lesson_id"
     )
     return {LessonId(lesson_id): at for lesson_id, at in db.execute(sql, ids)}
+
+
+# ---------------------------------------------------------------- miner state
+
+
+def ensure_miner_schema(db: sqlite3.Connection) -> None:
+    """Create the miner's `mined_calls` table in a store made before it existed. Idempotent."""
+    for statement in _statements(schema_sql("lessons")):
+        if "if not exists" in statement and "mined_calls" in statement:
+            db.execute(statement)
+
+
+def add_clone(db: sqlite3.Connection, common_dir: str, repo_id: RepoId, at: float | None = None) -> None:
+    """Register a clone's git common dir for a registered repo, or move it to that repo."""
+    db.execute(
+        "insert into clones (common_dir, repo_id, registered_at) values (?,?,?) "
+        "on conflict(common_dir) do update set repo_id = excluded.repo_id",
+        (common_dir, repo_id, time.time() if at is None else at),
+    )
+
+
+def repo_owner_class(db: sqlite3.Connection, repo_id: RepoId) -> str | None:
+    """`own` or `upstream` for a registered repo, or None when it is not registered."""
+    row = db.execute("select owner_class from repos where id = ?", (repo_id,)).fetchone()
+    return row[0] if row else None
+
+
+@dataclass(frozen=True)
+class Offset:
+    path: str
+    offset: int
+    inode: int
+    mtime: float
+
+
+@dataclass(frozen=True)
+class PendingFailure:
+    """A failed call still waiting, across batches, for the call that fixes it."""
+
+    tool_use_id: str
+    harness: str
+    session_id: str
+    tool: str
+    program: str | None
+    input: str
+    error_signature: str
+    calls_since: int
+    last_call_at: float
+
+
+@dataclass(frozen=True)
+class MinedCall:
+    """One `mined_calls` row. `command` is None for non-shell calls and for commands that held a secret."""
+
+    tool_use_id: str
+    harness: str
+    session_id: str
+    at: float
+    tool: str
+    tool_kind: str
+    command: str | None
+    paths: tuple[str, ...]
+    status: str
+    """`ok`, `failed`, or `unknown` when the transcript shows no outcome (a Codex call with no exit code)."""
+    error_signature: str | None
+    cwd: str
+    model_id: str | None
+
+
+@dataclass(frozen=True)
+class Observation:
+    lesson_id: LessonId
+    harness: str
+    session_id: str
+    failed_tool_use_id: str
+    failed_input: str
+    error_signature: str
+    passing_input: str
+    at: float
+
+
+def miner_offsets(db: sqlite3.Connection) -> dict[str, Offset]:
+    return {r[0]: Offset(*r) for r in db.execute("select path, offset, inode, mtime from miner_offsets")}
+
+
+def seen_tool_uses(db: sqlite3.Connection, ids: Iterable[str]) -> frozenset[str]:
+    """The subset of `ids` already fully processed by an earlier batch."""
+    wanted = list(dict.fromkeys(ids))
+    found: set[str] = set()
+    for start in range(0, len(wanted), 500):
+        chunk = wanted[start : start + 500]
+        marks = ",".join("?" * len(chunk))
+        found.update(
+            r[0]
+            for r in db.execute(
+                f"select tool_use_id from seen_tool_use where tool_use_id in ({marks})", chunk
+            )
+        )
+    return frozenset(found)
+
+
+def pending_failures(db: sqlite3.Connection) -> list[PendingFailure]:
+    rows = db.execute(
+        "select tool_use_id, harness, session_id, tool, program, input, error_signature, calls_since, "
+        "last_call_at from pending_failures order by last_call_at, tool_use_id"
+    )
+    return [PendingFailure(*r) for r in rows]
+
+
+def _mined_call(row: tuple[object, ...]) -> MinedCall:
+    values = list(row)
+    values[7] = tuple(json.loads(str(values[7])))
+    return MinedCall(*values)  # type: ignore[arg-type]
+
+
+_CALL_COLUMNS = (
+    "tool_use_id, harness, session_id, at, tool, tool_kind, command, paths, status, "
+    "error_signature, cwd, model_id"
+)
+
+
+def mined_calls_since(db: sqlite3.Connection, since: float) -> list[MinedCall]:
+    """Every mined call at or after `since`, in transcript order."""
+    rows = db.execute(f"select {_CALL_COLUMNS} from mined_calls where at >= ? order by seq", (since,))
+    return [_mined_call(r) for r in rows]
+
+
+def session_calls(db: sqlite3.Connection, session_id: str) -> list[MinedCall]:
+    """One session's mined calls in transcript order."""
+    rows = db.execute(
+        f"select {_CALL_COLUMNS} from mined_calls where session_id = ? order by seq", (session_id,)
+    )
+    return [_mined_call(r) for r in rows]
+
+
+def mined_call(db: sqlite3.Connection, tool_use_id: str) -> MinedCall | None:
+    row = db.execute(
+        f"select {_CALL_COLUMNS} from mined_calls where tool_use_id = ?", (tool_use_id,)
+    ).fetchone()
+    return _mined_call(row) if row else None
+
+
+def has_observation(db: sqlite3.Connection, failed_tool_use_id: str) -> bool:
+    found = db.execute("select 1 from observations where failed_tool_use_id = ?", (failed_tool_use_id,))
+    return found.fetchone() is not None
+
+
+def add_observation(db: sqlite3.Connection, obs: Observation) -> bool:
+    """Insert one observation; False when one already exists for this failed call."""
+    cur = db.execute(
+        "insert or ignore into observations (lesson_id, harness, session_id, failed_tool_use_id, "
+        "failed_input, error_signature, passing_input, at) values (?,?,?,?,?,?,?,?)",
+        (
+            obs.lesson_id,
+            obs.harness,
+            obs.session_id,
+            obs.failed_tool_use_id,
+            obs.failed_input,
+            obs.error_signature,
+            obs.passing_input,
+            obs.at,
+        ),
+    )
+    return cur.rowcount == 1
+
+
+def record_precision(
+    db: sqlite3.Connection,
+    lesson_id: LessonId,
+    revision: int,
+    *,
+    matched_failing: int,
+    matched_passing: int,
+    window_days: int,
+    at: float,
+) -> None:
+    """Store one precision run for a lesson revision, replacing an earlier run of the same revision."""
+    db.execute(
+        "insert or replace into precision_runs (lesson_id, revision, matched_failing, matched_passing, "
+        "window_days, at) values (?,?,?,?,?,?)",
+        (lesson_id, revision, matched_failing, matched_passing, window_days, at),
+    )
+
+
+def lesson_last_seen(db: sqlite3.Connection, lesson_id: LessonId) -> float | None:
+    row = db.execute("select last_seen_at from lessons where id = ?", (lesson_id,)).fetchone()
+    return row[0] if row else None
+
+
+def expiring_lessons(db: sqlite3.Connection, now: float) -> list[tuple[LessonId, int]]:
+    """`(id, revision)` of every candidate and provisional lesson whose expiry time has passed."""
+    rows = db.execute(
+        "select id, revision from lessons where status in ('candidate','provisional') "
+        "and expires_at is not null and expires_at <= ? order by id",
+        (now,),
+    )
+    return [(LessonId(i), r) for i, r in rows]
+
+
+def commit_batch(
+    db: sqlite3.Connection,
+    *,
+    offsets: Iterable[Offset],
+    seen: Iterable[str],
+    pending: Iterable[PendingFailure],
+    calls: Iterable[MinedCall],
+    prune_before: float,
+) -> None:
+    """Advance the miner in one transaction: new file offsets, processed tool results, the full set of
+    still-pending failures (replacing the old set), new mined calls, and calls older than `prune_before`
+    removed. A crash leaves either the old state or the new one, so a batch is never half-consumed."""
+    db.execute("begin immediate")
+    try:
+        db.executemany(
+            "insert or replace into miner_offsets (path, offset, inode, mtime) values (?,?,?,?)",
+            [(o.path, o.offset, o.inode, o.mtime) for o in offsets],
+        )
+        db.executemany("insert or ignore into seen_tool_use (tool_use_id) values (?)", [(s,) for s in seen])
+        db.execute("delete from pending_failures")
+        db.executemany(
+            "insert into pending_failures (tool_use_id, harness, session_id, tool, program, input, "
+            "error_signature, calls_since, last_call_at) values (?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    p.tool_use_id,
+                    p.harness,
+                    p.session_id,
+                    p.tool,
+                    p.program,
+                    p.input,
+                    p.error_signature,
+                    p.calls_since,
+                    p.last_call_at,
+                )
+                for p in pending
+            ],
+        )
+        db.executemany(
+            f"insert or ignore into mined_calls ({_CALL_COLUMNS}) values (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    c.tool_use_id,
+                    c.harness,
+                    c.session_id,
+                    c.at,
+                    c.tool,
+                    c.tool_kind,
+                    c.command,
+                    json.dumps(list(c.paths)),
+                    c.status,
+                    c.error_signature,
+                    c.cwd,
+                    c.model_id,
+                )
+                for c in calls
+            ],
+        )
+        db.execute("delete from mined_calls where at < ?", (prune_before,))
+        db.execute("commit")
+    except BaseException:
+        _rollback(db)
+        raise
