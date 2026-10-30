@@ -1,0 +1,19 @@
+{
+  "cases": [
+    {
+      "name": "Bash failure",
+      "stdin": {"session_id": "abc123", "transcript_path": "/t.jsonl", "cwd": "/Users/u/repo", "permission_mode": "default", "hook_event_name": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {"command": "npm test", "description": "Run test suite"}, "tool_use_id": "toolu_01ABC123", "error": "Exit code 1\nError: Cannot find module 'express'", "is_interrupt": false, "duration_ms": 4187},
+      "event": {"harness": "claude", "harness_version": "", "event": "tool_failed", "session_id": "abc123", "tool_use_id": "toolu_01ABC123", "cwd": "/Users/u/repo", "tool_kind": "shell", "command": "npm test", "paths": [], "error_text": "Exit code 1\nError: Cannot find module 'express'", "prompt": null, "model_id": null}
+    },
+    {
+      "name": "Edit failure",
+      "stdin": {"session_id": "abc123", "cwd": "/r", "hook_event_name": "PostToolUseFailure", "tool_name": "Edit", "tool_input": {"file_path": "/r/a.py", "old_string": "x", "new_string": "y"}, "tool_use_id": "toolu_02", "error": "String to replace not found in file."},
+      "event": {"harness": "claude", "harness_version": "", "event": "tool_failed", "session_id": "abc123", "tool_use_id": "toolu_02", "cwd": "/r", "tool_kind": "edit", "command": null, "paths": ["/r/a.py"], "error_text": "String to replace not found in file.", "prompt": null, "model_id": null}
+    },
+    {
+      "name": "missing error",
+      "stdin": {"session_id": "abc123", "cwd": "/r", "hook_event_name": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_use_id": "toolu_03"},
+      "error": "MalformedInput"
+    }
+  ]
+}

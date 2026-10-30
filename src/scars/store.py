@@ -1,17 +1,20 @@
-"""SQLite persistence for lessons.db and telemetry.db."""
+"""SQLite persistence for lessons.db and telemetry.db.
 
-import hashlib
+`hashlib`, `secrets`, `importlib.resources`, `urllib.parse` and `pathlib` are imported inside the
+functions that need them, because the hook imports this module on its latency budget and needs none of
+them.
+"""
+
+from __future__ import annotations
+
 import json
 import os
-import secrets
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from importlib.resources import files
-from pathlib import Path
-from urllib.parse import quote
+from typing import TYPE_CHECKING
 
 from scars.model import (
     LIFECYCLE,
@@ -34,6 +37,9 @@ from scars.model import (
     TrustClass,
 )
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 SCHEMA_VERSION = 1
 EXPIRY_SECONDS = 14 * 86400
 GENESIS_HASH = "0" * 64
@@ -45,6 +51,8 @@ EXPIRING = frozenset({Status.CANDIDATE, Status.PROVISIONAL})
 
 def schema_sql(name: str) -> str:
     """The DDL for `lessons` or `telemetry`, shipped in `scars/schema/`."""
+    from importlib.resources import files
+
     return files("scars.schema").joinpath(f"{name}.sql").read_text()
 
 
@@ -57,7 +65,9 @@ def connect(
 ) -> sqlite3.Connection:
     """Open a store file. Transactions are explicit: the connection runs in autocommit mode."""
     if readonly:
-        uri = "file:" + quote(str(Path(path).absolute())) + "?mode=ro"
+        from urllib.parse import quote
+
+        uri = "file:" + quote(os.path.abspath(path)) + "?mode=ro"
         db = sqlite3.connect(uri, uri=True, isolation_level=None)
     else:
         if synchronous.upper() not in ("FULL", "NORMAL"):
@@ -85,6 +95,8 @@ def _statements(sql: str) -> list[str]:
 
 
 def _init(path: Path, schema: str, synchronous: str) -> sqlite3.Connection:
+    from pathlib import Path
+
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -407,6 +419,8 @@ def _blob_json(value: object) -> object:
 
 def _row_hash(row: sqlite3.Row) -> str:
     text = json.dumps(dict(row), sort_keys=True, separators=(",", ":"), default=_blob_json)
+    import hashlib
+
     return hashlib.sha256(text.encode()).hexdigest()
 
 
@@ -526,6 +540,8 @@ def create_lesson(
     """
     at = time.time() if at is None else at
     triggers = tuple(triggers)
+    import secrets
+
     lesson_id = LessonId("L-" + secrets.token_hex(4))
     payload: dict[str, object] = {
         "text": {"avoid": text.avoid, "instead": text.instead, "reason": text.reason},
@@ -835,6 +851,89 @@ def active_for_hook(db: sqlite3.Connection, repo_id: RepoId | None, session_id: 
     return _load(db, ACTIVE_FOR_HOOK_WHERE, (repo_id, session_id))
 
 
+def active_for_stage(
+    db: sqlite3.Connection,
+    repo_id: RepoId | None,
+    session_id: SessionId,
+    *,
+    stage: Stage,
+    pinned_only: bool,
+    trigger_kinds: Iterable[TriggerKind] | None,
+    error_signature: str | None = None,
+) -> list[Lesson]:
+    """`active_for_hook`, narrowed in SQL to lessons that can fire at one stage, so the hook builds no
+    others.
+
+    With `pinned_only`, only pinned lessons. With `trigger_kinds`, only lessons with a trigger of one of
+    those kinds at `stage`; with `error_signature` too, an `error` trigger counts only when its spec is
+    exactly that signature, which is the only way an error trigger fires. Each lesson keeps all its
+    triggers. With `trigger_kinds` None the stage selects without triggers, so no trigger is required.
+    """
+    where = f"({ACTIVE_FOR_HOOK_WHERE})"
+    params: list[object] = [repo_id, session_id]
+    if pinned_only:
+        where += " and pinned = 1"
+    if trigger_kinds is not None:
+        kinds = sorted(k.value for k in trigger_kinds)
+        fires = f"t.stage = ? and t.kind in ({','.join('?' * len(kinds))})"
+        params += [stage.value, *kinds]
+        if error_signature is not None:
+            fires += " and (t.kind <> 'error' or t.spec = ?)"
+            params.append(error_signature)
+        where += f" and exists (select 1 from triggers t where t.lesson_id = lessons.id and {fires})"
+    return _load(db, where, params)
+
+
 def inbox_candidates(db: sqlite3.Connection) -> list[Lesson]:
     """Every candidate, for `scars inbox` to rank."""
     return _load(db, "status = 'candidate'", ())
+
+
+def candidate_count(db: sqlite3.Connection) -> int:
+    """How many candidates wait in the inbox, for the session-start notice."""
+    return db.execute("select count(*) from lessons where status = 'candidate'").fetchone()[0]
+
+
+def repo_for_common_dir(db: sqlite3.Connection, common_dirs: Iterable[str]) -> RepoId | None:
+    """The registered repo of the first of these git common dirs that is a registered clone, or None."""
+    for common_dir in common_dirs:
+        row = db.execute("select repo_id from clones where common_dir = ?", (common_dir,)).fetchone()
+        if row is not None:
+            return RepoId(row[0])
+    return None
+
+
+def repo_names(db: sqlite3.Connection) -> tuple[str, ...]:
+    """Display names of every registered repo, for the machine-scope lint."""
+    return tuple(r[0] for r in db.execute("select display_name from repos order by id"))
+
+
+def passing_inputs(db: sqlite3.Connection, lesson_ids: Iterable[LessonId]) -> dict[LessonId, frozenset[str]]:
+    """Each lesson's observed passing inputs: the commands render accepts in its `instead` field.
+
+    Every requested id is a key, with an empty set when the lesson has no observation.
+    """
+    ids = list(dict.fromkeys(lesson_ids))
+    found: dict[LessonId, set[str]] = {i: set() for i in ids}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        sql = f"select lesson_id, passing_input from observations where lesson_id in ({marks})"
+        for lesson_id, passing in db.execute(sql, ids):
+            found[LessonId(lesson_id)].add(passing)
+    return {i: frozenset(v) for i, v in found.items()}
+
+
+def promoted_at(db: sqlite3.Connection, lesson_ids: Iterable[LessonId]) -> dict[LessonId, float]:
+    """The time of each lesson's latest `promoted` event, for the `reviewed <date>` header.
+
+    Lessons that were never promoted are absent.
+    """
+    ids = list(dict.fromkeys(lesson_ids))
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    sql = (
+        f"select lesson_id, max(at) from events where type = 'promoted' and lesson_id in ({marks}) "
+        "group by lesson_id"
+    )
+    return {LessonId(lesson_id): at for lesson_id, at in db.execute(sql, ids)}
