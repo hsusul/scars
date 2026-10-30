@@ -43,7 +43,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.resources import files
@@ -535,11 +536,31 @@ def hook_script(ctx: Context, allow_dev_install: bool) -> str:
     return hook_path
 
 
+@contextmanager
+def init_lock(scars_home: Path) -> Iterator[None]:
+    """Run one init at a time. Two inits creating a new store at once can make SQLite's switch to WAL
+    fail with `database is locked` instead of waiting, and their config merges would race too."""
+    import fcntl
+
+    fd = os.open(scars_home / "init.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def cmd_init(args: argparse.Namespace, ctx: Context) -> int:
     scars_home = paths.home()
-    files_ = plan(ctx, scars_home, hook_script(ctx, args.allow_dev_install))
+    hook_path = hook_script(ctx, args.allow_dev_install)
+    plan(ctx, scars_home, hook_path)  # refuses a config it cannot merge before anything is created
     scars_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(scars_home, 0o700)
+    with init_lock(scars_home):
+        return _init_locked(args, ctx, scars_home, plan(ctx, scars_home, hook_path))
+
+
+def _init_locked(args: argparse.Namespace, ctx: Context, scars_home: Path, files_: Plan) -> int:
     (scars_home / "logs").mkdir(mode=0o700, exist_ok=True)
     db = store.init_lessons(scars_home / "lessons.db")
     store.ensure_miner_schema(db)
