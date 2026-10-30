@@ -6,6 +6,11 @@
       "event": {"harness": "codex", "harness_version": "", "event": "session_start", "session_id": "thr_123", "tool_use_id": null, "cwd": "/workspace", "tool_kind": null, "command": null, "paths": [], "error_text": null, "prompt": null, "model_id": "gpt-5.5-codex"}
     },
     {
+      "name": "fork",
+      "stdin": {"session_id": "thr_456", "transcript_path": null, "cwd": "/workspace", "hook_event_name": "SessionStart", "model": "gpt-5.5-codex", "permission_mode": "default", "source": "fork"},
+      "event": {"harness": "codex", "harness_version": "", "event": "session_start", "session_id": "thr_456", "tool_use_id": null, "cwd": "/workspace", "tool_kind": null, "command": null, "paths": [], "error_text": null, "prompt": null, "model_id": "gpt-5.5-codex"}
+    },
+    {
       "name": "compact marks a compaction",
       "stdin": {"session_id": "thr_123", "transcript_path": null, "cwd": "/workspace", "hook_event_name": "SessionStart", "model": "gpt-5.5-codex", "permission_mode": "default", "source": "compact"},
       "event": {"harness": "codex", "harness_version": "", "event": "compact", "session_id": "thr_123", "tool_use_id": null, "cwd": "/workspace", "tool_kind": null, "command": null, "paths": [], "error_text": null, "prompt": null, "model_id": "gpt-5.5-codex"}

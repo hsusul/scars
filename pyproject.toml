@@ -10,6 +10,7 @@ dependencies = []
 
 [project.scripts]
 scars = "scars.cli:main"
+scars-hook = "scars.hook_entry:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]

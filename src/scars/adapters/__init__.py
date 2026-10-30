@@ -16,9 +16,10 @@ from dataclasses import dataclass
 from scars.model import Harness, HookEvent, HookEventKind, SessionId, ToolKind
 
 FIELD_CAP_BYTES = 4096
-TRUNCATION_MARK = "…"
-"""Appended to a cut command. It keeps the text over the shell parser's 4 KB limit, so a cut command
-parses as unsupported instead of matching as the shorter command it was cut to."""
+TRUNCATION_MARK = "\x00"
+"""Appended to a cut command. The shell parser rejects every control character, NUL included, so a cut
+command always parses as unsupported instead of matching as the shorter command it was cut to, whatever
+its length after the cut."""
 
 
 class AdapterError(Exception):
@@ -42,8 +43,19 @@ def cap(text: str) -> str:
 
 
 def cap_command(command: str) -> str:
+    """`command` itself when it fits in 4 KB, else its cut followed by `TRUNCATION_MARK`."""
     capped = cap(command)
     return capped if capped == command else capped + TRUNCATION_MARK
+
+
+def full_command(payload: dict[str, object]) -> str | None:
+    """The uncapped `tool_input.command` of a tool event, which both harnesses use for shell commands.
+
+    The agent deny rule reads this instead of `HookEvent.command`, so text past the 4 KB cut still counts.
+    """
+    args = payload.get("tool_input")
+    command = args.get("command") if isinstance(args, dict) else None
+    return command if isinstance(command, str) else None
 
 
 def string(payload: dict[str, object], key: str, *, required: bool = True) -> str | None:
@@ -80,7 +92,7 @@ def common(event_name: str, payload: dict[str, object]) -> Common:
     session_id = string(payload, "session_id")
     cwd = string(payload, "cwd")
     assert session_id is not None and cwd is not None
-    return Common(SessionId(session_id), cwd, string(payload, "model", required=False))
+    return Common(SessionId(session_id), cwd, string(payload, "model", required=False) or None)
 
 
 def event(
@@ -97,8 +109,11 @@ def event(
 ) -> HookEvent:
     """Build the normalized event with every free-text field capped at 4 KB.
 
-    `harness_version` is empty: neither harness puts its version in hook stdin, and running
-    `claude --version` would cost more than the whole hook budget.
+    `harness_version` is empty: neither harness puts its version in hook stdin or in the hook's
+    environment (Claude Code 2.1.299 exports `CLAUDE_PROJECT_DIR`, `CLAUDE_PLUGIN_ROOT`,
+    `CLAUDE_PLUGIN_DATA`, `CLAUDE_EFFORT` and `CLAUDE_CODE_REMOTE`; Codex 0.162.1 exports `PLUGIN_ROOT` and
+    `PLUGIN_DATA`), and running `claude --version` would cost more than the whole hook budget. The hit
+    row stores NULL until a harness exports one.
     """
     return HookEvent(
         harness=harness,

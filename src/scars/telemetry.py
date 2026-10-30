@@ -1,19 +1,17 @@
 """The hook's best-effort state in telemetry.db: the cwd-to-repo cache, context epochs, delivered lessons
 and hit rows.
 
-Nothing here waits on a lock. Reads and the one write transaction run with `busy_timeout = 0`; a busy or
-missing file makes the read return the empty state and the write return False. A telemetry problem
-changes neither the hook's answer nor its latency, at the cost of one duplicate line or one lost row.
+The hook never creates telemetry.db or its directory; `scars init` does (through `store.init_telemetry`).
+When the file is missing, unreadable, read-only, locked or broken, telemetry is unavailable: the read
+returns the empty state (no cache, epoch 0, no dedupe) and the write returns False. Nothing here waits on
+a lock: the connection runs with `busy_timeout = 0`. A telemetry problem changes neither the hook's answer
+nor its latency, at the cost of one duplicate line or one lost row.
 """
 
-import contextlib
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
-from urllib.parse import quote
 
-from scars import store
 from scars.model import HitOutcome, LessonId, SessionId
 
 CWD_CACHE_SECONDS = 24 * 3600
@@ -41,6 +39,8 @@ EMPTY = State(None, 0, frozenset())
 
 @dataclass(frozen=True)
 class Hit:
+    """One `hits` row. Every column but `seq` is here; empty strings are stored as NULL."""
+
     at: float
     harness: str
     harness_version: str | None
@@ -57,6 +57,8 @@ class Hit:
     injected_chars: int | None
     latency_ms: float | None
     error_class: str | None
+    arm: str | None
+    """The eval arm from `SCARS_ARM`, or None outside an eval."""
 
 
 @dataclass(frozen=True)
@@ -71,17 +73,26 @@ class Writes:
     """A freshly resolved cache row to store, or None when the cache was used."""
 
 
-def connect(path: Path) -> sqlite3.Connection | None:
-    """Open telemetry.db, creating it with its schema the first time. None when it cannot be opened."""
+def uri(path: str, mode: str) -> str:
+    """A SQLite URI for `path`. SQLite ends the path at `?` or `#` and decodes `%HH`; nothing else needs
+    escaping, which spares the hook importing `urllib.parse`."""
+    escaped = path.replace("%", "%25").replace("?", "%3f").replace("#", "%23")
+    return f"file:{escaped}?mode={mode}"
+
+
+def connect(path: str) -> sqlite3.Connection | None:
+    """Open an existing telemetry.db for reading and writing, or None when it is unavailable."""
     try:
-        if not path.exists():
-            store.init_telemetry(path).close()
-        uri = "file:" + quote(str(path.absolute())) + "?mode=rw"
-        db = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=0)
-        db.execute("pragma busy_timeout = 0")
-        return db
-    except sqlite3.Error:
+        db = sqlite3.connect(uri(path, "rw"), uri=True, isolation_level=None, timeout=0)
+    except (sqlite3.Error, OSError):
         return None
+    try:
+        db.execute("pragma busy_timeout = 0")
+        db.execute("pragma synchronous = NORMAL")
+    except (sqlite3.Error, OSError):
+        db.close()
+        return None
+    return db
 
 
 def read(db: sqlite3.Connection | None, cwd: str, session_id: SessionId, *, compaction: bool) -> State:
@@ -100,7 +111,7 @@ def read(db: sqlite3.Connection | None, cwd: str, session_id: SessionId, *, comp
             "select lesson_id, trigger_key from shown where session_id = ? and context_epoch = ?",
             (session_id, epoch),
         ).fetchall()
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
         return EMPTY
     cached = CwdRepo(*row) if row else None
     return State(cached, epoch, frozenset((LessonId(lid), key) for lid, key in shown))
@@ -112,7 +123,7 @@ def write(db: sqlite3.Connection | None, writes: Writes) -> bool:
         return False
     try:
         db.execute("begin immediate")
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
         return False
     try:
         _insert_hits(db, writes.hits)
@@ -136,23 +147,30 @@ def write(db: sqlite3.Connection | None, writes: Writes) -> bool:
             )
         db.execute("commit")
         return True
-    except sqlite3.Error:
-        with contextlib.suppress(sqlite3.Error):
-            db.execute("rollback")
+    except (sqlite3.Error, OSError):
+        _rollback(db)
         return False
+
+
+def _rollback(db: sqlite3.Connection) -> None:
+    # Plain try/except rather than contextlib.suppress: contextlib would cost the hook an import.
+    try:
+        db.execute("rollback")
+    except (sqlite3.Error, OSError):
+        return
 
 
 def _insert_hits(db: sqlite3.Connection, hits: Iterable[Hit]) -> None:
     db.executemany(
         "insert into hits (at, harness, harness_version, model_id, session_id, tool_use_id, event, stage, "
         "lesson_id, lesson_revision, status_at_injection, trigger_key, outcome, injected_chars, latency_ms, "
-        "error_class) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "error_class, arm) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             (
                 h.at,
                 h.harness,
                 h.harness_version or None,
-                h.model_id,
+                h.model_id or None,
                 h.session_id,
                 h.tool_use_id,
                 h.event,
@@ -165,6 +183,7 @@ def _insert_hits(db: sqlite3.Connection, hits: Iterable[Hit]) -> None:
                 h.injected_chars,
                 h.latency_ms,
                 h.error_class,
+                h.arm or None,
             )
             for h in hits
         ],

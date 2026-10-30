@@ -5,6 +5,8 @@ a session), `UserPromptSubmit`, `PreToolUse` on `Bash` and `apply_patch`, and `P
 its `exec_command` tool as `Bash`, and file edits as `apply_patch` whose patch text is in
 `tool_input.command`.
 
+An `apply_patch` whose text has no file header has no paths; it is still a call, so it is not malformed.
+
 Codex has no failure event. `PostToolUse` fires after every call, and a call counts as failed only when
 the response shows a non-zero exit code: an object with an integer `exit_code`, or a text response whose
 header has a `Process exited with code N` or `Exit code: N` line. In Codex 0.162.1 the `Bash` response is
@@ -93,9 +95,8 @@ def _tool(
         tool_kind = ToolKind.EDIT
         patch = string(tool_input(payload), "command")
         assert patch is not None
+        # A patch with no file header edits nothing; it still fails or succeeds as a call.
         paths = patch_paths(patch)
-        if not paths:
-            raise MalformedInput("apply_patch names no file")
     else:
         tool_kind = ToolKind.OTHER
     return event(

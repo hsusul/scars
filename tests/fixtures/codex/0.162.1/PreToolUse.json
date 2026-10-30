@@ -11,9 +11,9 @@
       "event": {"harness": "codex", "harness_version": "", "event": "pre_tool", "session_id": "thr_123", "tool_use_id": "call_2", "cwd": "/workspace", "tool_kind": "edit", "command": null, "paths": ["src/app.py", "notes/new.md", "old/name.py", "new/name.py"], "error_text": null, "prompt": null, "model_id": "gpt-5.5-codex"}
     },
     {
-      "name": "apply_patch naming no file",
+      "name": "apply_patch naming no file has no paths",
       "stdin": {"session_id": "thr_123", "cwd": "/workspace", "hook_event_name": "PreToolUse", "model": "m", "tool_name": "apply_patch", "tool_use_id": "call_3", "tool_input": {"command": "not a patch"}},
-      "error": "MalformedInput"
+      "event": {"harness": "codex", "harness_version": "", "event": "pre_tool", "session_id": "thr_123", "tool_use_id": "call_3", "cwd": "/workspace", "tool_kind": "edit", "command": null, "paths": [], "error_text": null, "prompt": null, "model_id": "m"}
     }
   ]
 }

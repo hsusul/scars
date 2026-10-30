@@ -84,10 +84,27 @@ def test_cursor_version_is_skipped_on_every_event():
 
 def test_a_command_over_4_kb_is_cut_and_still_parses_as_unsupported():
     event = claude.parse("PreToolUse", bash("echo " + "a" * 5000))
-    assert event.command == "echo " + "a" * 4091 + "…"
-    assert len(event.command.encode()) == 4099
+    assert event.command == "echo " + "a" * 4091 + "\x00"
     with pytest.raises(Unsupported):
         parse(event.command)
+
+
+def test_a_cut_that_drops_a_multibyte_character_still_parses_as_unsupported():
+    command = "xcodebuild -scheme " + "a" * 4074 + "\N{GRINNING FACE} -showsdks"
+    event = claude.parse("PreToolUse", bash(command))
+    assert event.command == "xcodebuild -scheme " + "a" * 4074 + "\x00"
+    with pytest.raises(Unsupported):
+        parse(event.command)
+
+
+@pytest.mark.parametrize("length", range(4090, 4100))
+def test_every_cut_command_is_unsupported(length):
+    for filler in ("a", "\N{GRINNING FACE}", "\N{LATIN SMALL LETTER E WITH ACUTE}"):
+        command = ("ls " + filler * length)[:length]
+        capped = claude.parse("PreToolUse", bash(command)).command
+        if capped != command:
+            with pytest.raises(Unsupported):
+                parse(capped)
 
 
 def test_a_command_of_exactly_4_kb_is_kept_whole():
@@ -113,6 +130,15 @@ def test_codex_post_tool_use_reads_a_nonzero_exit_header_and_ignores_zero():
         ToolKind.SHELL,
         "boom",
     )
+
+
+def test_codex_apply_patch_without_file_headers_has_no_paths_on_both_events():
+    patch = {"command": "*** Begin Patch\n*** End Patch\n"}
+    pre = {**bash("x"), "tool_name": "apply_patch", "tool_input": patch}
+    assert codex.parse("PreToolUse", pre).paths == ()
+    post = {**pre, "hook_event_name": "PostToolUse", "tool_response": "Exit code: 1\nOutput:\nbad patch"}
+    event = codex.parse("PostToolUse", post)
+    assert (event.tool_kind, event.paths, event.error_text) == (ToolKind.EDIT, (), "bad patch")
 
 
 def test_codex_header_without_an_output_line_keeps_the_whole_text():
