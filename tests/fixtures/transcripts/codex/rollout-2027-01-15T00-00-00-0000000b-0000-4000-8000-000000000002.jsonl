@@ -1,0 +1,8 @@
+{"timestamp": "2027-01-15T08:00:00Z", "type": "session_meta", "payload": {"id": "sess", "cwd": "/tmp/scars-fixture/app"}}
+{"timestamp": "2027-01-15T08:00:01Z", "type": "turn_context", "payload": {"model": "gpt-test", "cwd": "/tmp/scars-fixture/app"}}
+{"timestamp": "2027-01-15T08:00:02Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "id": "exec-1", "command": ["/bin/zsh", "-lc", "pytest --frobnicate tests"], "cwd": "/tmp/scars-fixture/app", "exit_code": 2, "aggregated_output": "pytest: error: unrecognized arguments: --frobnicate"}}}
+{"timestamp": "2027-01-15T08:00:03Z", "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "id": "exec-2", "command": ["/bin/zsh", "-lc", "pytest tests"], "cwd": "/tmp/scars-fixture/app", "exit_code": 0, "aggregated_output": "1 passed"}}}
+{"timestamp": "2027-01-15T08:00:04Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": "{\"cmd\": \"make lint --strict\", \"workdir\": \"/tmp/scars-fixture/app\"}"}}
+{"timestamp": "2027-01-15T08:00:05Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "Exit code: 2\nWall time: 0.1 seconds\nOutput:\nmake: unknown option strict"}}
+{"timestamp": "2027-01-15T08:00:06Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "c2", "arguments": "{\"cmd\": \"make lint\"}"}}
+{"timestamp": "2027-01-15T08:00:07Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "c2", "output": "make: no exit code shown"}}

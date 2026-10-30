@@ -1,0 +1,6 @@
+{"type": "assistant", "timestamp": "2027-01-15T08:00:10Z", "cwd": "/tmp/scars-fixture/app", "message": {"model": "claude-test-1", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pytest --frobnicate tests"}}]}}
+{"type": "user", "timestamp": "2027-01-15T08:00:11Z", "cwd": "/tmp/scars-fixture/app", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": "pytest: error: unrecognized arguments: --frobnicate"}]}}
+{"type": "assistant", "timestamp": "2027-01-15T08:00:20Z", "cwd": "/tmp/scars-fixture/app", "message": {"model": "claude-test-1", "content": [{"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/tmp/scars-fixture/app/README.md"}}]}}
+{"type": "user", "timestamp": "2027-01-15T08:00:21Z", "cwd": "/tmp/scars-fixture/app", "message": {"content": [{"type": "tool_result", "tool_use_id": "t2", "is_error": false, "content": "fine"}]}}
+{"type": "assistant", "timestamp": "2027-01-15T08:00:30Z", "cwd": "/tmp/scars-fixture/app", "message": {"model": "claude-test-1", "content": [{"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "pytest tests"}}]}}
+{"type": "user", "timestamp": "2027-01-15T08:00:31Z", "cwd": "/tmp/scars-fixture/app", "message": {"content": [{"type": "tool_result", "tool_use_id": "t3", "is_error": false, "content": "fine"}]}}
