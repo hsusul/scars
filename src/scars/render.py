@@ -8,15 +8,17 @@ in the database behind the CLI's back is never shown.
 
 The policy is blunt on purpose. These checks sit behind trust tiers and human review, so dropping a
 harmless candidate is cheap and showing a harmful one is not. Where a rule cannot be complete, it is
-written as an allowlist (printable ASCII only, known programs only, allowed path roots only) rather than
-a list of bad phrases.
+written as an allowlist (printable ASCII only, commands already run on this machine only, allowed path
+roots only) rather than a list of bad phrases.
 
 1. Sanitizer: empty and over-cap fields, ANSI escapes, control characters (every C0 and C1 character,
    tab and newline included), anything outside printable ASCII, code fences and URLs.
-2. Imperative lint: the fixed `IMPERATIVE_RULES` table, plus the backticked-command rule for `instead`.
+2. Imperative lint: the fixed `IMPERATIVE_RULES` table on every field, plus the backticked-command
+   rule for `instead` (see `_check_instead_command`).
 3. Secret scan: known token formats, matched wherever they start, and a high-entropy fallback.
 4. Machine-scope lint: machine lessons reach every repo, so they may not name a repo, a GitHub
-   `owner/name`, a `..` path segment, or an absolute path outside `ALLOWED_ROOTS`.
+   `owner/name`, a `..` path segment, or an absolute path outside `ALLOWED_ROOTS`, including a path
+   attached to an option (`-I/x`, `--prefix=/x`, `key=/x`).
 
 Rejection messages name the field and the rule, never the matched text, so a secret or a private repo
 name cannot leak through an error message or a log line.
@@ -24,6 +26,7 @@ name cannot leak through an error message or a log line.
 
 import math
 import re
+import shlex
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,6 +43,7 @@ from scars.model import (
     Scope,
     SessionScope,
     Status,
+    TrustClass,
 )
 from scars.shell import Unsupported, parse
 
@@ -150,7 +154,7 @@ IMPERATIVE_RULES: tuple[Rule, ...] = (
             r"|credential\.helper|sequence\.editor)"
             r"|\b(?:\w*(?:_COMMAND|SHELL|PAGER|EDITOR|VISUAL|ASKPASS)|LD_\w+|DYLD_\w+|BASH_ENV|ENV"
             r"|PROMPT_COMMAND|PYTHONSTARTUP|PYTHONPATH|NODE_OPTIONS|PERL5OPT|PERL5LIB|RUBYOPT"
-            r"|GIT_EXTERNAL_DIFF|GIT_EXEC_PATH|GIT_CONFIG\w*|GIT_DIR|GIT_TEMPLATE_DIR)=",
+            r"|GIT_EXTERNAL_DIFF|GIT_EXEC_PATH|GIT_CONFIG\w*|GIT_DIR|GIT_TEMPLATE_DIR|GIT_SSH\w*)=",
             re.I,
         ),
     ),
@@ -198,44 +202,37 @@ IMPERATIVE_RULES: tuple[Rule, ...] = (
     ),
 )
 
-SHELL_BUILTINS = frozenset({"cd", "pushd", "popd", "true", "false"})
-"""Builtins that run no program, so they need no entry in `known_programs`."""
 
-WRAPPER_PROGRAMS = frozenset({"env", "time", "nohup", "sudo", "uv", "npx", "python", "python3", "bash", "sh"})
-"""Words the shell parser unwraps to reach the program they run. The parser reports only the inner
-program, so a wrapper named in a backticked command must be a known program too."""
+def normalize_command(command: str) -> str:
+    """`command` stripped, with each run of whitespace outside quotes collapsed to one space.
 
-LAUNCHERS = frozenset(
-    {"xargs", "nice", "timeout", "gtimeout", "watch", "nohup", "command", "builtin", "exec", "eval"}
-    | {"env", "sudo", "doas", "su", "caffeinate", "open", "launchctl", "script", "flock", "parallel"}
-    | {"strace", "ltrace", "dtrace", "dtruss", "lldb", "gdb", "entr", "chroot", "unshare", "nsenter"}
-    | {"osascript", "at", "batch", "crontab", "ssh", "sshpass", "uvx", "pipx", "bunx", "source", "."}
-)
-"""Programs whose job is to run another program named in their arguments, which the known-program
-rule cannot see. A backticked command may not run one."""
-
-LAUNCHING_SUBCOMMANDS: dict[str, frozenset[str]] = {
-    "npm": frozenset({"exec", "x"}),
-    "pnpm": frozenset({"dlx", "exec"}),
-    "yarn": frozenset({"dlx", "exec"}),
-    "bun": frozenset({"x"}),
-    "uv": frozenset({"tool"}),
-}
-
-XCRUN_TOOLS = frozenset(
-    {"simctl", "xcodebuild", "devicectl", "notarytool", "stapler", "xctrace", "swift", "swiftc"}
-    | {"clang", "clang++", "lipo", "otool", "codesign", "actool", "ibtool", "altool"}
-)
-"""`xcrun` runs a developer tool by name, so its first operand must be one of these."""
-
-
-def _launches(program: str, args: tuple[str, ...]) -> bool:
-    if program in LAUNCHERS:
-        return True
-    if program == "xcrun":
-        operands = [a for a in args if not a.startswith("-")]
-        return "-r" in args or "--run" in args or (bool(operands) and operands[0] not in XCRUN_TOOLS)
-    return bool(args) and args[0] in LAUNCHING_SUBCOMMANDS.get(program, frozenset())
+    Nothing else is rewritten: quoting, escapes and word order stay as written. A backslash outside
+    single quotes keeps the next character literal, so an escaped space is never collapsed. The miner
+    and the hook normalize the commands they pass as `known_commands` with this same function, and
+    `check` normalizes both sides again before comparing.
+    """
+    out: list[str] = []
+    quote = ""
+    i = 0
+    text = command.strip()
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'" and i + 1 < len(text):
+            out.append(text[i : i + 2])
+            i += 2
+            continue
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch.isspace():
+            if not out or out[-1] != " ":
+                out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 _SUBSTITUTION_PLACEHOLDER = "SUBST"
@@ -270,15 +267,38 @@ def _split_substitutions(command: str, depth: int = 0) -> list[str]:
     return ["".join(outer), *inner]
 
 
-def _words(command: str) -> set[str]:
-    return {w.strip("\"'") for w in command.split()}
+def _command_views(command: str) -> list[str]:
+    """The command as the shell will see it, for the imperative rules to scan.
+
+    Each piece (the outer command and every `$(...)` body) must parse with the shell parser. Each piece
+    yields two dequoted views: its words after shell quote removal, wrappers kept (`s''h -c id` reads
+    `sh -c id`), and each parsed simple command's program and arguments. Quotes therefore cannot hide
+    `-e`, `-c` or a config key from a rule that also runs on the raw text.
+    """
+    views: list[str] = []
+    try:
+        for piece in _split_substitutions(command):
+            parsed = parse(piece)
+            if not parsed:
+                raise Unsupported("no command")
+            views.append(" ".join(shlex.split(piece)))
+            views.extend(" ".join((c.program, *c.args)) for c in parsed)
+    except (Unsupported, ValueError):
+        raise RejectedText("lint.instead_unparseable_command", "instead") from None
+    return views
 
 
-def _check_instead_command(instead: str, known_programs: frozenset[str] | None) -> None:
-    """At most one backticked command, parsed by the shell parser, running only known programs.
+def _check_instead_command(instead: str, known_commands: frozenset[str], trust_class: TrustClass) -> None:
+    """At most one backticked command, and it must be one this machine already ran successfully.
 
-    A program word that contains `/` is rejected: the parser reports only its basename, and an explicit
-    path can run any file under a known name. `known_programs=None` skips only the membership rule.
+    Programs are not trusted by name: a known program runs arbitrary code through its own subcommands,
+    options and environment (`npm run`, `make -f`, `GIT_SSH=`). So a command is allowed only when its
+    normalized text equals a normalized entry of `known_commands`, the passing inputs observed on this
+    machine, or when the lesson's trust class is `human` (a person wrote or approved it at a terminal).
+
+    For every trust class, observed or not, the command must still parse, and every imperative rule
+    runs on its dequoted views as well as on the raw text. An observed `python -c` stays rejected: one
+    session's inline code should not be re-suggested to every session.
     """
     ticks = instead.count("`")
     if ticks == 0:
@@ -288,23 +308,14 @@ def _check_instead_command(instead: str, known_programs: frozenset[str] | None) 
     if ticks > 2:
         raise RejectedText("lint.instead_multiple_commands", "instead")
     command = instead.split("`")[1]
-    try:
-        pieces = _split_substitutions(command)
-        parsed = [c for piece in pieces for c in parse(piece)]
-    except Unsupported:
-        raise RejectedText("lint.instead_unparseable_command", "instead") from None
-    if not parsed:
-        raise RejectedText("lint.instead_unknown_program", "instead")
-    for c in parsed:
-        if re.search("/" + re.escape(c.program) + r"(?![A-Za-z0-9._+-])", command):
-            raise RejectedText("lint.instead_program_path", "instead")
-        if _launches(c.program, c.args):
-            raise RejectedText("lint.instead_launcher", "instead")
-    if known_programs is None:
+    for view in _command_views(command):
+        for rule in IMPERATIVE_RULES:
+            if rule.hits(view):
+                raise RejectedText(rule.name, "instead")
+    if trust_class is TrustClass.HUMAN:
         return
-    programs = {c.program for c in parsed} | (_words(command) & WRAPPER_PROGRAMS)
-    if not programs - SHELL_BUILTINS <= known_programs:
-        raise RejectedText("lint.instead_unknown_program", "instead")
+    if normalize_command(command) not in {normalize_command(k) for k in known_commands}:
+        raise RejectedText("lint.instead_unobserved_command", "instead")
 
 
 # ---------------------------------------------------------------- secret scan
@@ -365,7 +376,12 @@ continues it with `/`, so `/tmpfiles` and `/Volumes/990 Profile` are outside it.
 _GIT_REMOTES = frozenset({"origin", "upstream"})
 """Owners that are git remote names, so `origin/main` reads as a branch, not a GitHub repo."""
 
-_PATH_START = re.compile(r"(?<![\w.~$/-])(?:~/|/+(?=[\w.~-])|~(?=[A-Za-z_])|\$HOME\b|\$\{HOME\})")
+_PATH_HEAD = r"(?:~/|/+(?=[\w.~-])|~(?=[A-Za-z_])|\$HOME\b|\$\{HOME\})"
+_PATH_START = re.compile(r"(?<![\w.~$/-])" + _PATH_HEAD)
+_ATTACHED_START = re.compile(r"(?:(?<=[=:,])|(?<=(?<![\w-])-[A-Za-z]))" + _PATH_HEAD)
+"""A path glued to an option or a key: after `=`, `:` or `,` (`--prefix=/x`, `PATH=/a:/b`, `-Wl,/x`),
+or after a one-letter short option (`-I/x`, `-L~/lib`). `_PATH_START` skips these because a word
+character or `-` precedes the path."""
 _PATH_BODY = re.compile(r"[^\s`'\"]*")
 _QUOTED = re.compile(r"\"([^\"]*)\"|'([^']*)'")
 _DOTDOT = re.compile(r"(?<![^\s/`'\"])\.\.(?![^\s/`'\"])")
@@ -384,10 +400,12 @@ class _PathSpan:
     quoted: bool
 
 
-def _unquoted_paths(text: str, lo: int, hi: int) -> Iterator[_PathSpan]:
+def _unquoted_paths(
+    text: str, lo: int, hi: int, start_pattern: re.Pattern[str] = _PATH_START
+) -> Iterator[_PathSpan]:
     """Absolute paths in `text[lo:hi]`. An allowed root that contains a space is read whole."""
     pos = lo
-    while (m := _PATH_START.search(text, pos, hi)) is not None:
+    while (m := start_pattern.search(text, pos, hi)) is not None:
         start = m.start()
         root = next((r for r in _ROOTS_LONGEST_FIRST if text.startswith(r, start, hi)), "")
         body = _PATH_BODY.match(text, start + len(root), hi)
@@ -420,11 +438,26 @@ def _normalize(path: str) -> str:
     return "/".join([head, *kept]) if kept else (head or "/")
 
 
+_SUBPATH_START = re.compile(r"(?:^|(?<=[\s=:,])|(?<=(?<![\w-])-[A-Za-z]))" + _PATH_HEAD)
+_SUBPATH_END = re.compile(r"[\s=:,]")
+
+
 def _allowed(path: str) -> bool:
-    if re.search(r"\s(?:/|~|\$HOME|\$\{HOME\})", path):
-        return False
-    normal = _normalize(path)
-    return any(normal == root or normal.startswith(root + "/") for root in ALLOWED_ROOTS)
+    """Every path inside `path` is under an allowed root, not just the first.
+
+    A span can hold several paths: `/usr/bin:/Users/h/bin`, `/tmp/x=/Users/y`, or a quoted string such
+    as `"/tmp/x -I/Users/h"`. Each one starts at the beginning, after whitespace, `=`, `:` or `,`, or
+    after a one-letter short option, and runs to the next whitespace, `=`, `:` or `,`, except that an
+    allowed root containing a space is read whole.
+    """
+    for m in _SUBPATH_START.finditer(path):
+        start = m.start()
+        root = next((r for r in _ROOTS_LONGEST_FIRST if path.startswith(r, start)), "")
+        stop = _SUBPATH_END.search(path, start + len(root))
+        normal = _normalize(path[start : stop.start() if stop else len(path)])
+        if not any(normal == r or normal.startswith(r + "/") for r in ALLOWED_ROOTS):
+            return False
+    return True
 
 
 def _names_repo(text: str, registered_repos: Iterable[str]) -> bool:
@@ -449,6 +482,11 @@ def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[s
                 raise RejectedText("machine.absolute_path", field)
             masked[span.start : span.end] = " " * (span.end - span.start)
         rest = "".join(masked)
+        for span in _unquoted_paths(rest, 0, len(rest), _ATTACHED_START):
+            if not _allowed(span.path):
+                raise RejectedText("machine.absolute_path", field)
+            masked[span.start : span.end] = " " * (span.end - span.start)
+        rest = "".join(masked)
         if any(m.group(1).lower() not in _GIT_REMOTES for m in _OWNER_NAME.finditer(rest)):
             raise RejectedText("machine.github_repo", field)
 
@@ -466,12 +504,13 @@ def _run(rules: Sequence[Rule], values: Mapping[str, str]) -> None:
 def _check_values(
     values: Mapping[str, str],
     scope: Scope,
-    known_programs: frozenset[str] | None,
+    known_commands: frozenset[str],
+    trust_class: TrustClass,
     registered_repos: Sequence[str],
 ) -> None:
     _run(SANITIZER_RULES, values)
     _run(IMPERATIVE_RULES, values)
-    _check_instead_command(values["instead"], known_programs)
+    _check_instead_command(values["instead"], known_commands, trust_class)
     _run(SECRET_RULES, values)
     if isinstance(scope, MachineScope):
         _check_machine_scope(values, registered_repos)
@@ -481,17 +520,20 @@ def check(
     text: LessonText,
     scope: Scope,
     *,
-    known_programs: frozenset[str] | None,
+    known_commands: frozenset[str],
+    trust_class: TrustClass,
     registered_repos: Sequence[str] = (),
 ) -> None:
     """Raise `RejectedText` unless every field passes every stage.
 
-    `known_programs` holds the programs this machine ran successfully, as the miner records them. It is
-    required so that a caller cannot skip the membership rule by accident; `None` skips that one rule.
-    `registered_repos` holds the display names of every registered repo.
+    `known_commands` holds full commands that ran successfully on this machine: the miner passes the
+    passing inputs it observed, the hook passes the lesson's own observed passing inputs. It has no
+    default, so no caller can skip the observed-command rule by accident. `trust_class` is the lesson's;
+    only `human` exempts a backticked command from that rule. `registered_repos` holds the display names
+    of every registered repo.
     """
     values = {field: getattr(text, field) for field in FIELDS}
-    _check_values(values, scope, known_programs, registered_repos)
+    _check_values(values, scope, known_commands, trust_class, registered_repos)
 
 
 def check_fields(
@@ -500,7 +542,8 @@ def check_fields(
     reason: str,
     scope: Scope,
     *,
-    known_programs: frozenset[str] | None,
+    known_commands: frozenset[str],
+    trust_class: TrustClass,
     registered_repos: Sequence[str] = (),
 ) -> LessonText:
     """Check raw field strings and return them as `LessonText`.
@@ -510,7 +553,7 @@ def check_fields(
     same way it drops any other rejection.
     """
     values = {"avoid": avoid, "instead": instead, "reason": reason}
-    _check_values(values, scope, known_programs, registered_repos)
+    _check_values(values, scope, known_commands, trust_class, registered_repos)
     return LessonText(avoid=avoid, instead=instead, reason=reason)
 
 
@@ -555,16 +598,22 @@ def _header(lesson: Lesson, reviewed_on: date | None) -> str:
     return f"[scars {lesson.id} {lesson.level} | {label} | seen in {sessions} | {reviewed}]"
 
 
-def _recheck(lesson: Lesson, known_programs: frozenset[str] | None, registered_repos: Sequence[str]) -> None:
+def _recheck(lesson: Lesson, known_commands: frozenset[str], registered_repos: Sequence[str]) -> None:
     _check_header(lesson)
-    check(lesson.text, lesson.scope, known_programs=known_programs, registered_repos=registered_repos)
+    check(
+        lesson.text,
+        lesson.scope,
+        known_commands=known_commands,
+        trust_class=lesson.trust_class,
+        registered_repos=registered_repos,
+    )
 
 
 def render(
     lesson: Lesson,
     *,
+    known_commands: frozenset[str],
     reviewed_on: date | None = None,
-    known_programs: frozenset[str] | None = None,
     registered_repos: Sequence[str] = (),
 ) -> str:
     """Render one lesson as quoted, advisory data with its provenance.
@@ -572,10 +621,11 @@ def render(
     The lesson record has no review date, so the caller passes `reviewed_on`, the date of the lesson's
     latest promotion event. Only a promoted lesson with a date says `reviewed <date>`; every other lesson
     says `unreviewed`. Every check runs again first and its `RejectedText` propagates, so stale or
-    tampered text is never shown. With `known_programs=None` (a hook that lacks the miner's program list)
-    only the program-membership rule is skipped.
+    tampered text is never shown. `known_commands` has no default; the hook passes the lesson's own
+    observed passing inputs. The trust class is read from the lesson itself, never from the caller, so a
+    caller cannot lift a mined lesson into the `human` exemption.
     """
-    _recheck(lesson, known_programs, registered_repos)
+    _recheck(lesson, known_commands, registered_repos)
     return "\n".join(
         (
             _header(lesson, reviewed_on),
@@ -645,7 +695,7 @@ def fit(rendered: Sequence[Rendered], budget: Budget) -> Fitted:
 def render_deny(
     lesson: Lesson,
     *,
-    known_programs: frozenset[str] | None = None,
+    known_commands: frozenset[str],
     registered_repos: Sequence[str] = (),
 ) -> str:
     """A PreToolUse deny reason of at most `DENY_CAP` characters, without cutting any field.
@@ -654,7 +704,7 @@ def render_deny(
     header and AVOID; then a bare line naming the lesson. The bare line is at most 94 characters because
     the lesson id is at most 18, so some candidate always fits. The final length check guards that bound.
     """
-    _recheck(lesson, known_programs, registered_repos)
+    _recheck(lesson, known_commands, registered_repos)
     header = f"[scars {lesson.id} {lesson.level} | {scope_label(lesson.scope)}]"
     footer = f"(explain: scars why {lesson.id})"
     avoid = f"AVOID: {lesson.text.avoid}"
