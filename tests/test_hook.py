@@ -1075,6 +1075,7 @@ def test_latency_with_1000_lessons(env):
             result = run_hook(
                 home, "claude", "PostToolUseFailure", claude_failure(repo, f"lat{i}{error[:4]}", error=error)
             )
+            assert (result.stdout != "") == (error == ERROR)
             times.append(result.elapsed_ms)
         times.sort()
         return times[9], times[-1]

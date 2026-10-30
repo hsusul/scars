@@ -49,6 +49,59 @@ def observe(db, lesson_id, tool_use_id, passing):
     )
 
 
+def staged(db, fingerprint, triggers, steps):
+    lesson_id = store.create_lesson(
+        db,
+        text=LessonText("npm test", "run `npm ci`", "Error: missing module"),
+        scope=RepoScope(REPO),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=triggers,
+        fingerprint=fingerprint,
+        actor="miner",
+        at=T0,
+    )
+    revision = 1
+    for step in steps:
+        revision = store.apply_event(
+            db, lesson_id=lesson_id, event=step, expected_revision=revision, actor="human", payload={}
+        )
+    return lesson_id
+
+
+def test_active_for_stage_keeps_only_lessons_that_can_fire_at_the_stage(db):
+    error = Trigger(TriggerKind.ERROR, "Error: missing module", Stage.REPAIR)
+    other_error = Trigger(TriggerKind.ERROR, "Error: other", Stage.REPAIR)
+    prompt = Trigger(TriggerKind.PROMPT, "express", Stage.PLAN)
+    gate = Trigger(TriggerKind.COMMAND, "npm test", Stage.GATE)
+    pinned = [EventType.PROMOTED, EventType.PINNED]
+    repair = staged(db, "a", (error,), [EventType.PROVISIONALIZED])
+    other = staged(db, "b", (other_error,), [EventType.PROVISIONALIZED])
+    both = staged(db, "c", (prompt, other_error), pinned)
+    staged(db, "d", (prompt,), [EventType.PROMOTED])
+    staged(db, "e", (gate,), pinned[:1])
+
+    def ids(**query):
+        return [le.id for le in store.active_for_stage(db, REPO, "s1", **query)]
+
+    kinds = {TriggerKind.ERROR}
+    assert ids(stage=Stage.REPAIR, pinned_only=False, trigger_kinds=kinds, error_signature=error.spec) == [
+        repair
+    ]
+    assert sorted(ids(stage=Stage.REPAIR, pinned_only=False, trigger_kinds=kinds)) == sorted(
+        [repair, other, both]
+    )
+    plan_kinds = {TriggerKind.PROMPT, TriggerKind.PATH}
+    assert ids(stage=Stage.PLAN, pinned_only=True, trigger_kinds=plan_kinds) == [both]
+    found = store.active_for_stage(db, REPO, "s1", stage=Stage.PLAN, pinned_only=True, trigger_kinds=None)
+    assert [(le.id, set(le.triggers)) for le in found] == [(both, {prompt, other_error})]
+    assert ids(stage=Stage.PLAN, pinned_only=True, trigger_kinds=plan_kinds) == ids(
+        stage=Stage.PLAN, pinned_only=True, trigger_kinds=plan_kinds, error_signature="unused"
+    )
+    assert (
+        store.active_for_stage(db, None, "s1", stage=Stage.PLAN, pinned_only=True, trigger_kinds=None) == []
+    )
+
+
 def test_candidate_count_counts_only_candidates(db):
     first, _ = new(db, "a"), new(db, "b")
     store.apply_event(
