@@ -894,7 +894,7 @@ def test_locked_telemetry_still_delivers_the_lesson_and_drops_the_hit(env):
     try:
         result = run_hook(home, "claude", "PostToolUseFailure", claude_failure(repo))
         assert json.loads(result.stdout) == context("PostToolUseFailure", lesson_text(lesson_id))
-        assert result.elapsed_ms < 250
+        assert result.elapsed_ms < NO_WAIT_MS
     finally:
         locker.execute("rollback")
         locker.close()
@@ -904,10 +904,14 @@ def test_locked_telemetry_still_delivers_the_lesson_and_drops_the_hit(env):
 
 # ---------------------------------------------------------------- faults
 
+# These runs only prove the hook never waits on a lock, which would cost SQLite's 2 s busy timeout.
+# Latency itself is measured by scripts/bench_hook.py; a tight wall-clock bound flakes on shared CI runners.
+NO_WAIT_MS = 1000
+
 
 def assert_silent_and_fast(result):
     assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
-    assert result.elapsed_ms < 250, f"took {result.elapsed_ms:.0f} ms"
+    assert result.elapsed_ms < NO_WAIT_MS, f"took {result.elapsed_ms:.0f} ms"
 
 
 def test_missing_lessons_db_prints_nothing_quickly_and_records_an_error(env):
