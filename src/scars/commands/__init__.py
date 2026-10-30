@@ -63,7 +63,7 @@ def process_ancestors(pid: int | None = None) -> list[str] | None:
             break
         try:
             result = subprocess.run(
-                [PS, "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=2
+                [PS, "-ww", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=2
             )
         except (OSError, subprocess.SubprocessError):
             return None
