@@ -2,8 +2,10 @@
 
 Each `shown` hit at the plan or repair stage gets a reference call. For a repair hit it is the failed
 call that fired the hit (looked up by tool use id). For a plan hit it is the first call in the session,
-at or after the hit, that matches one of the lesson's command or path triggers. Then the first rule that
-holds decides:
+at or after the hit, that matches the hit's pre-trigger: the command or path trigger named by the hit's
+`trigger_key` when that is the trigger that fired, else any of the lesson's command or path triggers,
+whatever their stage (a mined lesson's command pre-trigger lives at the gate stage). Paths resolve
+against the worktree root of each call's working directory. Then the first rule that holds decides:
 
 1. `ignored_then_failed`: the lesson's error signature fails a call within the 5 calls after the
    reference call, or, for a plan hit, the reference call itself.
@@ -15,14 +17,15 @@ holds decides:
 
 Rules 2 to 5 wait until the 5 calls after the reference call exist or the session has ended, so a later
 failure always wins and the answer does not depend on when the miner ran. Transcripts mark no session
-end, so a session has ended once it has been idle for 24 hours: no mined call and no hit for that long.
+end, so a session has ended once it has been idle for 24 hours: no mined call and no hit of any kind in
+that session for that long. It is decided once per session, from its latest activity.
 Gate hits and hits that delivered nothing get no delayed outcome.
 """
 
 import os
 import sqlite3
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 
 from scars import store
 from scars.match import InvalidTrigger, RecordedCall, call_matches
@@ -40,6 +43,25 @@ class HitRow:
     tool_use_id: str | None
     stage: Stage
     lesson_id: LessonId
+    trigger_key: str | None = None
+
+
+def _fired(trigger_key: str | None) -> Trigger | None:
+    """The command or path trigger a `kind:stage:spec` key names, or None for any other key."""
+    parts = (trigger_key or "").split(":", 2)
+    if len(parts) != 3 or parts[0] not in (TriggerKind.COMMAND, TriggerKind.PATH):
+        return None
+    try:
+        return Trigger(TriggerKind(parts[0]), parts[2], Stage(parts[1]))
+    except ValueError:
+        return None
+
+
+Roots = Callable[[str], str | None]
+
+
+def _no_root(cwd: str) -> str | None:
+    return None
 
 
 @dataclass(frozen=True)
@@ -56,7 +78,7 @@ class LessonFacts:
         return cls(errors[0] if errors else lesson.text.reason, pre)
 
 
-def recorded(call: store.MinedCall) -> RecordedCall:
+def recorded(call: store.MinedCall, repo_root: str | None = None) -> RecordedCall:
     return RecordedCall(
         tool_kind=ToolKind(call.tool_kind),
         command=call.command,
@@ -64,13 +86,16 @@ def recorded(call: store.MinedCall) -> RecordedCall:
         succeeded=call.status == "ok",
         error_signature=call.error_signature,  # type: ignore[arg-type]
         cwd=call.cwd,
+        repo_root=repo_root,
     )
 
 
-def _matches_pre(facts: LessonFacts, call: store.MinedCall) -> bool:
+def _matches_pre(facts: LessonFacts, call: store.MinedCall, root_of: Roots) -> bool:
+    needs_root = call.paths and any(t.kind is TriggerKind.PATH for t in facts.pre_triggers)
+    record = recorded(call, root_of(call.cwd) if needs_root else None)
     for trigger in facts.pre_triggers:
         try:
-            if call_matches(trigger, recorded(call)):
+            if call_matches(trigger, record):
                 return True
         except InvalidTrigger:
             continue
@@ -82,9 +107,16 @@ def _failed_with(facts: LessonFacts, call: store.MinedCall) -> bool:
 
 
 def decide(
-    hit: HitRow, facts: LessonFacts, calls: Sequence[store.MinedCall], ended: bool
+    hit: HitRow,
+    facts: LessonFacts,
+    calls: Sequence[store.MinedCall],
+    ended: bool,
+    root_of: Roots = _no_root,
 ) -> DelayedOutcome | None:
-    """The delayed outcome of one hit given its session's calls in order, or None while undecided."""
+    """The delayed outcome of one hit given its session's calls in order, or None while undecided.
+
+    `root_of` maps a call's working directory to its worktree root, for path triggers.
+    """
     if hit.stage is Stage.REPAIR:
         index = next((i for i, c in enumerate(calls) if c.tool_use_id == hit.tool_use_id), None)
         if index is None:
@@ -97,10 +129,13 @@ def decide(
         following = next((c for c in calls[index + 1 :] if c.tool_kind == kind), None)
         if following is None:
             return DelayedOutcome.UNKNOWN if ended else None
-        if following.status == "ok" or (facts.pre_triggers and not _matches_pre(facts, following)):
+        if following.status == "ok" or (facts.pre_triggers and not _matches_pre(facts, following, root_of)):
             return DelayedOutcome.HEEDED
         return DelayedOutcome.UNKNOWN
-    index = next((i for i, c in enumerate(calls) if c.at >= hit.at and _matches_pre(facts, c)), None)
+    fired = _fired(hit.trigger_key)
+    if fired is not None:
+        facts = replace(facts, pre_triggers=(fired,))
+    index = next((i for i, c in enumerate(calls) if c.at >= hit.at and _matches_pre(facts, c, root_of)), None)
     if index is None:
         return DelayedOutcome.NO_ATTEMPT if ended else None
     if any(_failed_with(facts, c) for c in calls[index : index + 1 + WINDOW]):
@@ -124,9 +159,9 @@ class Result:
     models: int
 
 
-def run(lessons: sqlite3.Connection, telemetry_path: str, now: float) -> Result:
+def run(lessons: sqlite3.Connection, telemetry_path: str, now: float, *, root_of: Roots = _no_root) -> Result:
     """Write the outcomes that can be decided and backfill missing model ids. Skips a missing or
-    unusable telemetry.db."""
+    unusable telemetry.db. `root_of` maps a working directory to its worktree root."""
     if not os.path.exists(telemetry_path):
         return Result(0, 0)
     try:
@@ -134,16 +169,17 @@ def run(lessons: sqlite3.Connection, telemetry_path: str, now: float) -> Result:
     except sqlite3.Error:
         return Result(0, 0)
     try:
-        return _run(lessons, tdb, now)
+        return _run(lessons, tdb, now, root_of)
     except sqlite3.Error:
         return Result(0, 0)
     finally:
         tdb.close()
 
 
-def _run(lessons: sqlite3.Connection, tdb: sqlite3.Connection, now: float) -> Result:
+def _run(lessons: sqlite3.Connection, tdb: sqlite3.Connection, now: float, root_of: Roots) -> Result:
     rows = tdb.execute(
-        "select seq, at, session_id, tool_use_id, stage, lesson_id from hits h where outcome = 'shown' "
+        "select seq, at, session_id, tool_use_id, stage, lesson_id, trigger_key from hits h "
+        "where outcome = 'shown' "
         "and lesson_id is not null and stage in ('plan','repair') "
         "and not exists (select 1 from outcomes o where o.hit_seq = h.seq) order by seq"
     ).fetchall()
@@ -154,19 +190,24 @@ def _run(lessons: sqlite3.Connection, tdb: sqlite3.Connection, now: float) -> Re
             sessions[session_id] = store.session_calls(lessons, session_id)
         return sessions[session_id]
 
+    hit_activity = dict(tdb.execute("select session_id, max(at) from hits group by session_id").fetchall())
+
+    def ended(session_id: str) -> bool:
+        latest = max([hit_activity.get(session_id, 0.0), *(c.at for c in calls_of(session_id))])
+        return now - latest >= IDLE_SECONDS
+
     facts: dict[str, LessonFacts] = {}
     decided: list[tuple[int, str]] = []
-    for seq, at, session_id, tool_use_id, stage, lesson_id in rows:
-        hit = HitRow(seq, at, session_id, tool_use_id, Stage(stage), LessonId(lesson_id))
+    for seq, at, session_id, tool_use_id, stage, lesson_id, trigger_key in rows:
+        hit = HitRow(seq, at, session_id, tool_use_id, Stage(stage), LessonId(lesson_id), trigger_key)
         if lesson_id not in facts:
             facts[lesson_id] = LessonFacts.of(store.get_lesson(lessons, hit.lesson_id))
         stream_session = session_id
         if hit.stage is Stage.REPAIR and tool_use_id:
             found = store.mined_call(lessons, tool_use_id)
             stream_session = found.session_id if found else session_id
-        calls = calls_of(stream_session)
-        last = max([at, *(c.at for c in calls)])
-        outcome = decide(hit, facts[lesson_id], calls, now - last >= IDLE_SECONDS)
+        over = ended(session_id) and ended(stream_session)
+        outcome = decide(hit, facts[lesson_id], calls_of(stream_session), over, root_of)
         if outcome is not None:
             decided.append((seq, str(outcome)))
     models: list[tuple[str, int]] = []

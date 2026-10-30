@@ -81,6 +81,9 @@ create table if not exists mined_calls (       -- the last 30 days of mined tool
   error_signature text, cwd text not null, model_id text
 );
 create index if not exists mined_calls_session on mined_calls(session_id, seq);
+create table if not exists miner_file_context (  -- Codex session context in force at the saved offset
+  path text primary key, cwd text not null, model_id text
+);
 create table precision_runs (lesson_id text not null, revision integer not null, matched_failing integer not null,
                              matched_passing integer not null, window_days integer not null, at real not null,
                              primary key (lesson_id, revision));

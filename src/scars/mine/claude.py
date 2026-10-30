@@ -3,18 +3,28 @@
 Assistant records carry `tool_use` blocks (`id`, `name`, `input`) in `message.content`, with the model in
 `message.model`. User records carry the matching `tool_result` blocks (`tool_use_id`, `is_error`,
 `content`), with `timestamp` and `cwd` on the record. A call is complete when its result is read; its
-time is the result's time. The session id is the file name, as in hook stdin.
+time is the result's time. Calls are emitted in the order they were invoked, not the order their
+results arrived, and an edit is emitted at its invocation even before its result (see `calls.settle`).
+The session id is the file name, as in hook stdin.
 """
 
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from scars.mine.calls import SHELL_TOOL, Call, CallStatus, Line, Parsed, make_call, timestamp
+from scars.mine.calls import (
+    EDIT_TOOLS,
+    SHELL_TOOL,
+    Call,
+    CallStatus,
+    Context,
+    Invocation,
+    Line,
+    Parsed,
+    make_call,
+    settle,
+    timestamp,
+)
 from scars.model import Harness
-
-UNRESOLVED_HORIZON = 24 * 3600
-"""A tool call with no result this long after the newest record is abandoned (an interrupted session),
-so it no longer holds the file's offset back."""
 
 
 @dataclass(frozen=True)
@@ -43,9 +53,31 @@ def _paths(args: object) -> tuple[str, ...]:
     return tuple(v for k in ("file_path", "notebook_path") if isinstance(v := args.get(k), str))
 
 
-def parse(lines: Iterable[Line], session_id: str) -> Parsed:
+def _call(
+    session_id: str, tool_use_id: str, use: _Use, status: CallStatus, output: str, at: float, cwd: str
+) -> Call:
+    args = use.input
+    command = args.get("command") if isinstance(args, dict) else None
+    return make_call(
+        harness=Harness.CLAUDE,
+        session_id=session_id,
+        tool_use_id=tool_use_id,
+        tool=use.name,
+        raw_input=args,
+        command=command if use.name == SHELL_TOOL and isinstance(command, str) else None,
+        paths=_paths(args),
+        status=status,
+        output=output,
+        at=at,
+        cwd=cwd,
+        model_id=use.model,
+    )
+
+
+def parse(lines: Iterable[Line], session_id: str, context: Context | None = None, now: float = 0.0) -> Parsed:
+    """`context` is accepted for symmetry with Codex; Claude records carry their own cwd and model."""
     uses: dict[str, _Use] = {}
-    calls: list[Call] = []
+    order: dict[str, Invocation] = {}
     newest: float | None = None
     for line in lines:
         record = line.record
@@ -62,7 +94,10 @@ def parse(lines: Iterable[Line], session_id: str) -> Parsed:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
-                uses[block["id"]] = _Use(
+                tool_use_id = block["id"]
+                if tool_use_id in order:
+                    continue
+                use = _Use(
                     line.offset,
                     str(block.get("name", "")),
                     block.get("input"),
@@ -70,32 +105,24 @@ def parse(lines: Iterable[Line], session_id: str) -> Parsed:
                     str(cwd),
                     at,
                 )
+                uses[tool_use_id] = use
+                inv = order[tool_use_id] = Invocation(line.offset, at)
+                if use.name in EDIT_TOOLS and at is not None:
+                    inv.barrier = _call(session_id, tool_use_id, use, CallStatus.UNKNOWN, "", at, use.cwd)
             elif block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
-                use = uses.pop(block["tool_use_id"], None)
+                tool_use_id = block["tool_use_id"]
+                use = uses.pop(tool_use_id, None)
                 if use is None or at is None:
                     continue
                 failed = block.get("is_error") is True
-                args = use.input
-                command = args.get("command") if isinstance(args, dict) else None
-                calls.append(
-                    make_call(
-                        harness=Harness.CLAUDE,
-                        session_id=session_id,
-                        tool_use_id=block["tool_use_id"],
-                        tool=use.name,
-                        raw_input=args,
-                        command=command if use.name == SHELL_TOOL and isinstance(command, str) else None,
-                        paths=_paths(args),
-                        status=CallStatus.FAILED if failed else CallStatus.OK,
-                        output=_text(block.get("content")) if failed else "",
-                        at=at,
-                        cwd=str(cwd) or use.cwd,
-                        model_id=use.model,
-                    )
+                order[tool_use_id].call = _call(
+                    session_id,
+                    tool_use_id,
+                    use,
+                    CallStatus.FAILED if failed else CallStatus.OK,
+                    _text(block.get("content")) if failed else "",
+                    at,
+                    str(cwd) or use.cwd,
                 )
-    waiting = [
-        u.offset
-        for u in uses.values()
-        if newest is None or u.at is None or newest - u.at < UNRESOLVED_HORIZON
-    ]
-    return Parsed(tuple(calls), min(waiting) if waiting else None)
+    calls, resume = settle(order.values(), newest, now)
+    return Parsed(tuple(calls), resume)

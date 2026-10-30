@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -56,11 +57,65 @@ class Line:
 
 
 @dataclass(frozen=True)
+class Context:
+    """Session context a transcript sets for the calls after it: Codex `session_meta` and `turn_context`."""
+
+    cwd: str = ""
+    model_id: str | None = None
+
+
+@dataclass(frozen=True)
 class Parsed:
     calls: tuple[Call, ...]
     resume_offset: int | None
     """Where the next batch must start reading, when a call's start was read but its result was not yet
     written; None means after the last complete line."""
+    context: Context | None = None
+    """The context in force at the resume point, for the next batch to start from. None for Claude."""
+
+
+UNRESOLVED_HORIZON = 24 * 3600
+"""A tool call with no result this long after the newest record, or before the miner's clock, is abandoned
+(an interrupted session), so it no longer holds the file's offset back."""
+
+
+@dataclass
+class Invocation:
+    """One tool call in invocation order, resolved once its result is read."""
+
+    offset: int
+    """Byte offset of the line that started the call."""
+    at: float | None
+    call: Call | None = None
+    """The finished call, set when its result is read."""
+    barrier: Call | None = None
+    """For an edit call: what to emit while its result is not yet read. An edit ends every open pair at
+    the point it was invoked, whatever its result."""
+    dropped: bool = False
+    """Resolved, but into nothing the miner reads (a shell call whose command is not readable)."""
+
+
+def settle(
+    invocations: Iterable[Invocation], newest: float | None, now: float
+) -> tuple[list[Call], int | None]:
+    """The calls that can be emitted, in invocation order, and the offset to resume from.
+
+    Emission stops at the first unresolved call that is not an edit and not abandoned: its result could
+    still add a call to some failure's 10-call window, so no later call is final yet. Those later calls
+    are read again by the next batch, starting at the blocking call's line.
+    """
+    out: list[Call] = []
+    latest = max(now, newest) if newest is not None else now
+    for inv in invocations:
+        if inv.call is not None:
+            out.append(inv.call)
+        elif inv.barrier is not None:
+            out.append(inv.barrier)
+        elif inv.dropped or (inv.at is not None and latest - inv.at >= UNRESOLVED_HORIZON):
+            continue
+        else:
+            return out, inv.offset
+    return out, None
 
 
 def tool_kind(tool: str) -> ToolKind:

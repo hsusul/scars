@@ -3,14 +3,25 @@
 `run` mines one batch:
 
 1. Read the new complete lines of every transcript from its saved offset (from 0 when the file was
-   replaced or shrank), into one ordered call stream per session.
+   replaced or shrank), into one call stream per session in invocation order, starting from the Codex
+   context saved with the offset.
 2. Drop calls whose tool use id an earlier batch already processed: resumed sessions copy history.
 3. Pair failures with their fixes (see `pairs`), continuing the failures left open by earlier batches.
 4. Build each pair's candidate (see `build`), in order of the fixing call's time. A new fingerprint
    creates a candidate, which an `own_code` repo-scope candidate leaves at once as provisional; an
-   existing one gets an `observed` event. Each pair adds one observation.
+   existing one gets an `observed` event. Each pair adds one observation. A pair's lesson write,
+   provisionalization, precision run and observation commit in one transaction, and the observation,
+   unique per failed tool use id, marks the pair processed, so a crash never counts a sighting twice.
 5. Commit offsets, processed ids, the open failures and the new mined calls in one transaction.
 6. Expire lessons not sighted for 14 days, then write delayed hit outcomes.
+
+Every transcript-derived text is secret-scanned before it is stored anywhere: a command, error
+signature or model id that trips a secret rule is stored as NULL, a working directory as the empty
+string (the column is not nullable), a path that does is left out, and a pending failure whose input or
+signature does is not kept (it could only pair into a candidate the scan rejects).
+
+A working directory that no longer exists (a deleted worktree) resolves through its nearest existing
+parent directory.
 
 Event times are the fixing call's time, so expiry counts from the real sighting. Mining the same
 transcripts again changes nothing: offsets, processed ids and observations each guard the work.
@@ -19,14 +30,15 @@ transcripts again changes nothing: offsets, processed ids and observations each 
 import os
 import sqlite3
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from scars import hook, policy, render, store
-from scars.match import RecordedCall, precision
+from scars.match import InvalidTrigger, Precision, RecordedCall
 from scars.mine import build, calls, claude, codex, outcomes, pairs
-from scars.model import EventType, Harness, RepoId
+from scars.mine.replay import CallIndex
+from scars.model import ErrorSignature, EventType, Harness, RepoId, Trigger
 
 DAY = 86400.0
 
@@ -78,13 +90,24 @@ def _session_id(source: Source, path: Path) -> str:
 @dataclass(frozen=True)
 class _Read:
     offsets: tuple[store.Offset, ...]
+    contexts: tuple[store.FileContext, ...]
     streams: dict[tuple[str, str], list[calls.Call]]
     sessions: int
     malformed: int
 
 
-def _read(sources: Iterable[Source], saved: dict[str, store.Offset]) -> _Read:
+def _clean(text: str | None) -> str | None:
+    return None if text is None or build.secret_rule(text) is not None else text
+
+
+def _read(
+    sources: Iterable[Source],
+    saved: dict[str, store.Offset],
+    saved_contexts: dict[str, store.FileContext],
+    now: float,
+) -> _Read:
     offsets: list[store.Offset] = []
+    contexts: list[store.FileContext] = []
     streams: dict[tuple[str, str], list[calls.Call]] = {}
     sessions = malformed = 0
     for source in sources:
@@ -105,21 +128,24 @@ def _read(sources: Iterable[Source], saved: dict[str, store.Offset]) -> _Read:
             except OSError:
                 continue
             session_id = _session_id(source, path)
-            parsed = _PARSERS[source.harness](chunk.lines, session_id)
+            ctx = saved_contexts.get(key) if start else None
+            context = calls.Context(ctx.cwd, ctx.model_id) if ctx else None
+            parsed = _PARSERS[source.harness](chunk.lines, session_id, context, now)
             resume = chunk.end if parsed.resume_offset is None else parsed.resume_offset
             offsets.append(store.Offset(key, resume, state.inode, state.mtime))
+            if parsed.context is not None:
+                cwd, model = _clean(parsed.context.cwd) or "", _clean(parsed.context.model_id)
+                contexts.append(store.FileContext(key, cwd, model))
             malformed += chunk.malformed
             if chunk.lines:
                 sessions += 1
             if parsed.calls:
                 streams.setdefault((str(source.harness), session_id), []).extend(parsed.calls)
-    return _Read(tuple(offsets), streams, sessions, malformed)
+    return _Read(tuple(offsets), tuple(contexts), streams, sessions, malformed)
 
 
 def _mined_row(call: calls.Call) -> store.MinedCall:
-    command = call.command
-    if command is not None and build.secret_rule(command) is not None:
-        command = None
+    """The row to store for a call, with every transcript-derived text secret-scanned."""
     sig = pairs.signature(call.output) if call.status is calls.CallStatus.FAILED else None
     return store.MinedCall(
         tool_use_id=call.tool_use_id,
@@ -128,12 +154,12 @@ def _mined_row(call: calls.Call) -> store.MinedCall:
         at=call.at,
         tool=call.tool,
         tool_kind=str(call.tool_kind),
-        command=command,
-        paths=call.paths,
+        command=_clean(call.command),
+        paths=tuple(p for p in call.paths if _clean(p) is not None),
         status=str(call.status),
-        error_signature=sig,
-        cwd=call.cwd,
-        model_id=call.model_id,
+        error_signature=_clean(sig),
+        cwd=_clean(call.cwd) or "",
+        model_id=_clean(call.model_id),
     )
 
 
@@ -155,7 +181,11 @@ def _open_from_store(p: store.PendingFailure) -> pairs.OpenFailure:
     )
 
 
-def _pending_row(f: pairs.OpenFailure) -> store.PendingFailure:
+def _pending_row(f: pairs.OpenFailure) -> store.PendingFailure | None:
+    """The row to keep for an open failure, or None when its input or signature holds a secret. Such a
+    failure could only pair into a candidate the secret scan rejects, so dropping it loses no lesson."""
+    if _clean(f.input) is None or _clean(f.signature) is None or _clean(f.program) is None:
+        return None
     return store.PendingFailure(
         f.tool_use_id,
         f.harness,
@@ -169,27 +199,79 @@ def _pending_row(f: pairs.OpenFailure) -> store.PendingFailure:
     )
 
 
-class _Repos:
-    """Working directory to registered repo and owner class, resolved once per directory per run."""
+def existing_dir(cwd: str) -> str | None:
+    """`cwd`, or its nearest existing parent when it was deleted; None for a relative or empty path."""
+    if not cwd.startswith("/"):
+        return None
+    path = os.path.normpath(cwd)
+    while not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+    return path
 
-    def __init__(self, db: sqlite3.Connection, common_dir_of: Callable[[str], str | None]) -> None:
+
+class _Repos:
+    """Working directory to registered repo, owner class and worktree root, resolved once per directory."""
+
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        common_dir_of: Callable[[str], str | None],
+        repo_root_of: Callable[[str], str | None],
+    ) -> None:
         self._db = db
         self._common_dir_of = common_dir_of
+        self._repo_root_of = repo_root_of
         self._cache: dict[str, tuple[RepoId | None, str | None]] = {}
+        self._roots: dict[str, str | None] = {}
 
     def resolve(self, cwd: str) -> tuple[RepoId | None, str | None]:
         if cwd not in self._cache:
-            common = self._common_dir_of(cwd) if cwd and os.path.isdir(cwd) else None
+            found = existing_dir(cwd)
+            common = self._common_dir_of(found) if found else None
             repo = store.repo_for_common_dir(self._db, (common, os.path.realpath(common))) if common else None
             self._cache[cwd] = (repo, store.repo_owner_class(self._db, repo) if repo else None)
         return self._cache[cwd]
+
+    def root(self, cwd: str) -> str | None:
+        if cwd not in self._roots:
+            found = existing_dir(cwd)
+            self._roots[cwd] = self._repo_root_of(found) if found else None
+        return self._roots[cwd]
+
+
+def _precision(index: CallIndex, trigger: Trigger | None, signature: ErrorSignature) -> Precision | None:
+    if trigger is None:
+        return None
+    try:
+        return index.precision(trigger, signature)
+    except (InvalidTrigger, ValueError):
+        return None
 
 
 def _write(
     db: sqlite3.Connection,
     candidate: build.Candidate,
     pair: pairs.Pair,
-    recent: Sequence[RecordedCall],
+    index: CallIndex,
+    counts: Counter[str],
+) -> None:
+    """Write one pair in one transaction; `counts` changes only when it commits. Skips a pair that
+    already has its observation."""
+    local: Counter[str] = Counter()
+    with store.transaction(db):
+        if not store.has_observation(db, pair.failed.tool_use_id):
+            _write_pair(db, candidate, pair, index, local)
+    counts.update(local)
+
+
+def _write_pair(
+    db: sqlite3.Connection,
+    candidate: build.Candidate,
+    pair: pairs.Pair,
+    index: CallIndex,
     counts: Counter[str],
 ) -> None:
     at = pair.passing.at
@@ -207,10 +289,10 @@ def _write(
         )
         lesson_id = existing.id
         pre = next((t for t in existing.triggers if t.kind.value in ("command", "path")), None)
-        checked = precision(pre, recent, error_signature=candidate.signature) if pre else None
+        checked = _precision(index, pre, candidate.signature)
     else:
         pre = candidate.pre_trigger
-        checked = precision(pre, recent, error_signature=candidate.signature) if pre else None
+        checked = _precision(index, pre, candidate.signature)
         if checked is not None and not policy.keeps_pre_trigger(checked):
             counts["pre_triggers_dropped"] += 1
             pre = None
@@ -270,12 +352,17 @@ def run(
     now: float,
     *,
     common_dir_of: Callable[[str], str | None] = hook.git_common_dir,
+    repo_root_of: Callable[[str], str | None] = hook.repo_root,
 ) -> Summary:
-    """Mine one batch into `home`/lessons.db and write outcomes into `home`/telemetry.db if it exists."""
+    """Mine one batch into `home`/lessons.db and write outcomes into `home`/telemetry.db if it exists.
+
+    `common_dir_of` maps a directory to its git common dir (which names the registered repo), and
+    `repo_root_of` to its worktree root (against which path triggers resolve absolute paths).
+    """
     db = store.init_lessons(home / "lessons.db")
     try:
         store.ensure_miner_schema(db)
-        return _run(db, home, sources, now, common_dir_of)
+        return _run(db, home, sources, now, _Repos(db, common_dir_of, repo_root_of))
     finally:
         db.close()
 
@@ -285,12 +372,12 @@ def _run(
     home: Path,
     sources: Iterable[Source],
     now: float,
-    common_dir_of: Callable[[str], str | None],
+    repos: _Repos,
 ) -> Summary:
     counts: Counter[str] = Counter()
     rejected: Counter[str] = Counter()
     skipped: Counter[str] = Counter()
-    read = _read(sources, store.miner_offsets(db))
+    read = _read(sources, store.miner_offsets(db), store.miner_file_contexts(db), now)
     all_ids = [c.tool_use_id for stream in read.streams.values() for c in stream]
     seen = set(store.seen_tool_uses(db, all_ids))
     streams: dict[tuple[str, str], list[calls.Call]] = {}
@@ -314,7 +401,7 @@ def _run(
     rows = [_mined_row(c) for c in new_calls]
     recent = [_recorded(r) for r in store.mined_calls_since(db, since)]
     recent += [_recorded(r) for r in rows if r.at >= since]
-    repos = _Repos(db, common_dir_of)
+    index = CallIndex(recent, repos.root)
     for pair in sorted(found, key=lambda p: (p.passing.at, p.failed.tool_use_id)):
         if store.has_observation(db, pair.failed.tool_use_id):
             continue
@@ -328,19 +415,20 @@ def _run(
             rejected[exc.rule] += 1
             continue
         try:
-            _write(db, candidate, pair, recent, counts)
+            _write(db, candidate, pair, index, counts)
         except (store.Conflict, store.Rejected):
             skipped["store_conflict"] += 1
     store.commit_batch(
         db,
         offsets=read.offsets,
         seen=[c.tool_use_id for c in new_calls],
-        pending=[_pending_row(f) for f in still_open],
+        pending=[r for r in map(_pending_row, still_open) if r is not None],
         calls=[r for r in rows if r.at >= since],
         prune_before=since,
+        contexts=read.contexts,
     )
     expired = policy.expire(db, now)
-    result = outcomes.run(db, str(home / "telemetry.db"), now)
+    result = outcomes.run(db, str(home / "telemetry.db"), now, root_of=repos.root)
     return Summary(
         sessions_read=read.sessions,
         calls=len(new_calls),

@@ -435,6 +435,39 @@ def _rollback(db: sqlite3.Connection) -> None:
         db.execute("rollback")
 
 
+@contextmanager
+def transaction(db: sqlite3.Connection) -> Iterator[None]:
+    """Run several store writes as one transaction: all of them commit, or none does.
+
+    `create_lesson` and `apply_event` called inside it join the transaction instead of committing on
+    their own, and a `Conflict` or `Rejected` they raise undoes only their own change.
+    """
+    db.execute("begin immediate")
+    try:
+        yield
+        db.execute("commit")
+    except BaseException:
+        _rollback(db)
+        raise
+
+
+@contextmanager
+def _write_unit(db: sqlite3.Connection) -> Iterator[None]:
+    """One write unit: its own transaction, or a savepoint inside a caller's `transaction`."""
+    if not db.in_transaction:
+        with transaction(db):
+            yield
+        return
+    db.execute("savepoint store_write")
+    try:
+        yield
+    except BaseException:
+        db.execute("rollback to store_write")
+        db.execute("release store_write")
+        raise
+    db.execute("release store_write")
+
+
 def _append_event(
     db: sqlite3.Connection,
     *,
@@ -554,8 +587,7 @@ def create_lesson(
         payload["fix_program"] = fix_program
     state = next_state(None, EventType.PROPOSED, payload, at=at)
     cols: dict[str, object] = {"id": lesson_id, **_columns(state)}
-    db.execute("begin immediate")
-    try:
+    with _write_unit(db):
         try:
             db.execute(
                 f"insert into lessons ({','.join(cols)}) values ({','.join('?' * len(cols))})",
@@ -576,10 +608,6 @@ def create_lesson(
             payload=payload,
             at=at,
         )
-        db.execute("commit")
-    except BaseException:
-        _rollback(db)
-        raise
     return lesson_id
 
 
@@ -667,8 +695,7 @@ def apply_event(
     if event is EventType.PROPOSED:
         raise Rejected("use create_lesson to propose a lesson")
     at = time.time() if at is None else at
-    db.execute("begin immediate")
-    try:
+    with _write_unit(db):
         found = _rows(db, "select * from lessons where id = ?", (lesson_id,))
         if not found:
             raise Rejected(f"no lesson {lesson_id}")
@@ -707,10 +734,6 @@ def apply_event(
             payload=payload,
             at=at,
         )
-        db.execute("commit")
-    except BaseException:
-        _rollback(db)
-        raise
     return new.revision
 
 
@@ -943,9 +966,10 @@ def promoted_at(db: sqlite3.Connection, lesson_ids: Iterable[LessonId]) -> dict[
 
 
 def ensure_miner_schema(db: sqlite3.Connection) -> None:
-    """Create the miner's `mined_calls` table in a store made before it existed. Idempotent."""
+    """Create the miner's later tables (`mined_calls`, `miner_file_context`) in a store made before they
+    existed. Idempotent."""
     for statement in _statements(schema_sql("lessons")):
-        if "if not exists" in statement and "mined_calls" in statement:
+        if "if not exists" in statement:
             db.execute(statement)
 
 
@@ -970,6 +994,20 @@ class Offset:
     offset: int
     inode: int
     mtime: float
+
+
+@dataclass(frozen=True)
+class FileContext:
+    """Session context a transcript set before its saved offset (Codex `session_meta` and `turn_context`),
+    restored when the next batch reads on from that offset."""
+
+    path: str
+    cwd: str
+    model_id: str | None
+
+
+def miner_file_contexts(db: sqlite3.Connection) -> dict[str, FileContext]:
+    return {r[0]: FileContext(*r) for r in db.execute("select path, cwd, model_id from miner_file_context")}
 
 
 @dataclass(frozen=True)
@@ -1144,15 +1182,21 @@ def commit_batch(
     pending: Iterable[PendingFailure],
     calls: Iterable[MinedCall],
     prune_before: float,
+    contexts: Iterable[FileContext] = (),
 ) -> None:
     """Advance the miner in one transaction: new file offsets, processed tool results, the full set of
     still-pending failures (replacing the old set), new mined calls, and calls older than `prune_before`
-    removed. A crash leaves either the old state or the new one, so a batch is never half-consumed."""
+    removed, and the session context saved with each offset. A crash leaves either the old state or the
+    new one, so a batch is never half-consumed."""
     db.execute("begin immediate")
     try:
         db.executemany(
             "insert or replace into miner_offsets (path, offset, inode, mtime) values (?,?,?,?)",
             [(o.path, o.offset, o.inode, o.mtime) for o in offsets],
+        )
+        db.executemany(
+            "insert or replace into miner_file_context (path, cwd, model_id) values (?,?,?)",
+            [(c.path, c.cwd, c.model_id) for c in contexts],
         )
         db.executemany("insert or ignore into seen_tool_use (tool_use_id) values (?)", [(s,) for s in seen])
         db.execute("delete from pending_failures")

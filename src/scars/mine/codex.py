@@ -14,6 +14,11 @@ A call fails only when a non-zero exit code is visible, by the same rule as the 
 `exit_code`, or an exit-code line in the output header. A call with no visible exit code has status
 `unknown`. The model comes from the latest `turn_context`. The session id is the id at the end of the
 file name, which is also the first `session_meta` id.
+
+The cwd and model in force at the resume point are returned with the calls, and the next batch starts
+from them, so calls read later keep the context set by lines an earlier batch consumed. Calls are emitted
+in invocation order, with an `apply_patch` call emitted at its start even before its output (see
+`calls.settle`).
 """
 
 import json
@@ -24,13 +29,23 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from scars.adapters.codex import exit_status, patch_paths
-from scars.mine.calls import Call, CallStatus, Line, Parsed, make_call, timestamp
+from scars.mine.calls import (
+    EDIT_TOOLS,
+    Call,
+    CallStatus,
+    Context,
+    Invocation,
+    Line,
+    Parsed,
+    make_call,
+    settle,
+    timestamp,
+)
 from scars.model import Harness
 
 SHELL_FUNCTIONS = frozenset({"shell", "exec_command", "shell_command", "container.exec"})
 WRAPPER_TOOLS = frozenset({"exec"})
 SHELLS = frozenset({"bash", "zsh", "sh"})
-UNRESOLVED_HORIZON = 24 * 3600
 _SESSION = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -97,15 +112,23 @@ def _args(raw: object) -> object:
     return raw
 
 
-def parse(lines: Iterable[Line], session_id: str) -> Parsed:
+def _make(session_id: str, **kwargs: object) -> Call:
+    return make_call(harness=Harness.CODEX, session_id=session_id, **kwargs)  # type: ignore[arg-type]
+
+
+def parse(lines: Iterable[Line], session_id: str, context: Context | None = None, now: float = 0.0) -> Parsed:
     started: dict[str, _Started] = {}
-    calls: list[Call] = []
-    model: str | None = None
-    cwd = ""
+    order: list[Invocation] = []
+    pending: dict[str, Invocation] = {}
+    start = context or Context()
+    model: str | None = start.model_id
+    cwd = start.cwd
+    contexts: list[tuple[int, Context]] = []
+    """(offset, context in force before that line) at each line that changed it."""
     newest: float | None = None
 
-    def add(**kwargs: object) -> None:
-        calls.append(make_call(harness=Harness.CODEX, session_id=session_id, **kwargs))  # type: ignore[arg-type]
+    def add(offset: int, **kwargs: object) -> None:
+        order.append(Invocation(offset, None, call=_make(session_id, **kwargs)))
 
     for line in lines:
         record = line.record
@@ -117,6 +140,8 @@ def parse(lines: Iterable[Line], session_id: str) -> Parsed:
             continue
         kind = record.get("type")
         ptype = payload.get("type")
+        if kind in ("session_meta", "turn_context"):
+            contexts.append((line.offset, Context(cwd, model)))
         if kind == "session_meta" and not cwd and isinstance(payload.get("cwd"), str):
             cwd = payload["cwd"]
         elif kind == "turn_context":
@@ -135,6 +160,7 @@ def parse(lines: Iterable[Line], session_id: str) -> Parsed:
                 status = CallStatus.UNKNOWN if code is None else CallStatus.FAILED if code else CallStatus.OK
                 output = item.get("aggregated_output")
                 add(
+                    line.offset,
                     tool_use_id=item["id"],
                     tool="Bash",
                     raw_input=command,
@@ -149,6 +175,7 @@ def parse(lines: Iterable[Line], session_id: str) -> Parsed:
             elif item.get("type") == "FileChange":
                 changes = item.get("changes")
                 add(
+                    line.offset,
                     tool_use_id=item["id"],
                     tool="apply_patch",
                     raw_input=sorted(changes) if isinstance(changes, dict) else None,
@@ -166,21 +193,30 @@ def parse(lines: Iterable[Line], session_id: str) -> Parsed:
             if not isinstance(name, str) or not isinstance(call_id, str) or name in WRAPPER_TOOLS:
                 continue
             raw = payload.get("arguments") if ptype == "function_call" else payload.get("input")
-            started[call_id] = _Started(line.offset, name, _args(raw), at, cwd, model)
+            if call_id in started or call_id in pending:
+                continue
+            began = started[call_id] = _Started(line.offset, name, _args(raw), at, cwd, model)
+            inv = pending[call_id] = Invocation(line.offset, at)
+            order.append(inv)
+            if name in EDIT_TOOLS and at is not None:
+                inv.barrier = _edit(session_id, call_id, began, CallStatus.UNKNOWN, "", at)
         elif kind == "response_item" and ptype in ("function_call_output", "custom_tool_call_output"):
             call_id = payload.get("call_id")
-            start = started.pop(call_id, None) if isinstance(call_id, str) else None
-            if start is None or at is None:
+            begun = started.pop(call_id, None) if isinstance(call_id, str) else None
+            if begun is None or at is None:
                 continue
+            inv = pending.pop(call_id)
             status, output = _status(payload.get("output"))
-            args = start.args
-            if start.name in SHELL_FUNCTIONS:
+            args = begun.args
+            if begun.name in SHELL_FUNCTIONS:
                 found = args if isinstance(args, dict) else {}
                 command = command_text(found.get("command", found.get("cmd")))
                 if command is None:
+                    inv.dropped = True
                     continue
                 workdir = found.get("workdir")
-                add(
+                inv.call = _make(
+                    session_id,
                     tool_use_id=call_id,
                     tool="Bash",
                     raw_input=command,
@@ -189,26 +225,32 @@ def parse(lines: Iterable[Line], session_id: str) -> Parsed:
                     status=status,
                     output=output,
                     at=at,
-                    cwd=workdir if isinstance(workdir, str) else start.cwd,
-                    model_id=start.model,
+                    cwd=workdir if isinstance(workdir, str) else begun.cwd,
+                    model_id=begun.model,
                 )
             else:
-                patch = args if isinstance(args, str) else ""
-                add(
-                    tool_use_id=call_id,
-                    tool=start.name,
-                    raw_input=args,
-                    command=None,
-                    paths=patch_paths(patch) if start.name == "apply_patch" else (),
-                    status=status,
-                    output=output,
-                    at=at,
-                    cwd=start.cwd,
-                    model_id=start.model,
-                )
-    waiting = [
-        s.offset
-        for s in started.values()
-        if newest is None or s.at is None or newest - s.at < UNRESOLVED_HORIZON
-    ]
-    return Parsed(tuple(calls), min(waiting) if waiting else None)
+                inv.call = _edit(session_id, call_id, begun, status, output, at)
+    calls, resume = settle(order, newest, now)
+    if resume is None:
+        return Parsed(tuple(calls), None, Context(cwd, model))
+    before = [c for offset, c in contexts if offset >= resume]
+    return Parsed(tuple(calls), resume, before[0] if before else Context(cwd, model))
+
+
+def _edit(session_id: str, call_id: str, begun: _Started, status: CallStatus, output: str, at: float) -> Call:
+    """A non-shell call, such as `apply_patch`."""
+    args = begun.args
+    patch = args if isinstance(args, str) else ""
+    return _make(
+        session_id,
+        tool_use_id=call_id,
+        tool=begun.name,
+        raw_input=args,
+        command=None,
+        paths=patch_paths(patch) if begun.name == "apply_patch" else (),
+        status=status,
+        output=output,
+        at=at,
+        cwd=begun.cwd,
+        model_id=begun.model,
+    )

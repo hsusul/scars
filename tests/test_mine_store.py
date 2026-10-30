@@ -1,5 +1,17 @@
+import pytest
+
 from scars import store
-from scars.model import LessonId, LessonText, RepoId, RepoScope, Stage, Trigger, TriggerKind, TrustClass
+from scars.model import (
+    EventType,
+    LessonId,
+    LessonText,
+    RepoId,
+    RepoScope,
+    Stage,
+    Trigger,
+    TriggerKind,
+    TrustClass,
+)
 
 T0 = 1_800_000_000.0
 
@@ -70,9 +82,66 @@ def test_observations_precision_runs_and_clones(tmp_path):
     assert store.expiring_lessons(db, T0 + store.EXPIRY_SECONDS) == [(lesson, 1)]
 
 
+def _lesson(db, fingerprint: str) -> LessonId:
+    return store.create_lesson(
+        db,
+        text=LessonText("ls x", "run `ls` instead", "E: x"),
+        scope=RepoScope(RepoId("r")),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=[Trigger(TriggerKind.ERROR, "E: x", Stage.REPAIR)],
+        fingerprint=fingerprint,
+        actor="miner",
+        at=T0,
+    )
+
+
+def test_transaction_commits_its_writes_together_or_not_at_all(tmp_path):
+    db = store.init_lessons(tmp_path / "lessons.db")
+    store.add_repo(db, RepoId("r"), "app", "own")
+    with pytest.raises(RuntimeError), store.transaction(db):
+        lesson = _lesson(db, "f1")
+        store.apply_event(
+            db,
+            lesson_id=lesson,
+            event=EventType.PROVISIONALIZED,
+            expected_revision=1,
+            actor="miner",
+            payload={},
+        )
+        raise RuntimeError("crash")
+    assert db.execute("select count(*) from lessons").fetchone()[0] == 0
+    assert db.execute("select count(*) from events").fetchone()[0] == 0
+    with store.transaction(db):
+        kept = _lesson(db, "f2")
+        with pytest.raises(store.Conflict):
+            _lesson(db, "f2")
+        store.apply_event(
+            db,
+            lesson_id=kept,
+            event=EventType.PROVISIONALIZED,
+            expected_revision=1,
+            actor="miner",
+            payload={},
+        )
+    assert db.execute("select fingerprint, status, revision from lessons").fetchall() == [
+        ("f2", "provisional", 2)
+    ]
+    assert db.in_transaction is False
+    assert store.verify(db) == []
+
+
+def test_file_contexts_are_saved_with_the_batch(tmp_path):
+    db = store.init_lessons(tmp_path / "lessons.db")
+    ctx = store.FileContext("/t/r.jsonl", "/w/app", "gpt-test")
+    store.commit_batch(db, offsets=[], seen=[], pending=[], calls=[], prune_before=0, contexts=[ctx])
+    assert store.miner_file_contexts(db) == {"/t/r.jsonl": ctx}
+
+
 def test_ensure_miner_schema_adds_the_calls_table_to_an_older_store(tmp_path):
     db = store.init_lessons(tmp_path / "lessons.db")
     db.execute("drop table mined_calls")
+    db.execute("drop table miner_file_context")
     store.ensure_miner_schema(db)
     store.ensure_miner_schema(db)
     assert store.mined_calls_since(db, 0) == []
+    assert store.miner_file_contexts(db) == {}
