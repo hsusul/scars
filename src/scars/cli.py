@@ -52,6 +52,11 @@ def _why(p: argparse.ArgumentParser) -> None:
 
 def _init(p: argparse.ArgumentParser) -> None:
     p.add_argument("--yes", action="store_true", help="answer yes; register only repos with no git remote")
+    p.add_argument(
+        "--allow-dev-install",
+        action="store_true",
+        help="install even when scars-hook lives inside a git checkout an agent could edit",
+    )
 
 
 def _mine(p: argparse.ArgumentParser) -> None:

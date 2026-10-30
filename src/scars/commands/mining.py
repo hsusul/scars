@@ -66,7 +66,7 @@ def run(ctx: Context, since: float | None = None) -> Summary:
     sources = mine.default_sources(ctx.user_home)
     if since is not None:
         sources = recent_sources(sources, since)
-    return mine.run(paths.home(), sources, ctx.clock())
+    return mine.run(paths.home(), sources, ctx.clock(), partial=since is not None)
 
 
 def waiting_line(home: Path) -> str | None:

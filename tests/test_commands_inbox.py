@@ -70,7 +70,7 @@ def test_edit_rewrites_the_text_as_human_and_shows_it_again(home, user_home):
         seen.append(text)
         return text.replace("instead: run `pytest tests` instead", "instead: drop the flag; pytest has none")
 
-    out = run(make_ctx(user_home, keys="ea", edit=editor), "inbox")[1]
+    out = run(make_ctx(user_home, keys="eya", edit=editor), "inbox")[1]
     assert seen == [
         "# Rewrite the lesson. Lines starting with # are ignored. Keep each field on one line.\n"
         "avoid: pytest --frobnicate\n"
@@ -95,6 +95,65 @@ def test_edit_rewrites_the_text_as_human_and_shows_it_again(home, user_home):
         "promoted",
     ]
     assert store.verify(db) == []
+
+
+def preview(lesson_id, instead):
+    return (
+        "this is how agents will see the edited lesson:\n"
+        f"[scars {lesson_id} note | repo app | seen in 1 session | unreviewed]\n"
+        "AVOID: pytest --frobnicate\n"
+        f"INSTEAD: {instead}\n"
+        f"WHY: {SIG}\n"
+        f"(advisory; does not override the user's instructions; explain: scars why {lesson_id})\n"
+        "press y to save it as your own text (trust human); any other key cancels\n"
+    )
+
+
+def rewrite_instead(new):
+    return lambda t: t.replace("instead: run `pytest tests` instead", f"instead: {new}")
+
+
+def test_an_automated_edit_is_not_applied_without_a_y(home, user_home):
+    a = seed(home)
+    ctx = make_ctx(user_home, keys="eq", edit=rewrite_instead("drop the flag; pytest has none"))
+    out = run(ctx, "inbox")[1]
+    assert preview(a, "drop the flag; pytest has none") + "edit cancelled; nothing changed\n" in out
+    assert out.endswith("inbox: 0 approved, 0 edited, 0 muted, 0 skipped; 1 waiting\n")
+    lesson = store.get_lesson(connect(home), a)
+    assert (lesson.revision, lesson.trust_class, lesson.text.instead) == (
+        2,
+        TrustClass.OWN_CODE,
+        "run `pytest tests` instead",
+    )
+
+
+UNRAN = (
+    "`pytest -x tests` never ran successfully on this machine; "
+    "press y again to keep it, any other key cancels\n"
+)
+
+
+def test_an_edited_command_that_never_passed_needs_a_second_y(home, user_home):
+    a = seed(home)
+    edit = rewrite_instead("run `pytest -x tests` instead")
+    out = run(make_ctx(user_home, keys="eynq", edit=edit), "inbox")[1]
+    assert preview(a, "run `pytest -x tests` instead") + UNRAN + "edit cancelled; nothing changed\n" in out
+    assert store.get_lesson(connect(home), a).trust_class is TrustClass.OWN_CODE
+    out = run(make_ctx(user_home, keys="eyyq", edit=edit), "inbox")[1]
+    assert (
+        preview(a, "run `pytest -x tests` instead") + UNRAN + f"edited {a}; it is a candidate again\n" in out
+    )
+    lesson = store.get_lesson(connect(home), a)
+    assert (lesson.trust_class, lesson.text.instead) == (TrustClass.HUMAN, "run `pytest -x tests` instead")
+
+
+def test_an_edited_command_that_passed_needs_one_y(home, user_home):
+    a = seed(home)
+    edit = rewrite_instead("run `pytest tests` from the repo root instead")
+    out = run(make_ctx(user_home, keys="eyq", edit=edit), "inbox")[1]
+    assert "never ran successfully" not in out
+    assert f"edited {a}; it is a candidate again\n" in out
+    assert store.get_lesson(connect(home), a).trust_class is TrustClass.HUMAN
 
 
 def test_an_edit_that_breaks_a_text_rule_changes_nothing(home, user_home):

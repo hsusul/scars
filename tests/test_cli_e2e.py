@@ -24,7 +24,7 @@ def test_init_mine_inbox_then_the_hook_shows_the_lesson(work, monkeypatch):
     transcript.parent.mkdir(parents=True)
     transcript.write_text(claude_transcript(str(repo), time.time() - 3600, FAILURE_PAIR))
 
-    code, out, err = run(make_ctx(user_home, clock=time.time), "init", "--yes")
+    code, out, err = run(make_ctx(user_home, clock=time.time), "init", "--yes", "--allow-dev-install")
     assert (code, err) == (0, "")
     assert oct(os.stat(scars_home).st_mode & 0o777) == "0o700"
     assert (scars_home / "lessons.db").exists() and (scars_home / "telemetry.db").exists()
@@ -50,6 +50,7 @@ def test_init_mine_inbox_then_the_hook_shows_the_lesson(work, monkeypatch):
 
     hooks = json.loads((scars_home / "plugins" / "claude" / "hooks" / "hooks.json").read_text())
     command = hooks["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"]
+    assert command == f"{scars_home}/bin/scars-hook claude PostToolUseFailure"
     payload = {
         "session_id": "next-session",
         "cwd": str(repo),

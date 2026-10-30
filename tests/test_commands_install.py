@@ -65,29 +65,67 @@ def test_codex_hooks_match_the_documented_shape():
         assert group["hooks"] == [{"type": "command", "command": f"{QUOTED} codex {event}", "timeout": 2}]
 
 
-def test_codex_merge_keeps_other_hooks_and_replaces_old_scars_entries():
+def test_codex_merge_keeps_other_hooks_and_replaces_only_exact_scars_commands():
+    guard = {"type": "command", "command": "python3 ~/guard.py"}
+    mentions = {"type": "command", "command": "echo scars-hook is great"}
     existing = {
         "description": "mine",
         "hooks": {
+            "Stop": [],
             "PreToolUse": [
-                {"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 ~/guard.py"}]},
+                {"matcher": "Bash", "hooks": [guard]},
+                {"matcher": "Edit", "hooks": []},
+                {"hooks": [mentions]},
                 {
                     "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": "/old/scars-hook codex PreToolUse"}],
+                    "hooks": [{"type": "command", "command": f"{QUOTED} codex PreToolUse"}, guard],
                 },
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": f"{QUOTED} codex PreToolUse"}]},
             ],
-            "Stop": [{"hooks": [{"type": "command", "command": "/old/scars-hook codex Stop"}]}],
         },
     }
     ours = install.hooks_config("codex/hooks.json", HOOK)
     merged = install.merge_codex(existing, ours)
     assert merged["description"] == "mine"
+    assert merged["hooks"]["Stop"] == []
     assert merged["hooks"]["PreToolUse"] == [
-        {"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 ~/guard.py"}]},
+        {"matcher": "Bash", "hooks": [guard]},
+        {"matcher": "Edit", "hooks": []},
+        {"hooks": [mentions]},
+        {"matcher": "Bash", "hooks": [guard]},
         *ours["hooks"]["PreToolUse"],
     ]
-    assert "Stop" not in merged["hooks"]
+    assert list(merged["hooks"]) == ["Stop", "PreToolUse", "SessionStart", "UserPromptSubmit", "PostToolUse"]
     assert install.merge_codex(merged, ours) == merged
+
+
+@pytest.mark.parametrize(
+    ("hooks", "detail"),
+    [
+        ([], "hooks is not an object"),
+        ({"Stop": "echo hi"}, "hooks.Stop is not a list"),
+        ({"Stop": ["echo hi"]}, "hooks.Stop[0] is not an object"),
+        ({"Stop": [{"matcher": "x"}]}, "hooks.Stop[0].hooks is not a list"),
+        ({"Stop": [{"hooks": {"command": "x"}}]}, "hooks.Stop[0].hooks is not a list"),
+        ({"Stop": [{"hooks": ["echo hi"]}]}, "hooks.Stop[0].hooks[0] is not an object"),
+    ],
+)
+def test_init_refuses_a_codex_config_of_another_shape_and_changes_nothing(machine, hooks, detail):
+    user, scars_home = machine
+    path = user / ".codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    original = json.dumps({"hooks": hooks, "other": 1})
+    path.write_text(original)
+    code, out, err = run(make_ctx(user, clock=time.time), "init", "--yes")
+    assert (code, out, err) == (
+        1,
+        "",
+        f"scars init: {path} is not in the shape scars knows ({detail}); nothing was changed. "
+        "Fix it or move it away, then run scars init again\n",
+    )
+    assert path.read_text() == original
+    assert not (scars_home / "plugins").exists()
+    assert not (scars_home / "bin").exists()
 
 
 def test_init_yes_is_idempotent(machine, work):
@@ -172,6 +210,161 @@ def test_init_refuses_a_broken_codex_config(machine):
         f"scars init: cannot parse {user}/.codex/hooks.json; "
         "fix it or move it away, then run scars init again\n"
     )
+
+
+SHIM_BODY = "#!/bin/sh\nexec '/opt/scars bin/scars-hook' \"$@\"\n"
+
+
+def mode(path):
+    return oct(os.stat(path).st_mode & 0o777)
+
+
+def test_init_writes_a_stable_shim_and_points_both_harnesses_at_it(machine):
+    user, scars_home = machine
+    assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
+    shim = scars_home / "bin" / "scars-hook"
+    assert (shim.read_text(), mode(shim)) == (SHIM_BODY, "0o755")
+    quoted = shlex.quote(str(shim))
+    claude = json.loads((scars_home / "plugins" / "claude" / "hooks" / "hooks.json").read_text())
+    codex = json.loads((user / ".codex" / "hooks.json").read_text())
+    for config, harness in ((claude, "claude"), (codex, "codex")):
+        commands = [h["command"] for e, gs in config["hooks"].items() for g in gs for h in g["hooks"]]
+        events = list(config["hooks"])
+        assert commands == [f"{quoted} {harness} {e}" for e in events]
+    assert mode(user / ".codex" / "hooks.json") == "0o600"
+    assert mode(scars_home / "plugins" / "claude" / "hooks" / "hooks.json") == "0o600"
+    assert mode(user / "Library" / "LaunchAgents" / "dev.scars.miner.plist") == "0o644"
+
+
+def test_init_refuses_a_hook_inside_a_git_checkout_unless_allowed(machine, work, monkeypatch):
+    user, scars_home = machine
+    checkout = work / "scars-src"
+    (checkout / ".git").mkdir(parents=True)
+    script = checkout / ".venv" / "bin" / "scars-hook"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(install, "installed_script", lambda name: str(checkout / ".venv" / "bin" / name))
+    code, out, err = run(make_ctx(user, clock=time.time), "init", "--yes")
+    assert (code, out, err) == (
+        1,
+        "",
+        f"scars init: refused: {script} is inside the git checkout {checkout}, and an agent working in "
+        "that checkout could edit the hook code every session runs; install scars outside a checkout, "
+        "or pass --allow-dev-install to accept that\n",
+    )
+    assert not scars_home.exists()
+    code, out, err = run(make_ctx(user, clock=time.time), "init", "--yes", "--allow-dev-install")
+    assert (code, err) == (0, "")
+    assert f"warning: {script} is inside the git checkout {checkout}" in out
+    assert (
+        scars_home / "bin" / "scars-hook"
+    ).read_text() == f'#!/bin/sh\nexec {shlex.quote(str(script))} "$@"\n'
+
+
+def test_init_writes_through_a_symlinked_codex_config(machine, work):
+    user, _ = machine
+    real = work / "dotfiles" / "codex-hooks.json"
+    real.parent.mkdir()
+    real.write_text('{"other": 1}')
+    link = user / ".codex" / "hooks.json"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
+    assert link.is_symlink() and os.readlink(link) == str(real)
+    merged = json.loads(real.read_text())
+    assert (merged["other"], sorted(merged["hooks"])) == (
+        1,
+        ["PostToolUse", "PreToolUse", "SessionStart", "UserPromptSubmit"],
+    )
+
+
+def test_init_keeps_the_mode_of_an_existing_config(machine):
+    user, _ = machine
+    path = user / ".codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{}")
+    path.chmod(0o640)
+    assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
+    assert (mode(path), "PreToolUse" in json.loads(path.read_text())["hooks"]) == ("0o640", True)
+    path.write_text("{}")
+    path.chmod(0o600)
+    assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
+    assert (mode(path), "PreToolUse" in json.loads(path.read_text())["hooks"]) == ("0o600", True)
+
+
+def test_init_leaves_a_read_only_config_alone_unless_confirmed(machine):
+    user, _ = machine
+    path = user / ".codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{}")
+    path.chmod(0o444)
+    out = run(make_ctx(user, platform="linux", clock=time.time), "init", "--yes")[1]
+    assert (
+        f"Codex hooks: not written: {path} is read-only; run scars init without --yes to replace it\n" in out
+    )
+    assert path.read_text() == "{}"
+    out = run(make_ctx(user, lines="y\nn\n", platform="linux", clock=time.time), "init")[1]
+    assert f"write the Codex hooks? [y/N] {path} is read-only; replace it anyway? [y/N] " in out
+    assert "Codex hooks: not written\n" in out
+    assert path.read_text() == "{}"
+    out = run(make_ctx(user, lines="y\ny\n", platform="linux", clock=time.time), "init")[1]
+    assert "Codex hooks: written\n" in out
+    assert (mode(path), "PreToolUse" in json.loads(path.read_text())["hooks"]) == ("0o444", True)
+
+
+def test_concurrent_writes_of_one_file_never_fail_or_leave_temp_files(tmp_path):
+    import threading
+
+    target = tmp_path / "hooks.json"
+    errors = []
+
+    def writer(n):
+        for i in range(150):
+            try:
+                install.PlannedFile(target, f"{n}-{i}\n").write()
+            except Exception as exc:
+                errors.append(repr(exc))
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert [p.name for p in tmp_path.iterdir()] == ["hooks.json"]
+    assert target.read_text().endswith("-149\n")
+
+
+def test_two_inits_at_once_both_succeed(work):
+    import subprocess
+    import sys
+
+    user = work / "home with space"
+    user.mkdir()
+    env = {k: v for k, v in os.environ.items() if k not in ("SCARS_HOME", "CLAUDECODE", "CODEX_SANDBOX")}
+    env["HOME"] = str(user)
+    argv = [sys.executable, "-m", "scars", "init", "--yes", "--allow-dev-install"]
+    pipes = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
+    procs = [subprocess.Popen(argv, env=env, **pipes) for _ in range(2)]
+    outputs = [p.communicate(timeout=60) for p in procs]
+    results = [(p.returncode, err) for p, (_, err) in zip(procs, outputs, strict=True)]
+    assert results == [(0, ""), (0, "")]
+    codex = json.loads((user / ".codex" / "hooks.json").read_text())
+    assert sorted(codex["hooks"]) == ["PostToolUse", "PreToolUse", "SessionStart", "UserPromptSubmit"]
+    assert [len(groups) for groups in codex["hooks"].values()] == [1, 1, 1, 1]
+    leftovers = [p for p in user.rglob("*") if "scars-tmp" in p.name]
+    assert leftovers == []
+
+
+def test_init_yes_never_registers_a_repo_whose_remotes_cannot_be_read(machine, work, monkeypatch):
+    user, scars_home = machine
+    repo = git_repo(work / "app")
+    transcript(user, repo)
+    monkeypatch.setattr(install, "_git", lambda *args: None)
+    out = run(make_ctx(user, clock=time.time), "init", "--yes")[1]
+    assert f"repo app ({repo}/.git): cannot tell whether it has a git remote; skipped\n" in out
+    db = store.connect(scars_home / "lessons.db")
+    assert db.execute("select count(*) from repos").fetchone()[0] == 0
 
 
 def test_store_directory_is_private(machine):

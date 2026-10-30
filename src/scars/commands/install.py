@@ -15,8 +15,17 @@ Steps, in order:
 4. Mine history and list the top 5 waiting lessons with how often each would have fired in the last 30
    days: the mined failures in that window with the lesson's error signature.
 
-Every write is idempotent: a file that already has the planned content is reported unchanged, and the
-Codex merge replaces only entries that run `scars-hook`.
+Both harness configs run a shim, `~/.scars/bin/scars-hook`, which execs the installed `scars-hook` by
+absolute path, so the hook command in them stays the same across upgrades and reinstalls. When the
+installed `scars-hook` lives inside a git checkout, init refuses unless `--allow-dev-install` is given:
+an agent working in that checkout could edit the code every hook run executes.
+
+Every write is idempotent: a file that already has the planned content is reported unchanged. A write
+goes to the real file behind any symlink, through a temp file in the same directory that is fsynced and
+renamed into place, and keeps the existing file's mode. A read-only file is replaced only after the
+person confirms it, never under `--yes`. The Codex merge accepts only the documented shape of
+`hooks.json` (any other shape stops init before it changes anything) and removes only handlers whose
+command is exactly one scars renders; everything else in the file is kept.
 """
 
 from __future__ import annotations
@@ -30,9 +39,13 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
 
@@ -45,8 +58,10 @@ from scars.model import RepoId, TriggerKind
 DAY = 86400.0
 DISCOVERY_DAYS = 30
 TOP = 5
-HOOK_MARK = "scars-hook"
 LAUNCHD_LABEL = "dev.scars.miner"
+CONFIG_MODE = 0o600
+PLIST_MODE = 0o644
+SHIM_MODE = 0o755
 _CWD = re.compile(r'"cwd"\s*:\s*("(?:[^"\\]|\\.)*")')
 
 
@@ -54,6 +69,13 @@ _CWD = re.compile(r'"cwd"\s*:\s*("(?:[^"\\]|\\.)*")')
 class PlannedFile:
     path: Path
     content: str
+    mode: int = CONFIG_MODE
+    """The mode of a new file. An existing file keeps its own mode unless `force_mode` is set."""
+    force_mode: bool = False
+
+    def target(self) -> Path:
+        """The file a write lands in: `path` with every symlink resolved."""
+        return Path(os.path.realpath(self.path))
 
     def current(self) -> str | None:
         try:
@@ -61,10 +83,23 @@ class PlannedFile:
         except FileNotFoundError:
             return None
 
+    def _mode_ok(self) -> bool:
+        try:
+            return not self.force_mode or stat.S_IMODE(os.stat(self.target()).st_mode) == self.mode
+        except FileNotFoundError:
+            return False
+
+    def up_to_date(self) -> bool:
+        return self.current() == self.content and self._mode_ok()
+
+    def read_only(self) -> bool:
+        target = self.target()
+        return target.exists() and not os.access(target, os.W_OK)
+
     def diff(self) -> str:
         old = self.current()
         if old == self.content:
-            return ""
+            return "" if self._mode_ok() else f"mode of {self.path} becomes {self.mode:o}\n"
         lines = difflib.unified_diff(
             [] if old is None else old.splitlines(keepends=True),
             self.content.splitlines(keepends=True),
@@ -74,13 +109,37 @@ class PlannedFile:
         return "".join(lines)
 
     def write(self) -> bool:
-        """Write atomically. False when the file already had this content."""
-        if self.current() == self.content:
+        """Write atomically into the real file. False when it already had this content and mode.
+
+        The temp file has a unique name in the target's own directory, so concurrent inits never share
+        one and the rename never crosses a file system. File and directory are fsynced before and after
+        the rename, so a crash leaves the old file or the new one.
+        """
+        if self.up_to_date():
             return False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".scars-tmp")
-        tmp.write_text(self.content)
-        os.replace(tmp, self.path)
+        target = self.target()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            mode = self.mode if self.force_mode else stat.S_IMODE(os.stat(target).st_mode)
+        except FileNotFoundError:
+            mode = self.mode
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".scars-tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(self.content)
+                f.flush()
+                os.fchmod(f.fileno(), mode)
+                os.fsync(f.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            with suppress(FileNotFoundError):
+                os.unlink(tmp)
+            raise
+        directory = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         return True
 
 
@@ -137,34 +196,77 @@ def claude_files(scars_home: Path, hook_path: str) -> list[PlannedFile]:
     ]
 
 
-def _runs_scars(handler: object) -> bool:
-    return isinstance(handler, dict) and HOOK_MARK in str(handler.get("command", ""))
+def shim_file(scars_home: Path, hook_path: str) -> PlannedFile:
+    """`~/.scars/bin/scars-hook`, which execs the installed hook with the harness's arguments."""
+    content = f'#!/bin/sh\nexec {shlex.quote(hook_path)} "$@"\n'
+    return PlannedFile(scars_home / "bin" / "scars-hook", content, SHIM_MODE, force_mode=True)
+
+
+def git_checkout_of(path: str) -> Path | None:
+    """The nearest directory holding `path` (after resolving symlinks) that has a `.git` entry."""
+    for parent in Path(os.path.realpath(path)).parents:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def codex_shape_problem(config: dict[str, object]) -> str | None:
+    """Where `config` leaves the documented `hooks.json` shape, or None when it follows it.
+
+    The shape: an object whose optional `hooks` maps each event to a list of groups, each group an
+    object with a `hooks` list of handler objects. Anything else might be another tool's format that a
+    merge would silently damage, so init refuses it instead of guessing.
+    """
+    hooks = config.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return "hooks is not an object"
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            return f"hooks.{event} is not a list"
+        for i, group in enumerate(groups):
+            where = f"hooks.{event}[{i}]"
+            if not isinstance(group, dict):
+                return f"{where} is not an object"
+            if not isinstance(group.get("hooks"), list):
+                return f"{where}.hooks is not a list"
+            for j, handler in enumerate(group["hooks"]):
+                if not isinstance(handler, dict):
+                    return f"{where}.hooks[{j}] is not an object"
+    return None
+
+
+def _commands(config: dict[str, object]) -> set[str]:
+    hooks = config["hooks"]
+    assert isinstance(hooks, dict)
+    return {h["command"] for groups in hooks.values() for g in groups for h in g["hooks"]}
 
 
 def merge_codex(existing: dict[str, object], ours: dict[str, object]) -> dict[str, object]:
-    """`existing` with every handler that runs `scars-hook` replaced by `ours`; nothing else changes."""
-    merged = dict(existing)
-    hooks = merged.get("hooks", {})
-    if not isinstance(hooks, dict):
-        raise UserError("~/.codex/hooks.json has a hooks value that is not an object; fix it first")
+    """`existing` (already checked by `codex_shape_problem`) with scars's handlers replaced by `ours`.
+
+    A handler is scars's only when its command equals, exactly, a command in `ours`. A group is dropped
+    only when removing scars's handlers emptied it; empty groups and events that were already empty stay.
+    """
+    scars = _commands(ours)
+    hooks = existing.get("hooks", {})
+    assert isinstance(hooks, dict)
     out: dict[str, list[object]] = {}
     for event, groups in hooks.items():
-        kept = []
-        for group in groups if isinstance(groups, list) else []:
-            if isinstance(group, dict) and isinstance(group.get("hooks"), list):
-                handlers = [h for h in group["hooks"] if not _runs_scars(h)]
-                if handlers:
-                    kept.append({**group, "hooks": handlers})
-            else:
+        kept: list[object] = []
+        for group in groups:
+            others = [
+                h for h in group["hooks"] if not (isinstance(c := h.get("command"), str) and c in scars)
+            ]
+            if len(others) == len(group["hooks"]):
                 kept.append(group)
-        if kept:
-            out[event] = kept
+            elif others:
+                kept.append({**group, "hooks": others})
+        out[event] = kept
     ours_hooks = ours["hooks"]
     assert isinstance(ours_hooks, dict)
     for event, groups in ours_hooks.items():
         out.setdefault(event, []).extend(groups)
-    merged["hooks"] = out
-    return merged
+    return {**existing, "hooks": out}
 
 
 def codex_file(user_home: Path, hook_path: str) -> PlannedFile:
@@ -179,6 +281,11 @@ def codex_file(user_home: Path, hook_path: str) -> PlannedFile:
             ) from None
         if not isinstance(loaded, dict):
             raise UserError(f"{path} is not a JSON object; fix it or move it away")
+        if (problem := codex_shape_problem(loaded)) is not None:
+            raise UserError(
+                f"{path} is not in the shape scars knows ({problem}); nothing was changed. "
+                "Fix it or move it away, then run scars init again"
+            )
         existing = loaded
     return PlannedFile(path, _json(merge_codex(existing, hooks_config("codex/hooks.json", hook_path))))
 
@@ -191,7 +298,7 @@ def launchd_file(user_home: Path, scars_path: str, scars_home: Path, env: dict[s
     if env:
         job["EnvironmentVariables"] = env
     content = plistlib.dumps(job).decode()
-    return PlannedFile(user_home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist", content)
+    return PlannedFile(user_home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist", content, PLIST_MODE)
 
 
 # ---------------------------------------------------------------- repos
@@ -218,11 +325,18 @@ def transcript_cwds(user_home: Path, since: float) -> set[str]:
     return found
 
 
+class Remote(StrEnum):
+    YES = "yes"
+    NO = "no"
+    UNKNOWN = "unknown"
+    """git failed or timed out, so the repo may well have a remote."""
+
+
 @dataclass(frozen=True)
 class FoundRepo:
     common_dir: str
     name: str
-    has_remote: bool
+    remote: Remote
 
 
 def _git(*args: str) -> str | None:
@@ -250,7 +364,8 @@ def discover(cwds: set[str]) -> list[FoundRepo]:
         common = os.path.realpath(common)
         if common not in by_common:
             remotes = _git("--git-dir", common, "remote")
-            by_common[common] = FoundRepo(common, repo_name(common), bool(remotes and remotes.strip()))
+            remote = Remote.UNKNOWN if remotes is None else Remote.YES if remotes.strip() else Remote.NO
+            by_common[common] = FoundRepo(common, repo_name(common), remote)
     return sorted(by_common.values(), key=lambda r: (r.name, r.common_dir))
 
 
@@ -274,11 +389,13 @@ def register_repos(ctx: Context, scars_home: Path, yes: bool) -> None:
             ctx.print(f"repos: all {len(repos)} found are registered")
         for repo in fresh:
             if yes:
-                if repo.has_remote:
-                    ctx.print(
-                        f"repo {repo.name} ({repo.common_dir}): "
-                        "has a remote, so not sure it is yours; skipped"
+                if repo.remote is not Remote.NO:
+                    why = (
+                        "has a remote, so not sure it is yours"
+                        if repo.remote is Remote.YES
+                        else "cannot tell whether it has a git remote"
                     )
+                    ctx.print(f"repo {repo.name} ({repo.common_dir}): {why}; skipped")
                     continue
                 owner = "own"
             else:
@@ -314,25 +431,57 @@ def _offer(ctx: Context, title: str, planned: list[PlannedFile], yes: bool) -> b
         ctx.print(f"{title}: not written")
         return False
     for f in planned:
+        if f.up_to_date() or not f.read_only():
+            continue
+        if yes:
+            ctx.print(
+                f"{title}: not written: {f.path} is read-only; run scars init without --yes to replace it"
+            )
+            return False
+        if not ctx.confirm(f"{f.path} is read-only; replace it anyway?"):
+            ctx.print(f"{title}: not written")
+            return False
+    for f in planned:
         f.write()
     ctx.print(f"{title}: written")
     return True
 
 
-def install(ctx: Context, scars_home: Path, yes: bool, platform: str) -> None:
-    hook_path = installed_script("scars-hook")
-    if _offer(ctx, "Claude Code plugin", claude_files(scars_home, hook_path), yes):
+@dataclass(frozen=True)
+class Plan:
+    """Every file init may write, built before anything is touched so a refusal changes nothing."""
+
+    claude: list[PlannedFile]
+    codex: list[PlannedFile]
+    launchd: PlannedFile | None
+
+
+def plan(ctx: Context, scars_home: Path, hook_path: str) -> Plan:
+    shim = shim_file(scars_home, hook_path)
+    command = str(shim.path)
+    job = None
+    if ctx.platform == "darwin":
+        env = {} if scars_home == ctx.user_home / ".scars" else {"SCARS_HOME": str(scars_home)}
+        job = launchd_file(ctx.user_home, installed_script("scars"), scars_home, env)
+    return Plan(
+        claude=[shim, *claude_files(scars_home, command)],
+        codex=[shim, codex_file(ctx.user_home, command)],
+        launchd=job,
+    )
+
+
+def install(ctx: Context, scars_home: Path, files_: Plan, yes: bool) -> None:
+    if _offer(ctx, "Claude Code plugin", files_.claude, yes):
         plugins = scars_home / "plugins"
         ctx.print("to turn it on in Claude Code, run:")
         ctx.print(f"  claude plugin marketplace add {shlex.quote(str(plugins))}")
         ctx.print("  claude plugin install scars@scars-local")
-    if _offer(ctx, "Codex hooks", [codex_file(ctx.user_home, hook_path)], yes):
+    if _offer(ctx, "Codex hooks", files_.codex, yes):
         ctx.print("Codex asks you to review and trust the new hooks the next time it starts")
-    if platform != "darwin":
+    if files_.launchd is None:
         ctx.print("miner schedule: launchd is macOS only; run `scars mine` every 2 hours from cron instead")
         return
-    env = {} if scars_home == ctx.user_home / ".scars" else {"SCARS_HOME": str(scars_home)}
-    job = launchd_file(ctx.user_home, installed_script("scars"), scars_home, env)
+    job = files_.launchd
     if _offer(ctx, "miner schedule", [job], yes):
         ctx.print(f"to start it, run: launchctl bootstrap gui/{os.getuid()} {shlex.quote(str(job.path))}")
 
@@ -370,18 +519,37 @@ def show_top(ctx: Context, scars_home: Path) -> None:
     ctx.print("review them with: scars inbox")
 
 
+def hook_script(ctx: Context, allow_dev_install: bool) -> str:
+    """The installed `scars-hook`, refused when it sits in a git checkout unless that is allowed."""
+    hook_path = installed_script("scars-hook")
+    checkout = git_checkout_of(hook_path)
+    if checkout is not None:
+        real = os.path.realpath(hook_path)
+        if not allow_dev_install:
+            raise UserError(
+                f"refused: {real} is inside the git checkout {checkout}, and an agent working in that "
+                "checkout could edit the hook code every session runs; install scars outside a checkout, "
+                "or pass --allow-dev-install to accept that"
+            )
+        ctx.print(f"warning: {real} is inside the git checkout {checkout} (allowed by --allow-dev-install)")
+    return hook_path
+
+
 def cmd_init(args: argparse.Namespace, ctx: Context) -> int:
     scars_home = paths.home()
+    files_ = plan(ctx, scars_home, hook_script(ctx, args.allow_dev_install))
     scars_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(scars_home, 0o700)
     (scars_home / "logs").mkdir(mode=0o700, exist_ok=True)
     db = store.init_lessons(scars_home / "lessons.db")
     store.ensure_miner_schema(db)
     db.close()
-    store.init_telemetry(scars_home / "telemetry.db").close()
+    tele = store.init_telemetry(scars_home / "telemetry.db")
+    store.ensure_telemetry_schema(tele)
+    tele.close()
     ctx.print(f"store: {scars_home}")
     register_repos(ctx, scars_home, args.yes)
-    install(ctx, scars_home, args.yes, ctx.platform)
+    install(ctx, scars_home, files_, args.yes)
     summary = mining.run(ctx)
     for line in mining.summary_lines(summary):
         ctx.print(line)

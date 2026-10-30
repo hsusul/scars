@@ -21,6 +21,8 @@ import io
 import json
 import os
 import plistlib
+import re
+import sqlite3
 import statistics
 import subprocess
 import tempfile
@@ -31,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scars import hook, paths, store, telemetry
-from scars.commands import Context
+from scars.commands import Context, connect_readonly
 from scars.commands.import_guard import create_pinned
 from scars.commands.inspect import when
 from scars.model import Harness, HitOutcome, LessonText, Stage, Trigger, TriggerKind
@@ -65,15 +67,28 @@ class Check:
     detail: str
 
 
+_DF_ROW = re.compile(r"^.*?\s+\d+\s+\d+\s+\d+\s+\d+%\s+(?P<mount>.+)$")
+
+
+def mount_point(df_output: str) -> str | None:
+    """The mount point in `df -P` output. The row is read by its four numeric columns, because the file
+    system name before them and the mount point after them may both contain spaces."""
+    lines = df_output.strip().splitlines()
+    found = _DF_ROW.match(lines[-1]) if len(lines) >= 2 else None
+    return found["mount"].strip() if found else None
+
+
 def _mount_line(path: Path) -> str | None:
     try:
         df = subprocess.run(["df", "-P", str(path)], capture_output=True, text=True, timeout=5).stdout
-        mount_point = df.splitlines()[-1].split(None, 5)[-1]
         mounts = subprocess.run(["mount"], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError, IndexError):
+    except (OSError, subprocess.SubprocessError):
+        return None
+    mount_point_ = mount_point(df)
+    if mount_point_ is None:
         return None
     for line in mounts.splitlines():
-        if f" on {mount_point} " in line:
+        if f" on {mount_point_} " in line:
             return line
     return None
 
@@ -135,21 +150,24 @@ def harness_report(hits: list[telemetry.Hit], harness: Harness) -> tuple[str, bo
     return line, rate <= ERROR_RATE_LIMIT
 
 
+def _mentions(path: Path, text: str) -> bool:
+    try:
+        return text in path.read_text(errors="replace")
+    except OSError:
+        return False
+
+
 def _plugin_state(ctx: Context, scars_home: Path) -> dict[Harness, str]:
     claude_files = scars_home / "plugins" / "claude" / "hooks" / "hooks.json"
     installed = ctx.user_home / ".claude" / "plugins" / "installed_plugins.json"
     if not claude_files.exists():
         claude = "not installed (run scars init)"
-    elif installed.exists() and "scars@scars-local" in installed.read_text(errors="replace"):
+    elif _mentions(installed, "scars@scars-local"):
         claude = "installed"
     else:
         claude = "files written, not installed in Claude Code (claude plugin install scars@scars-local)"
     codex_config = ctx.user_home / ".codex" / "hooks.json"
-    codex = (
-        "installed"
-        if codex_config.exists() and "scars-hook" in codex_config.read_text(errors="replace")
-        else "not installed (run scars init)"
-    )
+    codex = "installed" if _mentions(codex_config, "scars-hook") else "not installed (run scars init)"
     return {Harness.CLAUDE: claude, Harness.CODEX: codex}
 
 
@@ -222,11 +240,15 @@ def _store_checks(ctx: Context, scars_home: Path, location: Callable[[Path], str
     checks.append(
         Check("store location", problem is None, f"{scars_home}: {problem}" if problem else str(scars_home))
     )
-    db = store.connect(lessons, readonly=True)
     try:
-        problems = store.verify(db)
-    finally:
-        db.close()
+        db = connect_readonly(lessons, "lessons")
+        try:
+            problems = store.verify(db)
+        finally:
+            db.close()
+    except (sqlite3.Error, OSError) as exc:
+        checks.append(Check("event chain", False, f"cannot read the lessons store: {exc}"))
+        return checks
     if problems:
         shown = "; ".join(problems[:3]) + (f"; and {len(problems) - 3} more" if len(problems) > 3 else "")
         checks.append(Check("event chain", False, shown))
@@ -249,11 +271,14 @@ def doctor(
     hits: list[telemetry.Hit] = []
     tele_path = scars_home / "telemetry.db"
     if tele_path.exists():
-        tele = store.connect(tele_path, readonly=True)
         try:
-            hits = telemetry.hits_since(tele, ctx.clock() - DAY)
-        finally:
-            tele.close()
+            tele = connect_readonly(tele_path, "hits")
+            try:
+                hits = telemetry.hits_since(tele, ctx.clock() - DAY)
+            finally:
+                tele.close()
+        except (sqlite3.Error, OSError) as exc:
+            out.append(Check("telemetry", False, f"cannot read telemetry.db: {exc}"))
     plugins = _plugin_state(ctx, scars_home)
     for harness in Harness:
         line, healthy = harness_report(hits, harness)

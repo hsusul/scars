@@ -984,6 +984,13 @@ def ensure_miner_schema(db: sqlite3.Connection) -> None:
             db.execute(statement)
 
 
+def ensure_telemetry_schema(db: sqlite3.Connection) -> None:
+    """Add telemetry.db's later indexes to a file made before they existed. Idempotent."""
+    for statement in _statements(schema_sql("telemetry")):
+        if "if not exists" in statement:
+            db.execute(statement)
+
+
 def add_clone(db: sqlite3.Connection, common_dir: str, repo_id: RepoId, at: float | None = None) -> None:
     """Register a clone's git common dir for a registered repo, or move it to that repo."""
     db.execute(
@@ -1173,6 +1180,11 @@ def record_precision(
 def lesson_last_seen(db: sqlite3.Connection, lesson_id: LessonId) -> float | None:
     row = db.execute("select last_seen_at from lessons where id = ?", (lesson_id,)).fetchone()
     return row[0] if row else None
+
+
+def lessons_last_seen(db: sqlite3.Connection) -> dict[LessonId, float | None]:
+    """Every lesson's `last_seen_at` in one query, for listings that would otherwise ask per lesson."""
+    return {LessonId(i): at for i, at in db.execute("select id, last_seen_at from lessons")}
 
 
 def expiring_lessons(db: sqlite3.Connection, now: float) -> list[tuple[LessonId, int]]:

@@ -7,8 +7,12 @@ Keys: `a` approves (promotes in the lesson's own scope), `e` opens the three tex
 unless a person runs it at a terminal.
 
 An edited lesson's text is the human's, so its trust class becomes `human` and the text is checked with
-the rules for human text. The edit sends the lesson back to candidate, and the inbox shows it again so
-the person can approve the new wording at once.
+the rules for human text. Because `human` lifts the observed-command rule, an edit is never applied on
+the editor's word alone (the editor could be a script that rewrites mined text): the inbox prints the
+lesson exactly as agents will see it and applies the edit only after the person presses `y`. When the
+new `instead` names a backticked command that never passed on this machine, it says so and needs a
+second `y`. Any other key cancels. The edit sends the lesson back to candidate, and the inbox shows it
+again so the person can approve the new wording at once.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import argparse
 import shlex
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from scars import render, store
@@ -100,29 +104,60 @@ def parse_edit(text: str) -> dict[str, str]:
     return found
 
 
-def edit(db: sqlite3.Connection, ctx: Context, lesson: Lesson) -> bool:
-    """Run the editor and apply the edit. False when nothing changed."""
+class Edit(StrEnum):
+    APPLIED = "applied"
+    UNCHANGED = "unchanged"
+    CANCELLED = "cancelled"
+
+
+def unobserved_command(instead: str, known_commands: frozenset[str]) -> str | None:
+    """The backticked command in a checked `instead` when no observed passing input equals it."""
+    if instead.count("`") != 2:
+        return None
+    command = instead.split("`")[1]
+    known = {render.normalize_command(k) for k in known_commands}
+    return None if render.normalize_command(command) in known else command
+
+
+def edit(db: sqlite3.Connection, ctx: Context, lesson: Lesson) -> Edit:
+    """Run the editor, show the result as agents will see it, and apply it after the person's `y`."""
     fields = parse_edit(ctx.rewrite(edit_text(lesson)))
     if all(fields[n] == getattr(lesson.text, n) for n in FIELDS):
-        return False
+        return Edit.UNCHANGED
+    known = store.passing_inputs(db, [lesson.id])[lesson.id]
+    repos = store.repo_names(db)
     try:
         text = render.check_fields(
             fields["avoid"],
             fields["instead"],
             fields["reason"],
             lesson.scope,
-            known_commands=store.passing_inputs(db, [lesson.id])[lesson.id],
+            known_commands=known,
             trust_class=TrustClass.HUMAN,
-            registered_repos=store.repo_names(db),
+            registered_repos=repos,
         )
+        after = replace(lesson, text=text, trust_class=TrustClass.HUMAN, status=Status.CANDIDATE)
+        shown = render.render(after, known_commands=known, registered_repos=repos)
     except render.RejectedText as exc:
         raise UserError(f"{exc.field} breaks {exc.rule}") from None
+    ctx.print("this is how agents will see the edited lesson:")
+    ctx.print(shown)
+    ctx.print("press y to save it as your own text (trust human); any other key cancels")
+    if ctx.key() != "y":
+        return Edit.CANCELLED
+    if (command := unobserved_command(text.instead, known)) is not None:
+        ctx.print(
+            f"`{command}` never ran successfully on this machine; "
+            "press y again to keep it, any other key cancels"
+        )
+        if ctx.key() != "y":
+            return Edit.CANCELLED
     payload: dict[str, object] = {
         "text": {"avoid": text.avoid, "instead": text.instead, "reason": text.reason},
         "trust_class": TrustClass.HUMAN.value,
     }
     apply(db, ctx, lesson, EventType.EDITED, payload)
-    return True
+    return Edit.APPLIED
 
 
 def _source(db: sqlite3.Connection, lesson: Lesson) -> list[str]:
@@ -175,11 +210,14 @@ def cmd_inbox(_: argparse.Namespace, ctx: Context) -> int:
                     ctx.print(f"muted {lesson.id}")
                     counts["muted"] += 1
                 elif key is Key.EDIT:
-                    if edit(db, ctx, lesson):
-                        ctx.print(f"edited {lesson.id}; it is a candidate again")
-                        counts["edited"] += 1
-                    else:
-                        ctx.print("no change")
+                    match edit(db, ctx, lesson):
+                        case Edit.APPLIED:
+                            ctx.print(f"edited {lesson.id}; it is a candidate again")
+                            counts["edited"] += 1
+                        case Edit.UNCHANGED:
+                            ctx.print("no change")
+                        case Edit.CANCELLED:
+                            ctx.print("edit cancelled; nothing changed")
                     continue
             except UserError as exc:
                 ctx.print(f"not applied: {exc}")

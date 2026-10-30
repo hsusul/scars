@@ -7,6 +7,8 @@ create table hits (
   injected_chars integer, latency_ms real, error_class text, arm text
 );
 create index hits_session on hits(session_id, at);
+create index if not exists hits_at on hits(at);                    -- doctor's 24 h window, the 30-day backfill
+create index if not exists hits_lesson on hits(lesson_id, at);     -- scars why, ls --firing
 
 create table outcomes (                        -- delayed outcomes, computed by the miner
   hit_seq integer primary key,

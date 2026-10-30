@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from scars import paths, store
+from scars import paths, render, store, telemetry
 from scars.model import Lesson, LessonId
 
 
@@ -32,6 +32,8 @@ HARNESS_MARKERS = ("@anthropic-ai/claude-code", "@openai/codex", "/claude-code/"
 """Command-line fragments that identify a harness run through an interpreter such as node."""
 HARNESS_ENV = ("CLAUDECODE", "CODEX_SANDBOX")
 ANCESTOR_DEPTH = 12
+PS = next((p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p)), "/bin/ps")
+"""`ps` by absolute path: a PATH lookup would let the caller swap in a `ps` that hides the harness."""
 
 
 def _read_key(stream: TextIO) -> str:
@@ -48,28 +50,33 @@ def _read_key(stream: TextIO) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def process_ancestors(pid: int | None = None) -> list[str]:
-    """The command lines of this process's ancestors, nearest first, as `ps` reports them."""
+def process_ancestors(pid: int | None = None) -> list[str] | None:
+    """The command lines of `pid` (default: this process's parent) and its ancestors, nearest first.
+
+    None when the chain cannot be read: `ps` is missing, fails, prints nothing, or prints something
+    that does not parse. A caller that needs the chain must treat None as a reason to refuse.
+    """
     out: list[str] = []
     pid = os.getppid() if pid is None else pid
     for _ in range(ANCESTOR_DEPTH):
         if pid <= 1:
             break
         try:
-            found = subprocess.run(
-                ["ps", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=2
-            ).stdout.strip()
+            result = subprocess.run(
+                [PS, "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=2
+            )
         except (OSError, subprocess.SubprocessError):
-            break
-        if not found:
-            break
+            return None
+        found = result.stdout.strip()
+        if result.returncode != 0 or not found:
+            return None
         parent, _, command = found.partition(" ")
-        out.append(command.strip())
         try:
             pid = int(parent)
         except ValueError:
-            break
-    return out
+            return None
+        out.append(command.strip())
+    return out or None
 
 
 def edit_in_editor(text: str, env: Mapping[str, str]) -> str:
@@ -100,7 +107,8 @@ class Context:
     env: Mapping[str, str] = field(default_factory=lambda: os.environ)
     read_key: Callable[[], str] | None = None
     """Returns one keypress. None reads from `stdin` in cbreak mode."""
-    ancestors: Callable[[], list[str]] = process_ancestors
+    ancestors: Callable[[], list[str] | None] = process_ancestors
+    """Command lines of the ancestor processes, nearest first; None when they cannot be read."""
     edit: Callable[[str], str] | None = None
     """Lets the person rewrite a text and returns it. None runs `$EDITOR`."""
     clock: Callable[[], float] = time.time
@@ -144,16 +152,20 @@ def refusal(ctx: Context) -> str | None:
     """Why a privileged command must not run here, or None when a person is at a terminal.
 
     Privileged commands change which lessons reach agents, so they need a human. The checks: stdin and
-    stdout are terminals, `CLAUDECODE` and `CODEX_SANDBOX` are unset, and no ancestor process is an agent
-    harness. An agent determined to get around this can, so it is a speed bump; the hook's agent deny
-    rule is the second layer.
+    stdout are terminals, `CLAUDECODE` and `CODEX_SANDBOX` are absent (even set to an empty string they
+    mark an agent session), and the ancestor processes can be read and none is an agent harness. When the
+    ancestry cannot be read the answer is no, not yes. An agent determined to get around this can, so it
+    is a speed bump; the hook's agent deny rule is the second layer.
     """
     for name in HARNESS_ENV:
-        if ctx.env.get(name):
+        if name in ctx.env:
             return f"{name} is set, so this looks like an agent session; run it in your own terminal"
     if not (_is_tty(ctx.stdin) and _is_tty(ctx.stdout)):
         return "stdin and stdout must be a terminal; run it in your own terminal"
-    for command_line in ctx.ancestors():
+    ancestors = ctx.ancestors()
+    if not ancestors:
+        return "cannot tell which processes started it; run it in your own terminal"
+    for command_line in ancestors:
         if harness_in(command_line):
             return "it was started from an agent harness; run it in your own terminal"
     return None
@@ -171,12 +183,50 @@ def require_home() -> Path:
     return home
 
 
+READ_BUSY_TIMEOUT_MS = 250
+
+
+def _probe(uri: str, table: str) -> sqlite3.Connection:
+    db = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        db.execute(f"pragma busy_timeout = {READ_BUSY_TIMEOUT_MS}")
+        db.execute(f"select 1 from {table} limit 0")
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
+def connect_readonly(path: Path, table: str) -> sqlite3.Connection:
+    """Open a store file read-only, the way the hook does, checking that `table` is readable.
+
+    A WAL database in a directory this process cannot write (an agent sandbox that denies writes to
+    `~/.scars`) cannot be opened normally, because SQLite has to create the `-shm` file. When the
+    directory is not writable and there is no `-wal` file, no writer can have changes pending, so the
+    file is opened as immutable instead.
+    """
+    uri = telemetry.uri(os.path.abspath(path), "ro")
+    try:
+        return _probe(uri, table)
+    except sqlite3.Error:
+        if os.access(path.parent, os.W_OK) or os.path.exists(f"{path}-wal"):
+            raise
+        return _probe(uri + "&immutable=1", table)
+
+
 @contextmanager
-def lessons_db() -> Iterator[sqlite3.Connection]:
-    db = store.connect(require_home() / "lessons.db")
+def lessons_db(*, readonly: bool = False) -> Iterator[sqlite3.Connection]:
+    """lessons.db for one command. Read-only commands pass `readonly`, so they never take a write lock."""
+    path = require_home() / "lessons.db"
+    try:
+        db = connect_readonly(path, "lessons") if readonly else store.connect(path)
+    except sqlite3.Error as exc:
+        raise UserError(f"cannot open {path}: {exc}") from None
     db.row_factory = sqlite3.Row
     try:
         yield db
+    except sqlite3.Error as exc:
+        raise UserError(f"cannot read {path}: {exc}") from None
     finally:
         db.close()
 
@@ -189,7 +239,52 @@ def get_lesson(db: sqlite3.Connection, lesson_id: str) -> Lesson:
 
 
 def telemetry_db() -> sqlite3.Connection | None:
+    """telemetry.db read-only, or None when it is missing or unreadable: telemetry is best-effort."""
     path = paths.home() / "telemetry.db"
     if not path.exists():
         return None
-    return store.connect(path, readonly=True)
+    try:
+        return connect_readonly(path, "hits")
+    except sqlite3.Error:
+        return None
+
+
+DISPLAY_RULES = (*render.SANITIZER_RULES, *render.IMPERATIVE_RULES, *render.SECRET_RULES)
+"""The lesson text rules, minus the observed-command rule (which is about a lesson's trust class)."""
+
+
+def shown(value: str) -> str:
+    """`value`, or `[hidden: <rule>]` when it breaks a lesson text rule.
+
+    Agents run the read commands too, so whatever they print is a way into an agent's context. Stored
+    values (lesson text, trigger specs, mined inputs, observations, event payloads) came from transcripts
+    and are held to the same rules as lesson text before they are printed.
+    """
+    if value == "":
+        return value
+    for rule in DISPLAY_RULES:
+        if rule.hits(value):
+            return f"[hidden: {rule.name}]"
+    return value
+
+
+def _shown_leaves(value: object) -> object:
+    match value:
+        case str():
+            return shown(value)
+        case list():
+            return [_shown_leaves(v) for v in value]
+        case dict():
+            return {shown(str(k)): _shown_leaves(v) for k, v in value.items()}
+    return value
+
+
+def shown_json(payload: str) -> str:
+    """A stored JSON payload with every string in it passed through `shown`, as compact JSON."""
+    import json
+
+    try:
+        value = json.loads(payload)
+    except ValueError:
+        return shown(payload)
+    return json.dumps(_shown_leaves(value), separators=(",", ":"), ensure_ascii=False)

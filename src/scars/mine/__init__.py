@@ -353,16 +353,20 @@ def run(
     *,
     common_dir_of: Callable[[str], str | None] = hook.git_common_dir,
     repo_root_of: Callable[[str], str | None] = hook.repo_root,
+    partial: bool = False,
 ) -> Summary:
     """Mine one batch into `home`/lessons.db and write outcomes into `home`/telemetry.db if it exists.
 
     `common_dir_of` maps a directory to its git common dir (which names the registered repo), and
     `repo_root_of` to its worktree root (against which path triggers resolve absolute paths).
+    `partial` says `sources` leave some transcripts out on purpose (`scars mine --since`): a pending
+    failure of a session this batch did not read is then kept as it is, neither advanced nor expired,
+    because its transcript was skipped rather than found idle.
     """
     db = store.init_lessons(home / "lessons.db")
     try:
         store.ensure_miner_schema(db)
-        return _run(db, home, sources, now, _Repos(db, common_dir_of, repo_root_of))
+        return _run(db, home, sources, now, _Repos(db, common_dir_of, repo_root_of), partial)
     finally:
         db.close()
 
@@ -373,6 +377,7 @@ def _run(
     sources: Iterable[Source],
     now: float,
     repos: _Repos,
+    partial: bool = False,
 ) -> Summary:
     counts: Counter[str] = Counter()
     rejected: Counter[str] = Counter()
@@ -393,6 +398,9 @@ def _run(
     found: list[pairs.Pair] = []
     still_open: list[pairs.OpenFailure] = []
     for key in sorted(set(streams) | set(waiting)):
+        if partial and key not in read.streams:
+            still_open.extend(waiting[key])
+            continue
         result = pairs.pair_session(waiting.get(key, ()), streams.get(key, ()), now)
         found.extend(result.pairs)
         still_open.extend(result.still_open)
