@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "@SCARS_HOOK@ codex SessionStart", "timeout": 2}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "@SCARS_HOOK@ codex UserPromptSubmit", "timeout": 2}]}
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch",
+        "hooks": [{"type": "command", "command": "@SCARS_HOOK@ codex PreToolUse", "timeout": 2}]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|apply_patch",
+        "hooks": [{"type": "command", "command": "@SCARS_HOOK@ codex PostToolUse", "timeout": 2}]
+      }
+    ]
+  }
+}

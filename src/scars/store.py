@@ -236,7 +236,12 @@ PAYLOAD_KEYS: dict[EventType, dict[str, PayloadKey]] = {
     EventType.OBSERVED: {"fix_program": PayloadKey(str)},
     EventType.PROMOTED: {"scope": PayloadKey(dict)},
     EventType.LEVEL_SET: {"level": PayloadKey(str, required=True)},
-    EventType.EDITED: {"text": PayloadKey(dict), "triggers": PayloadKey(list), "scope": PayloadKey(dict)},
+    EventType.EDITED: {
+        "text": PayloadKey(dict),
+        "triggers": PayloadKey(list),
+        "scope": PayloadKey(dict),
+        "trust_class": PayloadKey(str),
+    },
     EventType.SUPERSEDED: {"superseded_by": PayloadKey(str, required=True)},
 }
 """The payload keys each event accepts. Events not listed take an empty payload."""
@@ -303,6 +308,11 @@ def next_state(state: State | None, event: EventType, payload: object, *, at: fl
                 new = replace(new, text=_parse_text(payload["text"]))
             if "triggers" in payload:
                 new = replace(new, triggers=frozenset(_parse_triggers(payload["triggers"])))
+            if "trust_class" in payload:
+                # A human rewrite makes the text the human's, and nothing else may change trust.
+                if payload["trust_class"] != TrustClass.HUMAN.value:
+                    raise Rejected(f"an edit can only set trust class human, not {payload['trust_class']!r}")
+                new = replace(new, trust_class=TrustClass.HUMAN)
             if "scope" in payload:
                 scope = _parse_scope(payload["scope"])
                 if scope.kind == "machine" and state.scope.kind != "machine":
@@ -690,7 +700,8 @@ def apply_event(
 
     Payload keys by event: `observed` takes an optional `fix_program`, `promoted` an optional `scope`
     (required when the lesson is session-scoped), `level_set` needs `level`, `edited` takes optional
-    `text`, `triggers` and `scope` (never machine scope), and `superseded` needs `superseded_by`.
+    `text`, `triggers`, `scope` (never machine scope) and `trust_class` (only `human`), and `superseded`
+    needs `superseded_by`.
     """
     if event is EventType.PROPOSED:
         raise Rejected("use create_lesson to propose a lesson")
@@ -1243,3 +1254,57 @@ def commit_batch(
     except BaseException:
         _rollback(db)
         raise
+
+
+# ---------------------------------------------------------------- CLI reads
+
+
+def list_lessons(
+    db: sqlite3.Connection,
+    *,
+    statuses: Iterable[Status] | None = None,
+    repo_id: RepoId | None = None,
+) -> list[Lesson]:
+    """Lessons in any of `statuses` (all when None), narrowed to one repo's repo and path scopes."""
+    where, params = "1", []
+    if statuses is not None:
+        wanted = sorted(str(s) for s in statuses)
+        where += f" and status in ({','.join('?' * len(wanted))})"
+        params += wanted
+    if repo_id is not None:
+        where += " and repo_id = ?"
+        params.append(repo_id)
+    return _load(db, where, params)
+
+
+@dataclass(frozen=True)
+class EventRow:
+    seq: int
+    lesson_id: str | None
+    type: str
+    actor: str
+    from_revision: int | None
+    to_revision: int | None
+    payload: str
+    """Canonical JSON, as stored."""
+    at: float
+
+
+def lesson_events(db: sqlite3.Connection, lesson_id: LessonId) -> list[EventRow]:
+    """One lesson's events in log order, for `scars why`."""
+    rows = db.execute(
+        "select seq, lesson_id, type, actor, from_revision, to_revision, payload, at from events "
+        "where lesson_id = ? order by seq",
+        (lesson_id,),
+    )
+    return [EventRow(*r) for r in rows]
+
+
+def observations(db: sqlite3.Connection, lesson_id: LessonId) -> list[Observation]:
+    """One lesson's observations, oldest first."""
+    rows = db.execute(
+        "select lesson_id, harness, session_id, failed_tool_use_id, failed_input, error_signature, "
+        "passing_input, at from observations where lesson_id = ? order by at, id",
+        (lesson_id,),
+    )
+    return [Observation(LessonId(r[0]), *r[1:]) for r in rows]
