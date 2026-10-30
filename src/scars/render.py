@@ -13,8 +13,11 @@ roots only) rather than a list of bad phrases.
 
 1. Sanitizer: empty and over-cap fields, ANSI escapes, control characters (every C0 and C1 character,
    tab and newline included), anything outside printable ASCII, code fences and URLs.
-2. Imperative lint: the fixed `IMPERATIVE_RULES` table on every field, plus the backticked-command
-   rule for `instead` (see `_check_instead_command`).
+2. Imperative lint: the fixed `IMPERATIVE_RULES` table on every field, then the shape rules. A lesson
+   whose trust class is not `human` has a fixed structure: `instead` is exactly one of
+   `INSTEAD_TEMPLATES` around one observed command, and `avoid` and `reason` hold no code span at all
+   (see `_check_shape`). Free prose is never searched for commands; the structure leaves no room for one.
+   A `human` lesson keeps free wording, subject to every other rule.
 3. Secret scan: known token formats, matched wherever they start, and a high-entropy fallback.
 4. Machine-scope lint: machine lessons reach every repo, so they may not name a repo, a GitHub
    `owner/name`, a `..` path segment, or an absolute path outside `ALLOWED_ROOTS`, including a path
@@ -204,9 +207,11 @@ IMPERATIVE_RULES: tuple[Rule, ...] = (
 
 
 def normalize_command(command: str) -> str:
-    """`command` stripped, with each run of whitespace outside quotes collapsed to one space.
+    """`command` stripped, with each run of spaces and tabs outside quotes collapsed to one space.
 
-    Nothing else is rewritten: quoting, escapes and word order stay as written. A backslash outside
+    A newline separates two commands, so it is never collapsed: `echo a` newline `echo b` stays
+    different from `echo a echo b`. Nothing else is rewritten: quoting, escapes, newlines and word
+    order stay as written. A backslash outside
     single quotes keeps the next character literal, so an escaped space is never collapsed. The miner
     and the hook normalize the commands they pass as `known_commands` with this same function, and
     `check` normalizes both sides again before comparing.
@@ -225,7 +230,7 @@ def normalize_command(command: str) -> str:
             quote = "" if ch == quote else quote
         elif ch in "'\"":
             quote = ch
-        elif ch.isspace():
+        elif ch in " \t":
             if not out or out[-1] != " ":
                 out.append(" ")
             i += 1
@@ -288,8 +293,36 @@ def _command_views(command: str) -> list[str]:
     return views
 
 
+INSTEAD_TEMPLATES: tuple[str, ...] = (
+    "run `{command}`",
+    "run `{command}` first",
+    "run `{command}` instead",
+    "use `{command}`",
+    "use `{command}` instead",
+)
+"""The only shapes `instead` may take unless the lesson's trust class is `human`.
+
+Fill one with `template.format(command=normalize_command(passing_input))`. The match is exact: same
+case, single spaces, no trailing punctuation, nothing before or after. The command itself may be any
+text without a backtick; it must still parse, pass every imperative rule, and equal an observed command.
+"""
+
+
+def _template_pattern(template: str) -> str:
+    prefix, suffix = template.split("{command}")
+    return re.escape(prefix) + "[^`]*" + re.escape(suffix)
+
+
+_INSTEAD_SHAPE = re.compile("|".join(f"(?:{_template_pattern(t)})" for t in INSTEAD_TEMPLATES))
+_CODE_SPAN = re.compile(r"`|<\s*/?\s*(?:code|pre|kbd)\b|\$\(", re.IGNORECASE)
+"""A backtick, an HTML `code`, `pre` or `kbd` tag (opening or closing, any case), or `$(`."""
+
+
 def _check_instead_command(instead: str, known_commands: frozenset[str], trust_class: TrustClass) -> None:
     """At most one backticked command, and it must be one this machine already ran successfully.
+
+    Unless the trust class is `human`, `instead` must also be exactly one of `INSTEAD_TEMPLATES`, so a
+    second command cannot ride along in surrounding prose or in an HTML code tag.
 
     Programs are not trusted by name: a known program runs arbitrary code through its own subcommands,
     options and environment (`npm run`, `make -f`, `GIT_SSH=`). So a command is allowed only when its
@@ -300,22 +333,38 @@ def _check_instead_command(instead: str, known_commands: frozenset[str], trust_c
     runs on its dequoted views as well as on the raw text. An observed `python -c` stays rejected: one
     session's inline code should not be re-suggested to every session.
     """
+    human = trust_class is TrustClass.HUMAN
     ticks = instead.count("`")
     if ticks == 0:
-        return
+        if human:
+            return
+        raise RejectedText("lint.instead_template", "instead")
     if ticks % 2:
         raise RejectedText("lint.instead_unbalanced_backticks", "instead")
     if ticks > 2:
         raise RejectedText("lint.instead_multiple_commands", "instead")
+    if not human and _INSTEAD_SHAPE.fullmatch(instead) is None:
+        raise RejectedText("lint.instead_template", "instead")
     command = instead.split("`")[1]
     for view in _command_views(command):
         for rule in IMPERATIVE_RULES:
             if rule.hits(view):
                 raise RejectedText(rule.name, "instead")
-    if trust_class is TrustClass.HUMAN:
+    if human:
         return
     if normalize_command(command) not in {normalize_command(k) for k in known_commands}:
         raise RejectedText("lint.instead_unobserved_command", "instead")
+
+
+def _check_shape(values: Mapping[str, str], known_commands: frozenset[str], trust_class: TrustClass) -> None:
+    """The structural rules, field by field: `instead` via `_check_instead_command`, and for every trust
+    class but `human`, no code span in `avoid` or `reason`. The miner writes `avoid` as the failed input
+    without backticks and `reason` as an error signature, so neither needs one."""
+    for field in FIELDS:
+        if field == "instead":
+            _check_instead_command(values[field], known_commands, trust_class)
+        elif trust_class is not TrustClass.HUMAN and _CODE_SPAN.search(values[field]):
+            raise RejectedText("lint.code_span_outside_instead", field)
 
 
 # ---------------------------------------------------------------- secret scan
@@ -510,7 +559,7 @@ def _check_values(
 ) -> None:
     _run(SANITIZER_RULES, values)
     _run(IMPERATIVE_RULES, values)
-    _check_instead_command(values["instead"], known_commands, trust_class)
+    _check_shape(values, known_commands, trust_class)
     _run(SECRET_RULES, values)
     if isinstance(scope, MachineScope):
         _check_machine_scope(values, registered_repos)
@@ -529,7 +578,8 @@ def check(
     `known_commands` holds full commands that ran successfully on this machine: the miner passes the
     passing inputs it observed, the hook passes the lesson's own observed passing inputs. It has no
     default, so no caller can skip the observed-command rule by accident. `trust_class` is the lesson's;
-    only `human` exempts a backticked command from that rule. `registered_repos` holds the display names
+    only `human` exempts a lesson from that rule and from the fixed shape (`INSTEAD_TEMPLATES` for
+    `instead`, no code span in `avoid` or `reason`). `registered_repos` holds the display names
     of every registered repo.
     """
     values = {field: getattr(text, field) for field in FIELDS}
