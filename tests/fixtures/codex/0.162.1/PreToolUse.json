@@ -1,0 +1,19 @@
+{
+  "cases": [
+    {
+      "name": "Bash",
+      "stdin": {"session_id": "thr_123", "transcript_path": "/workspace/.codex/rollout.jsonl", "cwd": "/workspace", "hook_event_name": "PreToolUse", "model": "gpt-5.5-codex", "permission_mode": "default", "turn_id": "turn_1", "tool_name": "Bash", "tool_use_id": "call_1", "tool_input": {"command": "cargo test -p core"}},
+      "event": {"harness": "codex", "harness_version": "", "event": "pre_tool", "session_id": "thr_123", "tool_use_id": "call_1", "cwd": "/workspace", "tool_kind": "shell", "command": "cargo test -p core", "paths": [], "error_text": null, "prompt": null, "model_id": "gpt-5.5-codex"}
+    },
+    {
+      "name": "apply_patch",
+      "stdin": {"session_id": "thr_123", "transcript_path": null, "cwd": "/workspace", "hook_event_name": "PreToolUse", "model": "gpt-5.5-codex", "permission_mode": "default", "turn_id": "turn_1", "tool_name": "apply_patch", "tool_use_id": "call_2", "tool_input": {"command": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-a\n+b\n*** Add File: notes/new.md\n+hello\n*** Update File: old/name.py\n*** Move to: new/name.py\n*** End Patch\n"}},
+      "event": {"harness": "codex", "harness_version": "", "event": "pre_tool", "session_id": "thr_123", "tool_use_id": "call_2", "cwd": "/workspace", "tool_kind": "edit", "command": null, "paths": ["src/app.py", "notes/new.md", "old/name.py", "new/name.py"], "error_text": null, "prompt": null, "model_id": "gpt-5.5-codex"}
+    },
+    {
+      "name": "apply_patch naming no file",
+      "stdin": {"session_id": "thr_123", "cwd": "/workspace", "hook_event_name": "PreToolUse", "model": "m", "tool_name": "apply_patch", "tool_use_id": "call_3", "tool_input": {"command": "not a patch"}},
+      "error": "MalformedInput"
+    }
+  ]
+}

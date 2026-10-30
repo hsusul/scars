@@ -838,3 +838,53 @@ def active_for_hook(db: sqlite3.Connection, repo_id: RepoId | None, session_id: 
 def inbox_candidates(db: sqlite3.Connection) -> list[Lesson]:
     """Every candidate, for `scars inbox` to rank."""
     return _load(db, "status = 'candidate'", ())
+
+
+def candidate_count(db: sqlite3.Connection) -> int:
+    """How many candidates wait in the inbox, for the session-start notice."""
+    return db.execute("select count(*) from lessons where status = 'candidate'").fetchone()[0]
+
+
+def repo_for_common_dir(db: sqlite3.Connection, common_dirs: Iterable[str]) -> RepoId | None:
+    """The registered repo of the first of these git common dirs that is a registered clone, or None."""
+    for common_dir in common_dirs:
+        row = db.execute("select repo_id from clones where common_dir = ?", (common_dir,)).fetchone()
+        if row is not None:
+            return RepoId(row[0])
+    return None
+
+
+def repo_names(db: sqlite3.Connection) -> tuple[str, ...]:
+    """Display names of every registered repo, for the machine-scope lint."""
+    return tuple(r[0] for r in db.execute("select display_name from repos order by id"))
+
+
+def passing_inputs(db: sqlite3.Connection, lesson_ids: Iterable[LessonId]) -> dict[LessonId, frozenset[str]]:
+    """Each lesson's observed passing inputs: the commands render accepts in its `instead` field.
+
+    Every requested id is a key, with an empty set when the lesson has no observation.
+    """
+    ids = list(dict.fromkeys(lesson_ids))
+    found: dict[LessonId, set[str]] = {i: set() for i in ids}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        sql = f"select lesson_id, passing_input from observations where lesson_id in ({marks})"
+        for lesson_id, passing in db.execute(sql, ids):
+            found[LessonId(lesson_id)].add(passing)
+    return {i: frozenset(v) for i, v in found.items()}
+
+
+def promoted_at(db: sqlite3.Connection, lesson_ids: Iterable[LessonId]) -> dict[LessonId, float]:
+    """The time of each lesson's latest `promoted` event, for the `reviewed <date>` header.
+
+    Lessons that were never promoted are absent.
+    """
+    ids = list(dict.fromkeys(lesson_ids))
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    sql = (
+        f"select lesson_id, max(at) from events where type = 'promoted' and lesson_id in ({marks}) "
+        "group by lesson_id"
+    )
+    return {LessonId(lesson_id): at for lesson_id, at in db.execute(sql, ids)}

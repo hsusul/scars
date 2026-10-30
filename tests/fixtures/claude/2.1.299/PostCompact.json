@@ -1,0 +1,9 @@
+{
+  "cases": [
+    {
+      "name": "PostCompact is ignored; SessionStart with source compact delivers",
+      "stdin": {"session_id": "abc123", "transcript_path": "/t.jsonl", "cwd": "/r", "hook_event_name": "PostCompact", "trigger": "manual", "compact_summary": "Summary of the compacted conversation..."},
+      "error": "Ignored"
+    }
+  ]
+}

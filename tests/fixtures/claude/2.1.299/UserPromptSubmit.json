@@ -1,0 +1,19 @@
+{
+  "cases": [
+    {
+      "name": "prompt",
+      "stdin": {"session_id": "abc123", "transcript_path": "/t.jsonl", "cwd": "/Users/u/repo", "permission_mode": "default", "hook_event_name": "UserPromptSubmit", "prompt": "Write a function to calculate the factorial of a number"},
+      "event": {"harness": "claude", "harness_version": "", "event": "prompt", "session_id": "abc123", "tool_use_id": null, "cwd": "/Users/u/repo", "tool_kind": null, "command": null, "paths": [], "error_text": null, "prompt": "Write a function to calculate the factorial of a number", "model_id": null}
+    },
+    {
+      "name": "prompt is not a string",
+      "stdin": {"session_id": "abc123", "cwd": "/r", "hook_event_name": "UserPromptSubmit", "prompt": 7},
+      "error": "MalformedInput"
+    },
+    {
+      "name": "event name disagrees with the command line",
+      "stdin": {"session_id": "abc123", "cwd": "/r", "hook_event_name": "Stop", "prompt": "hi"},
+      "error": "MalformedInput"
+    }
+  ]
+}
