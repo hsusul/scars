@@ -8,7 +8,8 @@
 2. Drop calls whose tool use id an earlier batch already processed: resumed sessions copy history.
 3. Pair failures with their fixes (see `pairs`), continuing the failures left open by earlier batches.
 4. Build each pair's candidate (see `build`), in order of the fixing call's time. A new fingerprint
-   creates a candidate, which waits in the inbox for a human; an existing one gets an `observed` event.
+   creates a candidate, which waits in the inbox for a human; an existing one gets an `observed` event
+   the first time a session sights it, so `sessions_seen` counts sessions, not repeats within one.
    Each pair adds one observation. A pair's lesson write, precision run and observation commit in one
    transaction, and the observation, unique per failed tool use id, marks the pair processed, so a crash
    never counts a sighting twice.
@@ -287,17 +288,18 @@ def _write_pair(
     at = pair.passing.at
     existing = store.get_lesson_by_fingerprint(db, candidate.fingerprint)
     if existing is not None:
-        last = store.lesson_last_seen(db, existing.id) or at
-        revision = store.apply_event(
-            db,
-            lesson_id=existing.id,
-            event=EventType.OBSERVED,
-            expected_revision=existing.revision,
-            actor=policy.ACTOR,
-            payload={"fix_program": candidate.fix_program},
-            at=max(at, last),
-        )
-        lesson_id = existing.id
+        lesson_id, revision = existing.id, existing.revision
+        if not store.observed_in_session(db, lesson_id, pair.failed.harness, pair.failed.session_id):
+            last = store.lesson_last_seen(db, lesson_id) or at
+            revision = store.apply_event(
+                db,
+                lesson_id=lesson_id,
+                event=EventType.OBSERVED,
+                expected_revision=revision,
+                actor=policy.ACTOR,
+                payload={"fix_program": candidate.fix_program},
+                at=max(at, last),
+            )
         pre = next((t for t in existing.triggers if t.kind.value in ("command", "path")), None)
         checked = _precision(index, pre, candidate.signature)
     else:

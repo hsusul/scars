@@ -1138,6 +1138,15 @@ def has_observation(db: sqlite3.Connection, failed_tool_use_id: str) -> bool:
     return found.fetchone() is not None
 
 
+def observed_in_session(db: sqlite3.Connection, lesson_id: LessonId, harness: str, session_id: str) -> bool:
+    """Whether this lesson already has an observation from this session."""
+    found = db.execute(
+        "select 1 from observations where lesson_id = ? and harness = ? and session_id = ?",
+        (lesson_id, harness, session_id),
+    )
+    return found.fetchone() is not None
+
+
 def add_observation(db: sqlite3.Connection, obs: Observation) -> bool:
     """Insert one observation; False when one already exists for this failed call."""
     cur = db.execute(

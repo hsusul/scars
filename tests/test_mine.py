@@ -407,6 +407,25 @@ def test_second_sighting_observes_the_same_lesson_and_resets_expiry(env):
     assert store.verify(db) == []
 
 
+def test_seen_counts_distinct_sessions_not_observations(env):
+    write(
+        env,
+        "s1",
+        basic_pair(env["repo"])
+        .bash("t4", "pytest --frobnicate tests", FAIL_TEXT)
+        .bash("t5", "pytest tests")
+        .text(),
+    )
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.observations) == (2, 1, 2)
+    db = lessons_db(env)
+    assert db.execute("select sessions_seen from lessons").fetchall() == [(1,)]
+    write(env, "s2", basic_pair(env["repo"], start=T0 + 100, prefix="u").text())
+    mine_now(env)
+    assert db.execute("select sessions_seen from lessons").fetchall() == [(2,)]
+    assert store.verify(db) == []
+
+
 def test_precision_drops_a_broad_pre_trigger_but_keeps_the_error_trigger(env):
     t = Claude(env["repo"])
     for i in range(5):
