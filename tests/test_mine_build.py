@@ -6,7 +6,7 @@ from scars.mine.pairs import Pair, open_failure
 from scars.model import Harness, RepoId
 from scars.shell import SimpleCommand
 
-T0 = 1_800_000_000.0
+START = 1_800_000_000.0
 FAIL = "pytest: error: unrecognized arguments: --frobnicate"
 
 
@@ -21,7 +21,7 @@ def call(tool_use_id, command, status=CallStatus.OK, output=""):
         paths=(),
         status=status,
         output=output,
-        at=T0,
+        at=START,
         cwd="/tmp/app",
         model_id=None,
     )

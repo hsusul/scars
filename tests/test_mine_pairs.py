@@ -2,7 +2,7 @@ from scars.mine.calls import CallStatus, make_call
 from scars.mine.pairs import IDLE_SECONDS, pair_session
 from scars.model import Harness
 
-T0 = 1_800_000_000.0
+START = 1_800_000_000.0
 FAIL = "pytest: error: unrecognized arguments: --frobnicate"
 
 
@@ -38,38 +38,38 @@ def outcome(result):
 
 
 def test_a_failure_pairs_with_the_next_pass_of_the_same_program():
-    result = pair_session((), [failed("f", T0, command="pytest --x"), call("p", T0 + 1)], T0 + 2)
+    result = pair_session((), [failed("f", START, command="pytest --x"), call("p", START + 1)], START + 2)
     assert outcome(result) == ([("f", "p")], [], 1, 0, 0)
 
 
 def test_a_failed_edit_call_never_opens():
-    edit = failed("f", T0, tool="Edit")
-    result = pair_session((), [edit, call("r", T0 + 1, tool="Read")], T0 + 2)
+    edit = failed("f", START, tool="Edit")
+    result = pair_session((), [edit, call("r", START + 1, tool="Read")], START + 2)
     assert outcome(result) == ([], [], 1, 1, 0)
 
 
 def test_a_failed_shell_call_the_parser_rejects_never_opens():
     result = pair_session(
-        (), [failed("f", T0, command="pytest $("), call("p", T0 + 1, command="echo $(")], T0 + 2
+        (), [failed("f", START, command="pytest $("), call("p", START + 1, command="echo $(")], START + 2
     )
     assert outcome(result) == ([], [], 1, 1, 0)
 
 
 def test_a_failure_with_no_lessonable_signature_never_opens():
     timeout = call(
-        "f", T0, command="pytest --x", status=CallStatus.FAILED, output="Command timed out after 2m 0s"
+        "f", START, command="pytest --x", status=CallStatus.FAILED, output="Command timed out after 2m 0s"
     )
-    result = pair_session((), [timeout, call("p", T0 + 1)], T0 + 2)
+    result = pair_session((), [timeout, call("p", START + 1)], START + 2)
     assert outcome(result) == ([], [], 1, 1, 0)
 
 
 def test_a_failure_idle_for_a_day_is_dropped_by_the_next_call():
-    late = call("p", T0 + IDLE_SECONDS)
-    result = pair_session((), [failed("f", T0, command="pytest --x"), late], T0 + IDLE_SECONDS)
+    late = call("p", START + IDLE_SECONDS)
+    result = pair_session((), [failed("f", START, command="pytest --x"), late], START + IDLE_SECONDS)
     assert outcome(result) == ([], [], 1, 0, 1)
 
 
 def test_a_failure_one_second_short_of_a_day_still_pairs():
-    late = call("p", T0 + IDLE_SECONDS - 1)
-    result = pair_session((), [failed("f", T0, command="pytest --x"), late], T0 + IDLE_SECONDS - 1)
+    late = call("p", START + IDLE_SECONDS - 1)
+    result = pair_session((), [failed("f", START, command="pytest --x"), late], START + IDLE_SECONDS - 1)
     assert outcome(result) == ([("f", "p")], [], 1, 0, 0)
