@@ -143,15 +143,15 @@ def basic_pair(cwd: str, start: float = T0, prefix: str = "t") -> Claude:
     )
 
 
-def test_pair_in_own_repo_becomes_provisional_with_both_triggers(env):
+def test_pair_in_own_repo_is_an_own_code_candidate_with_both_triggers(env):
     write(env, "s1", basic_pair(env["repo"]).text())
     summary = mine_now(env)
     assert summary == Summary(
-        sessions_read=1, calls=3, failures=1, pairs=1, candidates_created=1, observations=1, provisionalized=1
+        sessions_read=1, calls=3, failures=1, pairs=1, candidates_created=1, observations=1
     )
     db = lessons_db(env)
-    (lesson,) = store.inbox_candidates(db) + store.active_for_hook(db, RepoId("own-app"), "x")
-    assert lesson.status is Status.PROVISIONAL
+    (lesson,) = store.inbox_candidates(db)
+    assert lesson.status is Status.CANDIDATE
     assert lesson.trust_class is TrustClass.OWN_CODE
     assert (lesson.text.avoid, lesson.text.instead, lesson.text.reason) == (
         "pytest --frobnicate",
@@ -167,7 +167,7 @@ def test_pair_in_own_repo_becomes_provisional_with_both_triggers(env):
     ]
     assert db.execute(
         "select revision, matched_failing, matched_passing, window_days from precision_runs"
-    ).fetchall() == [(2, 1, 0, 30)]
+    ).fetchall() == [(1, 1, 0, 30)]
     assert db.execute("select expires_at from lessons").fetchone()[0] == T0 + 31 + 14 * DAY
     assert store.verify(db) == []
 
@@ -183,7 +183,7 @@ def copy_fixture(source: Path, target: Path, repo: str) -> None:
 def test_static_fixture_pairs_like_the_builder(env):
     copy_fixture(FIXTURES / "claude" / "pair.jsonl", env["projects"] / "p" / "fixture.jsonl", env["repo"])
     summary = mine_now(env)
-    assert (summary.pairs, summary.candidates_created, summary.provisionalized) == (1, 1, 1)
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
 
 
 def test_edit_between_failure_and_fix_is_no_pair(env):
@@ -331,7 +331,7 @@ def test_pending_failure_is_dropped_after_a_day_idle(env):
 def test_upstream_repo_pair_stays_a_third_party_candidate(env):
     write(env, "s1", basic_pair(env["upstream"]).text())
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized) == (1, 0)
+    assert summary.candidates_created == 1
     (lesson,) = store.inbox_candidates(lessons_db(env))
     assert (lesson.status, lesson.trust_class, lesson.scope.kind) == (
         Status.CANDIDATE,
@@ -343,7 +343,7 @@ def test_upstream_repo_pair_stays_a_third_party_candidate(env):
 def test_pair_outside_registered_repos_is_a_session_candidate(env):
     write(env, "s1", basic_pair(env["loose"]).text())
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized) == (1, 0)
+    assert summary.candidates_created == 1
     (lesson,) = store.inbox_candidates(lessons_db(env))
     assert (lesson.status, lesson.scope.kind) == (Status.CANDIDATE, "session")
 
@@ -399,15 +399,10 @@ def test_second_sighting_observes_the_same_lesson_and_resets_expiry(env):
     write(env, "s1", basic_pair(env["repo"]).text())
     write(env, "s2", basic_pair(env["repo"], start=T0 + 5 * DAY, prefix="u").text())
     summary = mine_now(env, now=T0 + 6 * DAY)
-    assert (summary.pairs, summary.candidates_created, summary.observations, summary.provisionalized) == (
-        2,
-        1,
-        2,
-        1,
-    )
+    assert (summary.pairs, summary.candidates_created, summary.observations) == (2, 1, 2)
     db = lessons_db(env)
     assert db.execute("select status, sessions_seen, last_seen_at, fix_programs from lessons").fetchall() == [
-        ("provisional", 2, T0 + 5 * DAY + 31, '["pytest"]')
+        ("candidate", 2, T0 + 5 * DAY + 31, '["pytest"]')
     ]
     assert store.verify(db) == []
 
@@ -421,7 +416,7 @@ def test_precision_drops_a_broad_pre_trigger_but_keeps_the_error_trigger(env):
     summary = mine_now(env)
     assert (summary.candidates_created, summary.pre_triggers_dropped) == (1, 1)
     db = lessons_db(env)
-    (lesson,) = store.active_for_hook(db, RepoId("own-app"), "x")
+    (lesson,) = store.inbox_candidates(db)
     assert lesson.triggers == (Trigger(TriggerKind.ERROR, "fatal: invalid number of commits", Stage.REPAIR),)
     assert db.execute("select matched_failing, matched_passing from precision_runs").fetchall() == [(1, 5)]
 
@@ -445,10 +440,10 @@ def test_running_twice_changes_nothing(env):
     write(env, "s1", basic_pair(env["repo"]).text())
     write(env, "s2", Claude(env["repo"]).bash("p1", "pytest --frobnicate x", FAIL_TEXT).text())
     assert mine_now(env) == Summary(
-        sessions_read=2, calls=4, failures=2, pairs=1, candidates_created=1, observations=1, provisionalized=1
+        sessions_read=2, calls=4, failures=2, pairs=1, candidates_created=1, observations=1
     )
     before = dump(lessons_db(env))
-    assert [len(rows) for rows in before] == [1, 2, 2, 1, 2, 4, 1, 1, 4]
+    assert [len(rows) for rows in before] == [1, 2, 1, 1, 2, 4, 1, 1, 4]
     assert mine_now(env) == Summary()
     assert dump(lessons_db(env)) == before
 
@@ -547,7 +542,7 @@ def test_codex_static_fixture(env, tmp_path):
     for f in (FIXTURES / "codex").glob("rollout-*.jsonl"):
         copy_fixture(f, root / f.name, env["repo"])
     summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
-    assert (summary.pairs, summary.candidates_created, summary.provisionalized) == (1, 1, 1)
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
 
 
 def test_codex_reader_trusts_only_visible_exit_codes():
@@ -653,7 +648,7 @@ GATE = Trigger(TriggerKind.COMMAND, "pytest ** --frobnicate", Stage.GATE)
 
 def the_lesson(env):
     (lesson,) = store.inbox_candidates(lessons_db(env)) + store.active_for_hook(
-        lessons_db(env), RepoId("own-app"), "x"
+        lessons_db(env), RepoId("own-app")
     )
     return lesson
 
@@ -685,10 +680,27 @@ def failure_event(cwd: str, session: str = "later"):
 
 def test_mined_lesson_is_selected_at_repair_and_shown_by_the_hook(env, monkeypatch):
     from scars import hook, match, telemetry
-    from scars.model import HitOutcome, HookEvent, HookEventKind
+    from scars.model import EventType, HitOutcome, HookEvent, HookEventKind
 
     write(env, "s1", basic_pair(env["repo"]).text())
     mine_now(env)
+    monkeypatch.setenv("SCARS_HOME", str(env["home"]))
+    monkeypatch.setattr(hook, "git_common_dir", lambda cwd: "/git/app")
+    monkeypatch.setattr(hook, "repo_root", lambda cwd: env["repo"])
+    own_session = failure_event(env["repo"], session="s1")
+    unreviewed = hook.decide(own_session, "PostToolUseFailure", telemetry.EMPTY, now=T0 + 2 * DAY)
+    assert (unreviewed.outcome, unreviewed.shown) == (HitOutcome.NO_MATCH, [])
+    db = lessons_db(env)
+    (candidate,) = store.inbox_candidates(db)
+    store.apply_event(
+        db,
+        lesson_id=candidate.id,
+        event=EventType.PROMOTED,
+        expected_revision=candidate.revision,
+        actor="human",
+        payload={},
+        at=T0 + DAY,
+    )
     lesson = the_lesson(env)
     event = failure_event(env["repo"])
     context = match.MatchContext(env["repo"], RepoId("own-app"), SIG)
@@ -698,9 +710,6 @@ def test_mined_lesson_is_selected_at_repair_and_shown_by_the_hook(env, monkeypat
     pre_tool = HookEvent(**{**event.__dict__, "event": HookEventKind.PRE_TOOL, "error_text": None})
     assert match.matches(GATE, pre_tool) is True
     assert match.select([lesson], pre_tool, context).selected == ()
-    monkeypatch.setenv("SCARS_HOME", str(env["home"]))
-    monkeypatch.setattr(hook, "git_common_dir", lambda cwd: "/git/app")
-    monkeypatch.setattr(hook, "repo_root", lambda cwd: env["repo"])
     decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=T0 + 2 * DAY)
     assert decision.outcome is HitOutcome.SHOWN
     assert [s.lesson_id for s in decision.shown] == [lesson.id]
@@ -768,7 +777,7 @@ def boom_once(monkeypatch, name, when=lambda kwargs: True):
 @pytest.mark.parametrize(
     ("name", "when"),
     [
-        ("apply_event", lambda kw: str(kw.get("event")) == "provisionalized"),
+        ("create_lesson", lambda kw: True),
         ("record_precision", lambda kw: True),
         ("add_observation", lambda kw: True),
     ],
@@ -780,12 +789,11 @@ def test_a_crash_while_writing_a_new_lesson_leaves_nothing_behind(env, monkeypat
         mine_now(env)
     assert fired == [1]
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized, summary.observations) == (1, 1, 1)
+    assert (summary.candidates_created, summary.observations) == (1, 1)
     db = lessons_db(env)
-    assert db.execute("select status, sessions_seen from lessons").fetchall() == [("provisional", 1)]
+    assert db.execute("select status, sessions_seen from lessons").fetchall() == [("candidate", 1)]
     assert db.execute("select type from events order by seq").fetchall() == [
         ("proposed",),
-        ("provisionalized",),
     ]
     assert store.verify(db) == []
 
@@ -803,7 +811,6 @@ def test_a_crash_between_observed_and_the_observation_does_not_double_count(env,
     assert db.execute("select sessions_seen from lessons").fetchall() == [(2,)]
     assert db.execute("select type from events order by seq").fetchall() == [
         ("proposed",),
-        ("provisionalized",),
         ("observed",),
     ]
 
@@ -833,7 +840,7 @@ def test_codex_context_carries_over_to_the_next_batch(env, tmp_path):
     with path.open("a") as f:
         f.write(command_item(3, "e2", "pytest tests", 0))
     summary = mine_now(env, sources=[source])
-    assert (summary.pairs, summary.candidates_created, summary.provisionalized) == (1, 1, 1)
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
     db = lessons_db(env)
     assert db.execute("select cwd, model_id from mined_calls where tool_use_id = 'e2'").fetchall() == [
         (env["repo"], "gpt-test")
@@ -1039,7 +1046,7 @@ def test_a_candidate_over_the_repair_budget_is_dropped(env):
 def test_a_deleted_worktree_cwd_resolves_through_its_nearest_parent(env):
     write(env, "s1", basic_pair(env["repo"] + "/gone/deeper").text())
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized) == (1, 1)
+    assert summary.candidates_created == 1
     assert the_lesson(env).scope.kind == "repo"
 
 
@@ -1085,7 +1092,7 @@ def test_a_failure_and_its_fix_in_two_directories_of_one_repo_pair(env):
     t.bash("t2", "pytest tests")
     write(env, "s1", t.text())
     summary = mine_now(env)
-    assert (summary.pairs, summary.provisionalized) == (1, 1)
+    assert summary.pairs == 1
 
 
 MINED_WHY = "AVOID failed, INSTEAD passed"
@@ -1125,19 +1132,3 @@ def test_a_failure_whose_output_carries_a_scars_header_never_opens(env):
     t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", output).bash("t2", "pytest tests")
     write(env, "s1", t.text())
     assert mine_now(env) == Summary(sessions_read=1, calls=2, failures=1)
-
-
-def test_a_destructive_fix_waits_in_the_inbox_for_a_human(env):
-    t = (
-        Claude(env["repo"])
-        .bash("t1", "git push origin main", "error: failed to push some refs to origin")
-        .bash("t2", "git push --force origin main")
-    )
-    write(env, "s1", t.text())
-    summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized) == (1, 0)
-    lesson = the_lesson(env)
-    assert (lesson.status, lesson.text.instead) == (
-        Status.CANDIDATE,
-        "run `git push --force origin main` instead",
-    )

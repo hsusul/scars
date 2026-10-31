@@ -43,13 +43,13 @@ def test_mine_prints_the_summary(home, work):
     assert run(ctx, "mine") == (
         0,
         "read 1 transcripts: 2 calls, 1 failures, 1 pairs\n"
-        "lessons: 1 new, 1 observations, 0 provisional, 0 expired\n"
+        "lessons: 1 new, 1 observations, 0 expired\n"
         "1 lesson waiting: run scars inbox\n",
         "",
     )
     assert run(make_ctx(user, clock=time.time), "mine")[1] == (
         "read 0 transcripts: 0 calls, 0 failures, 0 pairs\n"
-        "lessons: 0 new, 0 observations, 0 provisional, 0 expired\n"
+        "lessons: 0 new, 0 observations, 0 expired\n"
         "1 lesson waiting: run scars inbox\n"
     )
 

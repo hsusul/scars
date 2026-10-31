@@ -397,7 +397,6 @@ def _decide_with(
         lessons = store.active_for_stage(
             db,
             repo_id,
-            event.session_id,
             stage=query.stage,
             pinned_only=query.pinned_only,
             trigger_kinds=query.trigger_kinds,

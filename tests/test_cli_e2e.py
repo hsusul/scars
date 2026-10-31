@@ -30,7 +30,7 @@ def test_init_mine_inbox_then_the_hook_shows_the_lesson(work, monkeypatch):
     assert (scars_home / "lessons.db").exists() and (scars_home / "telemetry.db").exists()
     assert "repo app: registered as app (own)\n" in out
     assert "read 1 transcripts: 2 calls, 1 failures, 1 pairs\n" in out
-    assert "lessons: 1 new, 1 observations, 1 provisional, 0 expired\n" in out
+    assert "lessons: 1 new, 1 observations, 0 expired\n" in out
     assert "would have fired 1 time in the last 30 days\n" in out
     for path in (
         scars_home / "plugins" / ".claude-plugin" / "marketplace.json",

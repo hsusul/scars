@@ -222,28 +222,28 @@ def test_get_lesson_returns_none_for_an_unknown_id(db):
     assert get_lesson(db, "L-00000000") is None
 
 
-def test_active_for_hook_returns_only_lessons_visible_to_this_repo_and_session(db):
+def test_active_for_hook_returns_only_promoted_lessons_visible_to_this_repo(db):
     repo_promoted = promoted(db, fingerprint="a")
     path_prov = new(db, fingerprint="b", scope=PathScope(OW, "*.py"))
     step(db, path_prov, EventType.PROVISIONALIZED)
     machine = new(db, fingerprint="c")
     step(db, machine, EventType.PROMOTED, {"scope": {"kind": "machine"}})
-    mine = new(db, fingerprint="d", scope=SessionScope(SessionId("s1")))
+    new(db, fingerprint="d", scope=SessionScope(SessionId("s1")))
     new(db, fingerprint="e", scope=SessionScope(SessionId("s2")))
     new(db, fingerprint="f")
     promoted(db, fingerprint="g", scope=RepoScope(RepoId("other")))
     retired = promoted(db, fingerprint="h")
     step(db, retired, EventType.RETIRED)
 
-    got = {lesson.id for lesson in active_for_hook(db, OW, SessionId("s1"))}
-    assert got == {repo_promoted, path_prov, machine, mine}
-    outside = {lesson.id for lesson in active_for_hook(db, None, SessionId("s9"))}
+    got = {lesson.id for lesson in active_for_hook(db, OW)}
+    assert got == {repo_promoted, machine}
+    outside = {lesson.id for lesson in active_for_hook(db, None)}
     assert outside == {machine}
 
 
 def test_active_for_hook_query_uses_the_active_index(db):
     plan = db.execute(
-        f"explain query plan select * from lessons where {ACTIVE_FOR_HOOK_WHERE}", ("ow", "s")
+        f"explain query plan select * from lessons where {ACTIVE_FOR_HOOK_WHERE}", ("ow",)
     ).fetchall()
     searches = [row[3] for row in plan if row[3].startswith(("SEARCH", "SCAN"))]
     assert searches and all("USING INDEX lessons_active" in s for s in searches)
@@ -391,7 +391,7 @@ def test_promoting_a_session_lesson_with_repo_scope_makes_it_visible_to_the_repo
     lesson_id = new(db, scope=SessionScope(SessionId("s1")))
     step(db, lesson_id, EventType.PROMOTED, {"scope": {"kind": "repo", "repo_id": "ow"}})
     assert scope_columns(db, lesson_id) == ("repo", "ow", None, None)
-    assert [lesson.id for lesson in active_for_hook(db, OW, SessionId("s2"))] == [lesson_id]
+    assert [lesson.id for lesson in active_for_hook(db, OW)] == [lesson_id]
     assert verify(db) == []
 
 
@@ -1101,7 +1101,6 @@ def commit_between_reads(monkeypatch, reader, write):
 
 
 LOADERS = {
-    "active_for_hook": lambda conn, lesson_id: active_for_hook(conn, OW, SessionId("s1")),
     "get_lesson": lambda conn, lesson_id: [get_lesson(conn, lesson_id)],
     "get_lesson_by_fingerprint": lambda conn, lesson_id: [get_lesson_by_fingerprint(conn, "fp1")],
     "inbox_candidates": lambda conn, lesson_id: inbox_candidates(conn),

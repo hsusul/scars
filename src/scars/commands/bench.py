@@ -35,7 +35,7 @@ PASSED = "npm install"
 
 
 def build_home(root: Path, lessons: int) -> tuple[Path, Path]:
-    """A scars home under `root` with `lessons` provisional repair lessons, and a registered git repo."""
+    """A scars home under `root` with `lessons` promoted repair lessons, and a registered git repo."""
     home, repo = root / "home", root / "repo"
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -69,9 +69,9 @@ def build_home(root: Path, lessons: int) -> tuple[Path, Path]:
             store.apply_event(
                 db,
                 lesson_id=lesson_id,
-                event=EventType.PROVISIONALIZED,
+                event=EventType.PROMOTED,
                 expected_revision=1,
-                actor="miner",
+                actor="human",
                 payload={},
             )
     db.close()

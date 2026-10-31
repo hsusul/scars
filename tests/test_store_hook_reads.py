@@ -74,14 +74,15 @@ def test_active_for_stage_keeps_only_lessons_that_can_fire_at_the_stage(db):
     prompt = Trigger(TriggerKind.PROMPT, "express", Stage.PLAN)
     gate = Trigger(TriggerKind.COMMAND, "npm test", Stage.GATE)
     pinned = [EventType.PROMOTED, EventType.PINNED]
-    repair = staged(db, "a", (error,), [EventType.PROVISIONALIZED])
-    other = staged(db, "b", (other_error,), [EventType.PROVISIONALIZED])
+    repair = staged(db, "a", (error,), [EventType.PROMOTED])
+    other = staged(db, "b", (other_error,), [EventType.PROMOTED])
+    staged(db, "f", (error,), [EventType.PROVISIONALIZED])
     both = staged(db, "c", (prompt, other_error), pinned)
     staged(db, "d", (prompt,), [EventType.PROMOTED])
     staged(db, "e", (gate,), pinned[:1])
 
     def ids(**query):
-        return [le.id for le in store.active_for_stage(db, REPO, "s1", **query)]
+        return [le.id for le in store.active_for_stage(db, REPO, **query)]
 
     kinds = {TriggerKind.ERROR}
     assert ids(stage=Stage.REPAIR, pinned_only=False, trigger_kinds=kinds, error_signature=error.spec) == [
@@ -92,14 +93,12 @@ def test_active_for_stage_keeps_only_lessons_that_can_fire_at_the_stage(db):
     )
     plan_kinds = {TriggerKind.PROMPT, TriggerKind.PATH}
     assert ids(stage=Stage.PLAN, pinned_only=True, trigger_kinds=plan_kinds) == [both]
-    found = store.active_for_stage(db, REPO, "s1", stage=Stage.PLAN, pinned_only=True, trigger_kinds=None)
+    found = store.active_for_stage(db, REPO, stage=Stage.PLAN, pinned_only=True, trigger_kinds=None)
     assert [(le.id, set(le.triggers)) for le in found] == [(both, {prompt, other_error})]
     assert ids(stage=Stage.PLAN, pinned_only=True, trigger_kinds=plan_kinds) == ids(
         stage=Stage.PLAN, pinned_only=True, trigger_kinds=plan_kinds, error_signature="unused"
     )
-    assert (
-        store.active_for_stage(db, None, "s1", stage=Stage.PLAN, pinned_only=True, trigger_kinds=None) == []
-    )
+    assert store.active_for_stage(db, None, stage=Stage.PLAN, pinned_only=True, trigger_kinds=None) == []
 
 
 def test_candidate_count_counts_only_candidates(db):

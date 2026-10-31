@@ -7,8 +7,6 @@ from scars.model import (
     LessonText,
     RepoId,
     RepoScope,
-    SessionId,
-    SessionScope,
     Stage,
     Trigger,
     TriggerKind,
@@ -17,56 +15,6 @@ from scars.model import (
 
 T0 = 1_800_000_000.0
 DAY = 86400.0
-
-
-@pytest.mark.parametrize(
-    ("scope", "trust", "expected"),
-    [
-        (RepoScope(RepoId("r")), TrustClass.OWN_CODE, True),
-        (RepoScope(RepoId("r")), TrustClass.THIRD_PARTY_REPO, False),
-        (RepoScope(RepoId("r")), TrustClass.WEB, False),
-        (SessionScope(SessionId("s")), TrustClass.OWN_CODE, False),
-    ],
-)
-def test_only_own_code_repo_candidates_become_provisional(scope, trust, expected):
-    assert policy.provisional_on_first_sighting(scope, trust, "pytest tests") is expected
-
-
-@pytest.mark.parametrize(
-    "fix",
-    [
-        "rm -rf build",
-        "/bin/rm build",
-        "env rm build",
-        "git reset --hard HEAD~1",
-        "git clean -fdx",
-        "git checkout -f main",
-        "git checkout --force main",
-        "git push --force origin main",
-        "git push -fu origin main",
-        "git push --force-with-lease",
-        "git push origin +main",
-        "find . -name '*.pyc' -delete",
-        "dd if=/dev/zero of=disk.img",
-        "mkfs.ext4 disk.img",
-        "truncate -s 0 app.log",
-        "chmod -R 777 .",
-        "chown --recursive me .",
-        "sudo make install",
-        "pytest tests && rm -rf build",
-        "pytest tests &&",
-    ],
-)
-def test_a_destructive_or_unparseable_fix_waits_for_a_human(fix):
-    assert policy.provisional_on_first_sighting(RepoScope(RepoId("r")), TrustClass.OWN_CODE, fix) is False
-
-
-@pytest.mark.parametrize(
-    "fix",
-    ["git push origin main", "git checkout main", "git reset HEAD a.py", "chmod +x run.sh", "find . -name x"],
-)
-def test_an_ordinary_fix_is_shared_on_first_sighting(fix):
-    assert policy.provisional_on_first_sighting(RepoScope(RepoId("r")), TrustClass.OWN_CODE, fix) is True
 
 
 @pytest.mark.parametrize(

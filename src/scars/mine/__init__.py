@@ -8,10 +8,10 @@
 2. Drop calls whose tool use id an earlier batch already processed: resumed sessions copy history.
 3. Pair failures with their fixes (see `pairs`), continuing the failures left open by earlier batches.
 4. Build each pair's candidate (see `build`), in order of the fixing call's time. A new fingerprint
-   creates a candidate, which an `own_code` repo-scope candidate leaves at once as provisional; an
-   existing one gets an `observed` event. Each pair adds one observation. A pair's lesson write,
-   provisionalization, precision run and observation commit in one transaction, and the observation,
-   unique per failed tool use id, marks the pair processed, so a crash never counts a sighting twice.
+   creates a candidate, which waits in the inbox for a human; an existing one gets an `observed` event.
+   Each pair adds one observation. A pair's lesson write, precision run and observation commit in one
+   transaction, and the observation, unique per failed tool use id, marks the pair processed, so a crash
+   never counts a sighting twice.
 5. Commit offsets, processed ids, the open failures and the new mined calls in one transaction.
 6. Expire lessons not sighted for 14 days, then write delayed hit outcomes.
 
@@ -66,7 +66,6 @@ class Summary:
     pairs: int = 0
     candidates_created: int = 0
     observations: int = 0
-    provisionalized: int = 0
     pre_triggers_dropped: int = 0
     expired: int = 0
     outcomes_written: int = 0
@@ -320,19 +319,6 @@ def _write_pair(
         )
         counts["candidates_created"] += 1
         revision = 1
-        if policy.provisional_on_first_sighting(
-            candidate.scope, candidate.trust_class, candidate.passing_input
-        ):
-            revision = store.apply_event(
-                db,
-                lesson_id=lesson_id,
-                event=EventType.PROVISIONALIZED,
-                expected_revision=revision,
-                actor=policy.ACTOR,
-                payload={},
-                at=at,
-            )
-            counts["provisionalized"] += 1
     if checked is not None:
         store.record_precision(
             db,
@@ -463,7 +449,6 @@ def _run(
         pairs=len(found),
         candidates_created=counts["candidates_created"],
         observations=counts["observations"],
-        provisionalized=counts["provisionalized"],
         pre_triggers_dropped=counts["pre_triggers_dropped"],
         expired=expired,
         outcomes_written=result.outcomes,

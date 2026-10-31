@@ -66,9 +66,7 @@ def seed_store(home: Path, repo: Path) -> sqlite3.Connection:
     return db
 
 
-def add_lesson(
-    db, *, fingerprint, triggers, avoid="npm test", fix=FIX, reason=SIGNATURE, status="provisional"
-):
+def add_lesson(db, *, fingerprint, triggers, avoid="npm test", fix=FIX, reason=SIGNATURE, status="promoted"):
     lesson_id = store.create_lesson(
         db,
         text=LessonText(avoid, f"run `{fix}`", MINED_WHY),
@@ -87,7 +85,6 @@ def add_lesson(
     )
     revision = 1
     steps = {
-        "provisional": [EventType.PROVISIONALIZED],
         "promoted": [EventType.PROMOTED],
         "pinned": [EventType.PROMOTED, EventType.PINNED],
     }[status]
@@ -107,7 +104,7 @@ def add_lesson(
 REPAIR = (Trigger(TriggerKind.ERROR, SIGNATURE, Stage.REPAIR),)
 
 
-def lesson_text(lesson_id, reviewed="unreviewed", avoid="npm test", fix=FIX, reason=MINED_WHY):
+def lesson_text(lesson_id, reviewed="reviewed 2027-01-15", avoid="npm test", fix=FIX, reason=MINED_WHY):
     return (
         f"[scars {lesson_id} note | repo r-demo | seen 1x | {reviewed}]\n"
         f"AVOID: {avoid}\n"
@@ -264,7 +261,7 @@ def test_claude_repair_shows_the_lesson_records_it_and_dedupes_until_compaction(
             "tool_failed",
             "repair",
             lesson_id,
-            "provisional",
+            "promoted",
             key,
             "shown",
             len(text),
@@ -810,7 +807,7 @@ def test_every_hits_column_is_written_for_a_shown_and_a_no_match_hit(env):
             "repair",
             lesson_id,
             2,
-            "provisional",
+            "promoted",
             f"error:repair:{SIGNATURE}",
             "shown",
             len(text),
