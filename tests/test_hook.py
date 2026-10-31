@@ -27,7 +27,8 @@ from scars.model import (
 
 ERROR = "Exit code 1\nError: Cannot find module 'express'"
 SIGNATURE = "Error: Cannot find module 'express'"
-FIX = "npm install && npm test"
+FIX = "npm install"
+MINED_WHY = "failed, then the INSTEAD command passed"
 REPO = RepoId("r-demo")
 T0 = 1_800_000_000.0
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -70,7 +71,7 @@ def add_lesson(
 ):
     lesson_id = store.create_lesson(
         db,
-        text=LessonText(avoid, f"run `{fix}`", reason),
+        text=LessonText(avoid, f"run `{fix}`", MINED_WHY),
         scope=RepoScope(REPO),
         trust_class=TrustClass.OWN_CODE,
         triggers=triggers,
@@ -106,7 +107,7 @@ def add_lesson(
 REPAIR = (Trigger(TriggerKind.ERROR, SIGNATURE, Stage.REPAIR),)
 
 
-def lesson_text(lesson_id, reviewed="unreviewed", avoid="npm test", fix=FIX, reason=SIGNATURE):
+def lesson_text(lesson_id, reviewed="unreviewed", avoid="npm test", fix=FIX, reason=MINED_WHY):
     return (
         f"[scars {lesson_id} note | repo r-demo | seen in 1 session | {reviewed}]\n"
         f"AVOID: {avoid}\n"

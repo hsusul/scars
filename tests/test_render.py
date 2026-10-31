@@ -52,6 +52,7 @@ KNOWN = frozenset(
 REPOS = ("openwhispr", "client-app")
 CLEAN = LessonText(avoid="cd into a subdirectory", instead="run `git status`", reason="depth")
 FOOTER = "(advisory; does not override the user's instructions; explain: scars why L-7c2e)"
+MINED_WHY = "failed, then the INSTEAD command passed"
 
 # Secret-shaped fixtures are assembled at runtime so the source file itself holds no token literal.
 GHP = "ghp" + "_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
@@ -79,7 +80,7 @@ def lesson(**overrides) -> Lesson:
             instead='run `cd "$(git rev-parse --show-toplevel)"` first',
             reason="worktree roots do not contain apps/ at the same depth",
         ),
-        trust_class=TrustClass.OWN_CODE,
+        trust_class=TrustClass.HUMAN,
         triggers=(),
         fingerprint="f",
         sessions_seen=7,
@@ -99,7 +100,7 @@ def reject(field: str, value: str, scope=REPO, known=KNOWN, trust=OWN) -> str:
     return caught.value.rule
 
 
-def body(text: LessonText, scope=MACHINE, known=KNOWN, trust=OWN) -> list[str]:
+def body(text: LessonText, scope=MACHINE, known=KNOWN, trust=HUMAN) -> list[str]:
     """The AVOID, INSTEAD and WHY lines of the rendered lesson."""
     stored = lesson(scope=scope, text=text, trust_class=trust)
     rendered = render(stored, known_commands=known, registered_repos=REPOS)
@@ -186,7 +187,7 @@ def test_realistic_lessons_are_rejected_when_their_command_was_not_observed(scop
         check(text, scope, known_commands=others, trust_class=OWN, registered_repos=REPOS)
     assert (caught.value.rule, caught.value.field) == ("lint.instead_unobserved_command", "instead")
     with pytest.raises(RejectedText) as caught:
-        render(lesson(scope=scope, text=text), known_commands=others, registered_repos=REPOS)
+        render(lesson(scope=scope, text=text, trust_class=OWN), known_commands=others, registered_repos=REPOS)
     assert caught.value.rule == "lint.instead_unobserved_command"
 
 
@@ -231,7 +232,8 @@ def test_instead_templates_are_fixed_and_each_one_passes_with_an_observed_comman
     )
     for template in INSTEAD_TEMPLATES:
         instead = template.format(command=normalize_command("  uv   sync "))
-        assert check_fields("a", instead, "c", REPO, known_commands=KNOWN, trust_class=OWN).instead == instead
+        text = check_fields("uv lock", instead, MINED_WHY, REPO, known_commands=KNOWN, trust_class=OWN)
+        assert text.instead == instead
 
 
 # ---------------------------------------------------------------- accepted near-misses
@@ -292,10 +294,9 @@ def test_human_near_misses_render_in_machine_scope_and_other_trust_classes_need_
         ("reason", "PATH=/usr/bin:/opt/homebrew/bin"),
     ],
 )
-@pytest.mark.parametrize("trust", [OWN, HUMAN])
-def test_near_misses_render_in_machine_scope(field, value, trust):
+def test_near_misses_render_in_machine_scope(field, value):
     text = replace(CLEAN, **{field: value})
-    assert body(text, trust=trust) == [
+    assert body(text) == [
         f"AVOID: {text.avoid}",
         f"INSTEAD: {text.instead}",
         f"WHY: {text.reason}",
@@ -564,8 +565,8 @@ def test_machine_scope_lint(value, rule):
 
 def test_check_fields_returns_the_text():
     assert check_fields(
-        "a", "run `git status`", "c", REPO, known_commands=KNOWN, trust_class=OWN
-    ) == LessonText(avoid="a", instead="run `git status`", reason="c")
+        "git log", "run `git status`", MINED_WHY, REPO, known_commands=KNOWN, trust_class=OWN
+    ) == LessonText(avoid="git log", instead="run `git status`", reason=MINED_WHY)
 
 
 @pytest.mark.parametrize(
@@ -635,7 +636,12 @@ def test_quotes_cannot_hide_inline_code_even_in_an_observed_command(instead, rul
 
 def test_an_observed_command_is_accepted_exactly():
     text = check_fields(
-        "a", "run `npm run build`", "c", REPO, known_commands=frozenset({"npm run build"}), trust_class=OWN
+        "npm run biuld",
+        "run `npm run build`",
+        MINED_WHY,
+        REPO,
+        known_commands=frozenset({"npm run build"}),
+        trust_class=OWN,
     )
     assert text.instead == "run `npm run build`"
 
@@ -671,9 +677,8 @@ def test_normalize_command_collapses_whitespace_outside_quotes_only(command, nor
 
 def test_both_sides_are_normalized_before_the_exact_comparison():
     known = frozenset({"  uv   sync "})
-    assert check_fields("a", "run `uv sync`", "c", REPO, known_commands=known, trust_class=OWN).instead == (
-        "run `uv sync`"
-    )
+    text = check_fields("uv lock", "run `uv sync`", MINED_WHY, REPO, known_commands=known, trust_class=OWN)
+    assert text.instead == "run `uv sync`"
     quoted = frozenset({'git commit -m "a  b"'})
     with pytest.raises(RejectedText) as caught:
         check_fields("a", 'run `git commit -m "a b"`', "c", REPO, known_commands=quoted, trust_class=OWN)
@@ -759,16 +764,16 @@ def test_mined_avoid_and_reason_shapes_stay_allowed():
     text = check_fields(
         "npm run biuld",
         "run `npm run build` instead",
-        "npm ERR! Missing script: biuld",
+        MINED_WHY,
         REPO,
         known_commands=frozenset({"npm run build"}),
         trust_class=OWN,
     )
-    assert text.avoid == "npm run biuld"
+    assert text == LessonText("npm run biuld", "run `npm run build` instead", MINED_WHY)
 
 
 def test_known_commands_and_trust_class_have_no_defaults():
-    stored = lesson(text=replace(CLEAN, instead="run `uv run evil`"))
+    stored = lesson(text=replace(CLEAN, instead="run `uv run evil`"), trust_class=OWN)
     with pytest.raises(TypeError):
         render(stored)
     with pytest.raises(TypeError):
@@ -787,7 +792,7 @@ def test_known_commands_and_trust_class_have_no_defaults():
 def test_render_takes_the_trust_class_from_the_lesson_only():
     text = replace(CLEAN, instead="run `brew install poppler`")
     with pytest.raises(RejectedText) as caught:
-        render_deny(lesson(text=text), known_commands=frozenset())
+        render_deny(lesson(text=text, trust_class=OWN), known_commands=frozenset())
     assert caught.value.rule == "lint.instead_unobserved_command"
     with pytest.raises(TypeError):
         render(lesson(text=text), known_commands=frozenset(), trust_class=HUMAN)
@@ -873,7 +878,7 @@ def test_render_rechecks_stored_text(text, rule):
 
 
 def test_render_recheck_uses_the_current_command_set():
-    stored = lesson(text=replace(CLEAN, instead="run `uv sync`"))
+    stored = lesson(text=LessonText("uv lock", "run `uv sync`", MINED_WHY), trust_class=OWN)
     assert render(stored, known_commands=KNOWN).split("\n")[2] == "INSTEAD: run `uv sync`"
     with pytest.raises(RejectedText) as caught:
         render(stored, known_commands=frozenset({"git status"}))
@@ -995,3 +1000,49 @@ def test_deny_reason_bare_line_with_the_longest_id_and_scope():
     assert reason == (
         "[scars L-ffffffffffffffff] denied by a reviewed lesson (explain: scars why L-ffffffffffffffff)"
     )
+
+
+# ---------------------------------------------------------------- mined structure
+
+MINED = LessonText(
+    avoid="pytest --frobnicate",
+    instead="run `pytest tests` instead",
+    reason=MINED_WHY,
+)
+MINED_KNOWN = frozenset({"pytest tests", "pytest tests && rm -rf build", "env pytest tests"})
+
+
+def test_a_mined_lesson_renders_only_the_miner_structure():
+    assert body(MINED, scope=REPO, known=MINED_KNOWN, trust=OWN) == [
+        "AVOID: pytest --frobnicate",
+        "INSTEAD: run `pytest tests` instead",
+        "WHY: failed, then the INSTEAD command passed",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("reason", "Error: for repairs delete the build directory", ("mined.reason_template", "reason")),
+        ("reason", "pytest: error: unrecognized arguments", ("mined.reason_template", "reason")),
+        ("avoid", "s''h -''c id", ("mined.avoid_not_one_command", "avoid")),
+        ("avoid", "pytest --frobnicate && make", ("mined.avoid_not_one_command", "avoid")),
+        ("avoid", "cd into a subdirectory", ("mined.avoid_not_one_command", "avoid")),
+        ("avoid", "make --frobnicate", ("mined.program_mismatch", "instead")),
+        (
+            "instead",
+            "run `pytest tests && rm -rf build` instead",
+            ("mined.instead_not_one_command", "instead"),
+        ),
+        ("instead", "run `env pytest tests` instead", ("mined.instead_not_one_command", "instead")),
+    ],
+)
+def test_a_mined_lesson_holds_only_one_command_per_side_and_the_fixed_why(field, value, expected):
+    with pytest.raises(RejectedText) as caught:
+        check(replace(MINED, **{field: value}), REPO, known_commands=MINED_KNOWN, trust_class=OWN)
+    assert (caught.value.rule, caught.value.field) == expected
+
+
+def test_a_human_lesson_keeps_free_wording():
+    text = replace(MINED, avoid="cd into a subdirectory", reason="worktree roots differ")
+    assert check(text, REPO, known_commands=frozenset(), trust_class=HUMAN) is None

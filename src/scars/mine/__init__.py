@@ -320,7 +320,9 @@ def _write_pair(
         )
         counts["candidates_created"] += 1
         revision = 1
-        if policy.provisional_on_first_sighting(candidate.scope, candidate.trust_class):
+        if policy.provisional_on_first_sighting(
+            candidate.scope, candidate.trust_class, candidate.passing_input
+        ):
             revision = store.apply_event(
                 db,
                 lesson_id=lesson_id,

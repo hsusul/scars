@@ -22,6 +22,11 @@ roots only) rather than a list of bad phrases.
 4. Machine-scope lint: machine lessons reach every repo, so they may not name a repo, a GitHub
    `owner/name`, a `..` path segment, or an absolute path outside `ALLOWED_ROOTS`, including a path
    attached to an option (`-I/x`, `--prefix=/x`, `key=/x`).
+5. Mined structure: a lesson whose trust class is not `human` holds only what the miner builds from
+   parsed calls, never transcript prose. `avoid` is one plain command and the command in `instead` is
+   another with the same program, each written as `shlex.join` of its words (see `plain_command`), and
+   `reason` is exactly `MINED_REASON`. The agent already sees its own error at the repair stage, so the
+   error text adds nothing a lesson needs and is the one field an attacker fully controls.
 
 Rejection messages name the field and the rule, never the matched text, so a secret or a private repo
 name cannot leak through an error message or a log line.
@@ -48,7 +53,8 @@ from scars.model import (
     Status,
     TrustClass,
 )
-from scars.shell import Unsupported, parse
+from scars.shell import SimpleCommand, Unsupported, parse
+from scars.signature import HEADER_PREFIX
 
 FIELDS = ("avoid", "instead", "reason")
 
@@ -540,6 +546,54 @@ def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[s
             raise RejectedText("machine.github_repo", field)
 
 
+# ---------------------------------------------------------------- mined structure
+
+MINED_REASON = "failed, then the INSTEAD command passed"
+
+
+def plain_command(command: str) -> SimpleCommand | None:
+    """The one simple command `command` is, when its shell words are exactly its program and arguments.
+
+    None for a command the parser rejects, for several commands, and for any word the parser consumes
+    or the shell expands at run time: a wrapper, an assignment, a redirection, a comment, `$NAME`, a
+    glob or `~`. What is left can be rewritten as `shlex.join` of its words without changing what runs.
+    """
+    try:
+        parsed = parse(command)
+        words = shlex.split(command)
+    except (Unsupported, ValueError):
+        return None
+    if len(parsed) != 1:
+        return None
+    (simple,) = parsed
+    if simple.uncertain or words != [simple.program, *simple.args]:
+        return None
+    return simple
+
+
+def plain_text(simple: SimpleCommand) -> str:
+    return shlex.join((simple.program, *simple.args))
+
+
+def _canonical(text: str) -> SimpleCommand | None:
+    simple = plain_command(text)
+    return simple if simple is not None and plain_text(simple) == text else None
+
+
+def _check_mined(values: Mapping[str, str]) -> None:
+    """Stage 5. `instead` already matched one of `INSTEAD_TEMPLATES`, so it holds exactly one code span."""
+    avoid = _canonical(values["avoid"])
+    if avoid is None:
+        raise RejectedText("mined.avoid_not_one_command", "avoid")
+    fix = _canonical(values["instead"].split("`")[1])
+    if fix is None:
+        raise RejectedText("mined.instead_not_one_command", "instead")
+    if fix.program != avoid.program:
+        raise RejectedText("mined.program_mismatch", "instead")
+    if values["reason"] != MINED_REASON:
+        raise RejectedText("mined.reason_template", "reason")
+
+
 # ---------------------------------------------------------------- check
 
 
@@ -563,6 +617,8 @@ def _check_values(
     _run(SECRET_RULES, values)
     if isinstance(scope, MachineScope):
         _check_machine_scope(values, registered_repos)
+    if trust_class is not TrustClass.HUMAN:
+        _check_mined(values)
 
 
 def check(
@@ -645,7 +701,7 @@ def _header(lesson: Lesson, reviewed_on: date | None) -> str:
     )
     sessions = "1 session" if lesson.sessions_seen == 1 else f"{lesson.sessions_seen} sessions"
     label = scope_label(lesson.scope)
-    return f"[scars {lesson.id} {lesson.level} | {label} | seen in {sessions} | {reviewed}]"
+    return f"{HEADER_PREFIX}{lesson.id} {lesson.level} | {label} | seen in {sessions} | {reviewed}]"
 
 
 def _recheck(lesson: Lesson, known_commands: frozenset[str], registered_repos: Sequence[str]) -> None:
