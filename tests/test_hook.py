@@ -87,6 +87,7 @@ def add_lesson(db, *, fingerprint, triggers, avoid="npm test", fix=FIX, reason=S
     steps = {
         "promoted": [EventType.PROMOTED],
         "pinned": [EventType.PROMOTED, EventType.PINNED],
+        "candidate": [],
     }[status]
     for step in steps:
         revision = store.apply_event(
@@ -326,13 +327,15 @@ def test_session_start_injects_pinned_lessons_and_tells_the_human_about_waiting_
     db = seed_store(home, repo)
     pinned = add_lesson(db, fingerprint="fp1", triggers=REPAIR, status="pinned")
     add_lesson(db, fingerprint="fp2", triggers=REPAIR, status="promoted")
+    add_lesson(db, fingerprint="fp3", triggers=REPAIR, status="candidate", avoid="npm tset")
+    # Text mined before a rule change: the inbox cannot show it, so the notice does not count it.
     store.create_lesson(
         db,
         text=LessonText("make", "run `make all`", "make: no rule"),
         scope=RepoScope(REPO),
         trust_class=TrustClass.OWN_CODE,
         triggers=REPAIR,
-        fingerprint="fp3",
+        fingerprint="fp4",
         actor="miner",
     )
     text = lesson_text(pinned, reviewed="reviewed 2027-01-15")

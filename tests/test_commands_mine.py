@@ -36,6 +36,12 @@ def write_transcript(user, repo, name, mtime=None):
     return path
 
 
+HIDDEN_LOOSE = (
+    "hidden: 1 from a directory that is not a registered repo "
+    "(scars init offers to register the repos your sessions used)\n"
+)
+
+
 def test_mine_prints_the_summary(home, work):
     user = work / "user"
     (work / "loose").mkdir(exist_ok=True)
@@ -45,13 +51,13 @@ def test_mine_prints_the_summary(home, work):
         0,
         "read 1 transcripts: 2 calls, 1 failures, 1 pairs\n"
         "lessons: 1 new, 1 observations, 0 expired\n"
-        "1 lesson waiting: run scars inbox\n",
+        f"{HIDDEN_LOOSE}",
         "",
     )
     assert run(make_ctx(user, clock=time.time), "mine")[1] == (
         "read 0 transcripts: 0 calls, 0 failures, 0 pairs\n"
         "lessons: 0 new, 0 observations, 0 expired\n"
-        "1 lesson waiting: run scars inbox\n"
+        f"{HIDDEN_LOOSE}"
     )
 
 

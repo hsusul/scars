@@ -101,14 +101,6 @@ def test_active_for_stage_keeps_only_lessons_that_can_fire_at_the_stage(db):
     assert store.active_for_stage(db, None, stage=Stage.PLAN, pinned_only=True, trigger_kinds=None) == []
 
 
-def test_candidate_count_counts_only_candidates(db):
-    first, _ = new(db, "a"), new(db, "b")
-    store.apply_event(
-        db, lesson_id=first, event=EventType.PROMOTED, expected_revision=1, actor="human", payload={}
-    )
-    assert store.candidate_count(db) == 1
-
-
 def test_repo_for_common_dir_takes_the_first_registered_clone(db):
     db.execute("insert into clones values ('/w/demo/.git', 'r-demo', 1.0)")
     assert store.repo_for_common_dir(db, ["/nowhere/.git", "/w/demo/.git"]) == REPO

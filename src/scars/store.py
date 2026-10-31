@@ -922,11 +922,6 @@ def inbox_candidates(db: sqlite3.Connection) -> list[Lesson]:
     return _load(db, "status = 'candidate'", ())
 
 
-def candidate_count(db: sqlite3.Connection) -> int:
-    """How many candidates wait in the inbox, for the session-start notice."""
-    return db.execute("select count(*) from lessons where status = 'candidate'").fetchone()[0]
-
-
 def repo_for_common_dir(db: sqlite3.Connection, common_dirs: Iterable[str]) -> RepoId | None:
     """The registered repo of the first of these git common dirs that is a registered clone, or None."""
     for common_dir in common_dirs:
