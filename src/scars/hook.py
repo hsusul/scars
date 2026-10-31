@@ -24,7 +24,9 @@ One run, in order:
    are rendered with their own observed passing commands and fitted to the stage budget.
 6. The output is printed and flushed.
 7. One telemetry transaction writes a hit row per shown lesson (or one `no_match` or `blocked` row), the
-   new shown rows, a freshly resolved cache row and, on compaction, the new epoch. If the file is busy,
+   new shown rows, a freshly resolved cache row and, on compaction, the new epoch, which moves even when
+   lessons.db is unavailable. An event the adapter ignores gets one `ignored` row and reads no lessons.
+   If the file is busy,
    all of it is dropped.
 
 Any exception prints nothing, records an `error` hit when telemetry is available, and exits 0. The
@@ -40,7 +42,7 @@ import sys
 import time
 from dataclasses import dataclass, field, replace
 from types import ModuleType
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from scars import paths, telemetry
 from scars.adapters import Ignored, MalformedInput, claude, codex, context_output, deny_output, full_command
@@ -55,6 +57,11 @@ from scars.model import (
     ToolKind,
     TriggerKind,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from scars import shell
 
 MATCH_DEADLINE_MS = 50
 MATCH_CLOCK = time.monotonic
@@ -118,12 +125,14 @@ EDIT_REASON = (
     "commands a human runs at a terminal."
 )
 READ_ONLY_PROGRAMS = frozenset(
-    {"cat", "ls", "head", "tail", "less", "grep", "rg", "stat", "wc", "file", "find"}
+    {"cat", "ls", "head", "tail", "less", "grep", "rg", "stat", "wc", "file", "find", "echo", "printf"}
 )
 FIND_ACTIONS_THAT_WRITE = frozenset(
     {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
 )
+SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
 _QUOTING = re.compile(r"[\"'\\]")
+_KNOWN_VARIABLE = re.compile(r"\$(HOME|SCARS_HOME)(?![A-Za-z0-9_])")
 _invocation: re.Pattern[str] | None = None
 
 
@@ -136,11 +145,11 @@ def _invocation_pattern() -> re.Pattern[str]:
     return _invocation
 
 
-def _home_pattern(home: str) -> re.Pattern[str]:
-    roots = {home, os.path.realpath(home)}
-    spelled = [r"(?:~|\$HOME|\$\{HOME\})/\.scars", r"\$SCARS_HOME(?!\w)", r"\$\{SCARS_HOME\}"]
-    spelled += [re.escape(r.rstrip("/")) for r in sorted(roots) if r.rstrip("/")]
-    return re.compile(rf"(?:{'|'.join(spelled)})(?![\w.-])", re.IGNORECASE)
+def _home_mention(home: str) -> re.Pattern[str]:
+    """The scars home spelled in raw text: its directory name (`.scars` always) or `$SCARS_HOME`."""
+    names = {os.path.basename(h.rstrip("/")) for h in (home, os.path.realpath(home))} | {".scars"}
+    spelled = [r"\$SCARS_HOME(?!\w)", r"\$\{SCARS_HOME\}", *(re.escape(n) for n in sorted(names) if n)]
+    return re.compile(rf"(?<![\w.${{-])(?:{'|'.join(spelled)})(?![\w.-])", re.IGNORECASE)
 
 
 def agent_deny_reason(
@@ -148,34 +157,15 @@ def agent_deny_reason(
 ) -> str | None:
     """Why this PreToolUse call is denied, or None to stay silent.
 
-    `command` is the full shell command before the 4 KB cut; it defaults to `event.command`. A shell call
-    is denied when either holds:
-
-    - The text runs a protected scars command: the word `scars` (bare, after a path such as
-      `/usr/local/bin/scars`, or after `python -m` or `uv run`) followed by whitespace and `inbox` or a
-      privileged command. One fixed regex scans the raw text, so a call inside a nested quoted script
-      counts, and scans it again with quotes and backslashes removed, so `'sc''ars' off` counts too. The
-      same scan also denies quoted text that merely reads like such a call, such as a commit message.
-    - The text names the scars home (`~/.scars`, `$HOME/.scars`, `${HOME}/.scars`, `$SCARS_HOME`,
-      `${SCARS_HOME}`, or the absolute home path) and the command is not provably read-only.
-
-    Everything else fails open: a command the shell parser cannot model gets no deny just for mentioning
-    the word scars. Edit tools are denied for any path under the scars home.
+    `command` is the full shell command before the 4 KB cut; it defaults to `event.command`. Shell calls
+    follow `shell_deny_reason`. Edit tools are denied for any path under the scars home.
     """
     if event.event is not HookEventKind.PRE_TOOL:
         return None
     home = os.fspath(home)
     if event.tool_kind is ToolKind.SHELL:
         text = command if command is not None else event.command
-        if text is None:
-            return None
-        unquoted = _QUOTING.sub("", text)
-        for candidate in (text, unquoted):
-            if found := _invocation_pattern().search(candidate):
-                return RUN_REASON.format(found.group(1).lower())
-        names_home = _home_pattern(home)
-        if any(names_home.search(c) for c in (text, unquoted)) and not provably_read_only(text):
-            return SHELL_HOME_REASON
+        return None if text is None else shell_deny_reason(text, event.cwd, home)
     if event.tool_kind is ToolKind.EDIT:
         for path in event.paths:
             if _under(path, event.cwd, home):
@@ -183,52 +173,208 @@ def agent_deny_reason(
     return None
 
 
-def provably_read_only(command: str) -> bool:
-    """True only when the command parses and every program it runs just reads files.
+def shell_deny_reason(text: str, cwd: str, home: str) -> str | None:
+    """Why the shell command `text`, run in `cwd`, is denied, or None.
 
-    Every simple command must run a program from `READ_ONLY_PROGRAMS`, with no `>` outside quotes. `find`
-    may not use an action that deletes, runs or writes, and `rg` may not use `--pre`, which runs a
-    program. For those two an argument the shell expands into a word that starts with `$`, `*`, `?` or `[`
-    could become such an option, so it is not read-only either.
+    The command is parsed with `scars.shell`, and each simple command it runs is checked:
+
+    - Running scars (by any path, through the wrappers the parser removes, or as `python -m scars`) with
+      `inbox` or a privileged subcommand, or with a first operand the shell expands at run time, is denied.
+      So is a command that is not `provably_read_only` and has an argument word naming the `scars`
+      program (exactly `scars`, or a path ending in `/bin/scars`) followed by such a subcommand, because
+      runners the parser does not model (`timeout`, `xargs`, `find -exec`) pass it on; `xargs` with no
+      subcommand after `scars` takes it from input. A word such as `src/scars` is not the program, so
+      nothing after it is read as a subcommand.
+    - A command that is not `provably_read_only` is denied when an argument spells the scars home, the
+      default `~/.scars`, `$HOME/.scars`, `${HOME}/.scars`, `$SCARS_HOME` or `${SCARS_HOME}` anywhere in
+      it, even inside a quoted script.
+    - A command that is not `provably_read_only` is denied when one of its arguments may resolve under
+      the scars home or the default `~/.scars`. Arguments are paths relative to the command's directory
+      (the event cwd, after a leading `cd`, and both when the `cd` may have failed); the text after an `=`
+      counts too. A leading `~`, `$HOME` and `$SCARS_HOME` are expanded, a glob is denied when it could
+      match a path there, and an argument holding any other variable is denied when the raw text names
+      the home. Redirection targets that open a file for writing are checked the same way for every
+      command, including one that is only a redirection.
+    - A shell program the parser did not unwrap (a second nested `-c`, or `zsh`) runs a script the parser
+      never saw, so its arguments are scanned as raw text, as below.
+
+    A command the parser cannot model is denied only when its raw text, as written or with quotes and
+    backslashes removed, holds `scars <inbox or privileged subcommand>` or names the scars home. Quoted
+    text in a command the parser models is never read as a call: `git commit -m 'scars off'` passes.
     """
-    if _redirects_output(command):
-        return False
     from scars import shell
 
     try:
-        commands = shell.parse(command)
+        commands = shell.parse(text, null_commands=True)
     except shell.Unsupported:
-        return False
+        return _unparsed_reason(text, home)
+    roots = _roots(home)
+    spelled = _home_spellings(roots)
+
+    def names_home() -> bool:
+        return _names_home(text, home)
+
     for c in commands:
-        if c.program not in READ_ONLY_PROGRAMS:
+        if c.program.lower() in SHELLS and (reason := _unparsed_reason(" ".join(c.args), home)):
+            return reason
+        read_only = provably_read_only(c)
+        if (subcommand := _scars_subcommand(c, read_only)) is not None:
+            return RUN_REASON.format(subcommand)
+        dirs = _directories(c, cwd)
+        for target in c.writes:
+            if _may_resolve_under(target, target.startswith("~"), dirs, roots, names_home):
+                return SHELL_HOME_REASON
+        if read_only:
+            continue
+        for i, word in enumerate(c.args):
+            if spelled.search(word) or _may_resolve_under(word, i in c.uncertain, dirs, roots, names_home):
+                return SHELL_HOME_REASON
+    return None
+
+
+def _home_spellings(roots: tuple[str, ...]) -> re.Pattern[str]:
+    spelled = [*(re.escape(r) for r in roots), r"~/\.scars", r"\$HOME/\.scars", r"\$\{HOME\}/\.scars"]
+    spelled += [r"\$SCARS_HOME", r"\$\{SCARS_HOME\}"]
+    return re.compile(rf"(?:{'|'.join(spelled)})(?![\w.-])", re.IGNORECASE)
+
+
+def _unparsed_reason(text: str, home: str) -> str | None:
+    unquoted = _QUOTING.sub("", text)
+    for candidate in (text, unquoted):
+        if found := _invocation_pattern().search(candidate):
+            return RUN_REASON.format(found.group(1).lower())
+    return SHELL_HOME_REASON if _names_home(text, home) else None
+
+
+def _names_home(text: str, home: str) -> bool:
+    mention = _home_mention(home)
+    return any(mention.search(t) for t in (text, _QUOTING.sub("", text)))
+
+
+def _scars_subcommand(c: "shell.SimpleCommand", read_only: bool) -> str | None:
+    """The protected subcommand this command runs scars with, or None."""
+    name = c.program.lower()
+    if name == "scars" or name.startswith("scars."):
+        return _protected_operand(c, 0)
+    if read_only:
+        return None
+    for i, arg in enumerate(c.args):
+        if not _names_cli(arg):
+            continue
+        if (found := _protected_operand(c, i + 1)) is not None:
+            return found
+        if name == "xargs" and all(a.startswith("-") for a in c.args[i + 1 :]):
+            return "..."
+    return None
+
+
+def _names_cli(word: str) -> bool:
+    """Whether an argument word names the scars program: exactly `scars`, or a path ending in `/bin/scars`,
+    which covers the installed versions and a virtualenv. `src/scars` and other paths are not the CLI."""
+    word = word.lower()
+    return word == "scars" or word.endswith("/bin/scars")
+
+
+def _protected_operand(c: "shell.SimpleCommand", start: int) -> str | None:
+    """The first non-option argument from `start` when it is protected or unknown, else None."""
+    for i in range(start, len(c.args)):
+        arg = c.args[i]
+        if i in c.uncertain:
+            return arg
+        if not arg.startswith("-"):
+            return arg.lower() if arg.lower() in AGENT_DENIED_SUBCOMMANDS else None
+    return None
+
+
+def provably_read_only(c: "shell.SimpleCommand") -> bool:
+    """True only when the simple command runs a program that just reads its arguments.
+
+    The program must be one of `READ_ONLY_PROGRAMS`. `find` may not use an action that deletes, runs or
+    writes, and `rg` may not use `--pre`, which runs a program. For those two an argument the shell
+    expands into a word that starts with `$`, `*`, `?` or `[` could become such an option, so it is not
+    read-only either. Output redirections are checked separately.
+    """
+    if c.program not in READ_ONLY_PROGRAMS:
+        return False
+    if c.program in ("find", "rg"):
+        if any(c.args[i][:1] in ("$", "*", "?", "[") for i in c.uncertain):
             return False
-        if c.program in ("find", "rg"):
-            if any(c.args[i][:1] in ("$", "*", "?", "[") for i in c.uncertain):
-                return False
-            if c.program == "find" and FIND_ACTIONS_THAT_WRITE.intersection(c.args):
-                return False
-            if c.program == "rg" and any(a.startswith("--pre") for a in c.args):
-                return False
+        if c.program == "find" and FIND_ACTIONS_THAT_WRITE.intersection(c.args):
+            return False
+        if c.program == "rg" and any(a.startswith("--pre") for a in c.args):
+            return False
     return True
 
 
-def _redirects_output(command: str) -> bool:
-    quote: str | None = None
-    escaped = False
-    for ch in command:
-        if escaped:
-            escaped = False
-        elif quote == "'":
-            quote = None if ch == "'" else quote
-        elif ch == "\\":
-            escaped = True
-        elif quote == '"':
-            quote = None if ch == '"' else quote
-        elif ch in "'\"":
-            quote = ch
-        elif ch == ">":
-            return True
+def _roots(home: str) -> tuple[str, ...]:
+    """The scars home and the default `~/.scars`, as spelled and resolved, compared without case because
+    the default macOS file system ignores it."""
+    found = []
+    for h in (home, os.path.join(os.path.expanduser("~"), ".scars")):
+        found += [os.path.abspath(h), os.path.realpath(h)]
+    return tuple(dict.fromkeys(r.rstrip("/").casefold() for r in found))
+
+
+def _directories(c: "shell.SimpleCommand", cwd: str) -> tuple[str, ...]:
+    if c.cwd is None:
+        return (cwd,)
+    moved = os.path.join(cwd, c.cwd)
+    return (moved,) if c.cwd_known else (moved, cwd)
+
+
+def _may_resolve_under(
+    word: str, expands: bool, dirs: tuple[str, ...], roots: tuple[str, ...], names_home: "Callable[[], bool]"
+) -> bool:
+    for candidate in (word, word.partition("=")[2]) if "=" in word else (word,):
+        if expands:
+            expanded = _expand(candidate)
+            if expanded is None:
+                if names_home():
+                    return True
+                continue
+            candidate = expanded
+        for d in dirs:
+            path = os.path.join(d, candidate)
+            if expands and any(ch in path for ch in "*?["):
+                if any(_glob_may_reach(path, r) for r in roots):
+                    return True
+            elif any(_inside(p, r) for p in (os.path.abspath(path), os.path.realpath(path)) for r in roots):
+                return True
     return False
+
+
+def _expand(word: str) -> str | None:
+    """`word` with a leading `~`, `$HOME` and `$SCARS_HOME` expanded, or None when another expansion
+    (`~user`, any other variable) leaves its value unknown."""
+    if word.startswith("~"):
+        user, slash, rest = word[1:].partition("/")
+        if user:
+            return None
+        word = os.path.expanduser("~") + slash + rest
+    word = _KNOWN_VARIABLE.sub(
+        lambda m: os.environ.get("HOME", "") if m.group(1) == "HOME" else paths.home_path(), word
+    )
+    return None if "$" in word else word
+
+
+def _inside(path: str, root: str) -> bool:
+    path = path.casefold()
+    return path == root or path.startswith(root + "/")
+
+
+def _glob_may_reach(pattern: str, root: str) -> bool:
+    """Whether the glob `pattern` could match `root` or a path inside it."""
+    from fnmatch import fnmatchcase
+
+    parts = os.path.normpath(pattern).casefold().split("/")
+    for i, name in enumerate(root.split("/")):
+        if i >= len(parts):
+            return False
+        if "**" in parts[i]:
+            return True
+        if not fnmatchcase(name, parts[i]):
+            return False
+    return True
 
 
 def _under(path: str, cwd: str, home: str) -> bool:
@@ -245,8 +391,25 @@ def _under(path: str, cwd: str, home: str) -> bool:
 # ---------------------------------------------------------------- repo resolution
 
 
+GIT_LOCATION_ENV = ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES")
+
+
+class _AskGit(Exception):
+    """The files alone do not settle where git would find the repo."""
+
+
 def git_common_dir(cwd: str) -> str | None:
-    """`git rev-parse --git-common-dir` as an absolute path, or None outside a repo or without git."""
+    """`git rev-parse --git-common-dir` as an absolute path, or None outside a repo or without git.
+
+    It is read from the `.git` directory or file, and a worktree's `commondir` file, when those settle it,
+    because starting git costs about 15 ms of every run without a telemetry cache. git itself answers
+    when an environment variable moves the repo, when `cwd` is inside a git directory, and when a file
+    is not in the shape git writes.
+    """
+    try:
+        return _common_dir_from_files(cwd)
+    except _AskGit:
+        pass
     import subprocess  # Only a cache miss needs it; importing it costs about 2 ms of the hook budget.
 
     try:
@@ -261,6 +424,49 @@ def git_common_dir(cwd: str) -> str | None:
         return None
     out = result.stdout.strip()
     return out if result.returncode == 0 and out else None
+
+
+def _common_dir_from_files(cwd: str) -> str | None:
+    if not os.path.isabs(cwd) or any(name in os.environ for name in GIT_LOCATION_ENV):
+        raise _AskGit
+    here = os.path.realpath(cwd)
+    while True:
+        if os.path.isfile(os.path.join(here, "HEAD")) and os.path.isdir(os.path.join(here, "objects")):
+            raise _AskGit
+        dotgit = os.path.join(here, ".git")
+        if os.path.isdir(dotgit):
+            git_dir = dotgit
+            break
+        if os.path.isfile(dotgit):
+            line = _first_line(dotgit)
+            if not line.startswith("gitdir: "):
+                raise _AskGit
+            git_dir = os.path.join(here, line.removeprefix("gitdir: "))
+            break
+        if os.path.lexists(dotgit):
+            raise _AskGit
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+    common = os.path.join(git_dir, "commondir")
+    # git skips a directory without these and keeps looking above it.
+    holds_repo = os.path.isdir(os.path.join(git_dir, "objects")) and os.path.isdir(
+        os.path.join(git_dir, "refs")
+    )
+    if not os.path.isfile(os.path.join(git_dir, "HEAD")) or not (holds_repo or os.path.isfile(common)):
+        raise _AskGit
+    if os.path.lexists(common):
+        git_dir = os.path.join(git_dir, _first_line(common))
+    return os.path.realpath(git_dir)
+
+
+def _first_line(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read(4096).strip()
+    except (OSError, UnicodeError) as exc:
+        raise _AskGit from exc
 
 
 def repo_root(cwd: str) -> str | None:
@@ -482,13 +688,14 @@ def _hit(
     shown: Shown | None = None,
     trigger_key: str | None = None,
     error_class: str | None = None,
+    session_id: str = "",
 ) -> telemetry.Hit:
     return telemetry.Hit(
         at=now,
         harness=harness.value,
         harness_version=(event.harness_version or None) if event else None,
         model_id=(event.model_id or None) if event else None,
-        session_id=event.session_id if event else "",
+        session_id=event.session_id if event else session_id,
         tool_use_id=event.tool_use_id if event else None,
         event=event.event.value if event else "unknown",
         stage=STAGES[event.event].value if event else None,
@@ -602,6 +809,17 @@ def run(
             payload = read_payload(stdin)
             event = ADAPTERS[harness].parse(event_name, payload)
         except Ignored:
+            tele = telemetry.connect(_telemetry_path())
+            session = payload.get("session_id")
+            hit = _hit(
+                harness,
+                None,
+                HitOutcome.IGNORED,
+                now=time.time(),
+                latency_ms=elapsed_ms(),
+                session_id=session if isinstance(session, str) else "",
+            )
+            telemetry.write(tele, telemetry.Writes((hit,)))
             return
         except (MalformedInput, BadStdin) as exc:
             error_class = exc.error_class if isinstance(exc, BadStdin) else "malformed_input"
@@ -632,11 +850,13 @@ def run(
             hit = _hit(
                 harness, event, HitOutcome.ERROR, now=now, latency_ms=elapsed_ms(), error_class=error_class
             )
-            telemetry.write(tele, telemetry.Writes((hit,)))
+            writes = telemetry.Writes(
+                (hit,), session_id=event.session_id, epoch=state.epoch, bump_epoch=compaction
+            )
+            telemetry.write(tele, writes)
             raise
         if decision.output is not None:
-            stdout.write(json.dumps(decision.output))
-            stdout.flush()
+            _print(stdout, json.dumps(decision.output))
         dedupe = decision.outcome is HitOutcome.SHOWN
         telemetry.write(
             tele,
@@ -652,6 +872,19 @@ def run(
     finally:
         if tele is not None:
             tele.close()
+
+
+def _print(stdout: TextIO, text: str) -> None:
+    try:
+        stdout.write(text)
+        stdout.flush()
+    except BrokenPipeError:
+        # The harness stopped reading. Python flushes stdout again at exit and would then print a
+        # BrokenPipeError and exit 120; pointing the descriptor at /dev/null keeps that flush quiet.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), stdout.fileno())
+        except (OSError, ValueError):
+            return
 
 
 def main(harness: str, event_name: str, *, started: float | None = None) -> int:

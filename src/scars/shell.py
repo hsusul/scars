@@ -94,6 +94,11 @@ class SimpleCommand:
     """Indices into `args` of arguments the shell expands at run time, so their value is unknown."""
     cwd_known: bool = True
     """False when the directory depends on whether an earlier `cd` succeeded."""
+    writes: tuple[str, ...] = ()
+    """Files its redirections open for writing (`<>` included), including those on an enclosing group, as
+    written: a leading `~` is not expanded. With `null_commands`, a command with no program, such as `> f`,
+    `X=1 > f`, `(X=1) > f` or the redirection on a leading `cd`, is reported as the null command `:` so its
+    targets are kept."""
 
 
 class Unsupported(Exception):
@@ -261,7 +266,7 @@ _WRAPPERS: dict[str, _Wrapper] = {
 }
 
 
-def parse(command: str) -> tuple[SimpleCommand, ...]:
+def parse(command: str, *, null_commands: bool = False) -> tuple[SimpleCommand, ...]:
     """Split a shell command into simple commands with wrappers removed.
 
     Leading `VAR=value` assignments are dropped, then wrappers from the wrapper table are removed in any
@@ -270,8 +275,13 @@ def parse(command: str) -> tuple[SimpleCommand, ...]:
     parse their script again, one level deep. A `cd DIR &&` at the start of the command, or at the start
     of a subshell group, sets the working directory of the commands after it in that group and is not
     reported as a command. The reported program is the basename of the program word.
+
+    `null_commands` also reports redirections that run no program as the null command `:` (see
+    `SimpleCommand.writes`). `:` is never a program word the parser accepts, so it cannot be confused with
+    one; callers that ask what runs leave it off.
     """
-    return _parse(command, depth=0)
+    commands = _parse(command, depth=0)
+    return commands if null_commands else tuple(c for c in commands if c.program != ":")
 
 
 def _parse(command: str, depth: int) -> tuple[SimpleCommand, ...]:
@@ -465,6 +475,10 @@ class _Grouper:
         self.open_fds = set(_STANDARD_FDS)
         self.altered = False
         """A command that can stop or rewire later commands has been emitted."""
+        self.writes: list[str] = []
+        self.group_starts: list[int] = []
+        self.closed_from = 0
+        """Index of the first command inside the group that just closed."""
 
     def run(self, tokens: list[_Token]) -> list[SimpleCommand]:
         i = 0
@@ -481,7 +495,16 @@ class _Grouper:
                         raise Unsupported("redirection without a target")
                     if target.text.startswith("!") and target.bare[0]:
                         raise Unsupported("zsh reads `>!` as a clobbering redirection")
-                    self._redirect(text, fd, target)
+                    if self._redirect(text, fd, target):
+                        if self.closed_group:
+                            start = self.closed_from
+                            if start == len(self.commands):
+                                self._emit_null(self.frames[-1], ())
+                            self.commands[start:] = [
+                                replace(c, writes=(*c.writes, target.text)) for c in self.commands[start:]
+                            ]
+                        else:
+                            self.writes.append(target.text)
                     self.pending = True
                     i += 1
                 case _Op("("):
@@ -490,6 +513,7 @@ class _Grouper:
                     outer = self.frames[-1]
                     outer.leading = False
                     self.frames.append(_Frame(outer.cwd, outer.cwd_known))
+                    self.group_starts.append(len(self.commands))
                     self.needs_follower = False
                     self.open_fds = set(_STANDARD_FDS)
                 case _Op(")"):
@@ -500,6 +524,7 @@ class _Grouper:
                     self._finish(None)
                     if not self.frames.pop().has_command:
                         raise Unsupported("empty group")
+                    self.closed_from = self.group_starts.pop()
                     self.frames[-1].has_command = True
                     self.pending = self.closed_group = True
                     self.open_fds = set(_STANDARD_FDS)
@@ -517,9 +542,12 @@ class _Grouper:
         self._finish(None)
         return self.commands
 
-    def _redirect(self, op: str, fd: int | None, target: _Word) -> None:
-        """Check one redirection against the forms bash runs, tracking which descriptors are open."""
-        if not target.literal:
+    def _redirect(self, op: str, fd: int | None, target: _Word) -> bool:
+        """Check one redirection against the forms bash runs, tracking which descriptors are open.
+
+        True when it opens its target as a file for writing.
+        """
+        if not target.literal and not _home_relative(target):
             raise Unsupported(f"redirection target {target.text!r} expands at run time")
         if target.text == "":
             raise Unsupported("bash cannot open an empty redirection target")
@@ -532,41 +560,50 @@ class _Grouper:
                 if self.closed_group:
                     raise Unsupported("closing a descriptor of a group")
                 fds.discard(n)
-            elif plain and len(target.text) == 1 and target.text.isdigit():
+                return False
+            if plain and len(target.text) == 1 and target.text.isdigit():
                 if int(target.text) not in fds:
                     raise Unsupported(f"descriptor {target.text} may not be open")
                 fds.add(n)
-            elif op == ">&" and fd is None and plain and _PLAIN_FILE.fullmatch(target.text):
+                return False
+            if op == ">&" and fd is None and plain and _PLAIN_FILE.fullmatch(target.text):
                 _check_file_target(target.text)
                 fds.update((1, 2))
-            else:
-                raise Unsupported(f"invalid descriptor redirection {op}{target.text!r}")
-        elif op == "&>":
-            _check_file_target(target.text)
+                return True
+            raise Unsupported(f"invalid descriptor redirection {op}{target.text!r}")
+        _check_file_target(target.text)
+        if op == "&>":
             fds.update((1, 2))
         else:
-            _check_file_target(target.text)
             fds.add(fd if fd is not None else (0 if op[0] == "<" else 1))
+        return op != "<"
 
     def _finish(self, separator: str | None) -> None:
         words, self.words = self.words, []
+        writes, self.writes = tuple(self.writes), []
         frame = self.frames[-1]
         self.open_fds = set(_STANDARD_FDS)
         if self.pending:
             frame.has_command = True
             self.needs_follower = False
         if words:
-            self._emit(words, frame, separator)
+            self._emit(words, frame, separator, writes)
+        elif writes:
+            self._emit_null(frame, writes)
         if frame.moved and separator is not None and separator not in _KEEPS_CWD:
             frame.cwd_known = False
 
-    def _emit(self, words: list[_Word], frame: _Frame, separator: str | None) -> None:
+    def _emit(
+        self, words: list[_Word], frame: _Frame, separator: str | None, writes: tuple[str, ...]
+    ) -> None:
         if words[0].quoted_from is None and words[0].text in _KEYWORDS:
             raise Unsupported(f"shell keyword {words[0].text!r}")
         if frame.leading and words[0].text == "cd":
             if len(words) != 2 or not _plain_directory(words[1]):
                 raise Unsupported("a leading cd needs exactly one plain directory operand")
             if separator == "&&":
+                if writes:
+                    self._emit_null(frame, writes)
                 target = words[1].text
                 frame.cwd = target if frame.cwd is None else posixpath.join(frame.cwd, target)
                 frame.moved = True
@@ -584,13 +621,25 @@ class _Grouper:
             self.altered = True
         if not frame.cwd_known:
             emitted = [replace(c, cwd_known=False) for c in emitted]
+        if writes and not emitted:
+            self._emit_null(frame, writes)
+        emitted = [replace(c, writes=(*c.writes, *writes)) for c in emitted]
         self.commands.extend(emitted)
         if any(c.program in _DIRECTORY_CHANGERS for c in emitted):
             frame.cwd_known = False
 
+    def _emit_null(self, frame: _Frame, writes: tuple[str, ...]) -> None:
+        self.commands.append(SimpleCommand(":", (), frame.cwd, cwd_known=frame.cwd_known, writes=writes))
+
+
+def _home_relative(word: _Word) -> bool:
+    """`~` or `~/rest` with nothing else the shell expands: bash and zsh both open the home path."""
+    tail = _Word(word.text[1:], None, word.bare[1:], word.expanded)
+    return word.text[:1] == "~" and word.bare[0] and word.text[1:2] in ("", "/") and tail.literal
+
 
 def _check_file_target(text: str) -> None:
-    if text.endswith("/") or text.rsplit("/", 1)[-1] in (".", ".."):
+    if text.endswith("/") or text == "~" or text.rsplit("/", 1)[-1] in (".", ".."):
         raise Unsupported(f"redirection target {text!r} is a directory")
 
 

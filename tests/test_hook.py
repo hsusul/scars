@@ -2,6 +2,7 @@ import io
 import itertools
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -239,6 +240,7 @@ SHELL_HOME_REASON = (
     "scars: this command names the scars home directory and is not a plain read (cat, ls, grep and the "
     "like, with no `>`). Lessons change only through scars commands a human runs at a terminal."
 )
+IGNORED_HIT = ("claude", "s1", None, "unknown", None, None, None, None, "ignored", 0, None)
 GATE_NO_MATCH = ("pre_tool", "gate", None, None, None, "no_match", 0, None)
 GATE_DENY = ("pre_tool", "gate", None, None, "agent_deny", "blocked", 0, None)
 
@@ -392,12 +394,12 @@ def test_claude_post_compact_prints_nothing_and_leaves_the_epoch_alone(env):
     add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR, status="pinned")
     payload = {"session_id": "s1", "cwd": str(repo), "hook_event_name": "PostCompact", "trigger": "auto"}
     assert run_hook(home, "claude", "PostCompact", payload).stdout == ""
-    assert hits(home) == []
+    assert hits(home) == [IGNORED_HIT]
     assert rows(home, "select * from session_epoch") == []
     # The same session's SessionStart compact is what moves the epoch and records a hit.
     assert run_hook(home, "claude", "SessionStart", session_start(repo, "compact")).stdout != ""
     assert rows(home, "select session_id, context_epoch from session_epoch") == [("s1", 1)]
-    assert [h[3] for h in hits(home)] == ["compact"]
+    assert [h[3] for h in hits(home)] == ["unknown", "compact"]
 
 
 def test_user_prompt_submit_delivers_a_pinned_prompt_lesson(env):
@@ -444,7 +446,18 @@ def test_codex_post_tool_use_with_a_nonzero_exit_delivers_repair(env):
     ]
     success = {**payload, "tool_use_id": "call_2", "tool_response": "all good"}
     assert run_hook(home, "codex", "PostToolUse", success).stdout == ""
-    assert len(hits(home)) == 1
+    assert rows(home, "select harness, session_id, model_id, event, outcome, lesson_id from hits") == [
+        ("codex", "thr_1", "gpt-5.5-codex", "tool_failed", "shown", lesson_id),
+        ("codex", "thr_1", None, "unknown", "ignored", None),
+    ]
+
+
+def test_a_cursor_event_is_ignored_and_recorded_without_reading_lessons(env):
+    home, repo = env
+    (home / "lessons.db").write_bytes(b"not a database")
+    payload = {**session_start(repo, "startup"), "cursor_version": "1.2"}
+    assert run_hook(home, "claude", "SessionStart", payload).stdout == ""
+    assert hits(home) == [IGNORED_HIT]
 
 
 def test_codex_session_start_compact_reinjects_pinned_lessons(env):
@@ -514,7 +527,6 @@ def test_a_promoted_block_lesson_never_denies_in_phase_1(env):
         ("claude", "rm $SCARS_HOME/OFF", SHELL_HOME_REASON),
         ("claude", "rm -f ${SCARS_HOME}/OFF", SHELL_HOME_REASON),
         ("claude", 'touch ~/".scars"/OFF', SHELL_HOME_REASON),
-        ("claude", "cat ~/.scars/lessons.db > /tmp/copy", SHELL_HOME_REASON),
         ("claude", "find ~/.scars -name '*.db' -delete", SHELL_HOME_REASON),
         ("claude", "find ~/.scars -exec rm {} +", SHELL_HOME_REASON),
         ("claude", "cat $(echo ~/.scars/lessons.db)", SHELL_HOME_REASON),
@@ -554,6 +566,11 @@ def test_a_command_naming_the_absolute_scars_home_is_denied_unless_it_only_reads
         "rg -n retire ~/.scars/logs",
         'grep "a > b" ~/.scars/x',
         "find ~/.scars -name '*.db'",
+        "cat ~/.scars/lessons.db > /tmp/copy",
+        "printf '%s\\n' 'scars off'",
+        "git commit -m 'document scars off'",
+        "echo scars off is the kill switch",
+        "grep -rn 'scars off' guide/",
         "git log --grep scars",
         "npm run scarsify off",
     ],
@@ -562,13 +579,6 @@ def test_reading_scars_commands_and_mere_mentions_are_allowed(env, command):
     home, repo = env
     assert run_hook(home, "claude", "PreToolUse", pre_tool(repo, command)).stdout == ""
     assert [h[3:] for h in hits(home)] == [GATE_NO_MATCH]
-
-
-def test_quoted_text_that_reads_as_a_scars_invocation_is_denied(env):
-    # The rule is one regex over the raw text, so it cannot tell a commit message from a nested script.
-    home, repo = env
-    result = run_hook(home, "claude", "PreToolUse", pre_tool(repo, "git commit -m 'scars promote'"))
-    assert result.stdout == deny_json(run_reason("promote"))
 
 
 def test_agent_edits_under_the_scars_home_are_denied_for_both_harnesses(env):
@@ -738,7 +748,9 @@ def test_every_fixture_replays_through_the_hook(tmp_path, harness, event_name, c
             (harness, e["session_id"], e["tool_use_id"], e["event"], STAGES[e["event"]], *NO_LESSON)
         ]
     elif case["error"] == "Ignored":
-        assert hits(home) == []
+        assert [(h[0], h[1], h[3], h[8]) for h in hits(home)] == [
+            (harness, case["stdin"].get("session_id", ""), "unknown", "ignored")
+        ]
     else:
         assert [(h[0], h[3], h[8], h[10]) for h in hits(home)] == [
             (harness, "unknown", "error", "malformed_input")
@@ -921,6 +933,14 @@ def test_missing_lessons_db_prints_nothing_quickly_and_records_an_error(env):
     assert outcomes(home) == [("error", "lessons_unavailable")]
 
 
+def test_a_compaction_moves_the_epoch_even_when_the_lessons_store_is_missing(env):
+    home, repo = env
+    for _ in range(2):
+        assert_silent_and_fast(run_hook(home, "claude", "SessionStart", session_start(repo, "compact")))
+    assert rows(home, "select session_id, context_epoch from session_epoch") == [("s1", 2)]
+    assert outcomes(home) == [("error", "lessons_unavailable"), ("error", "lessons_unavailable")]
+
+
 @NOT_ROOT
 def test_unreadable_lessons_db_prints_nothing_quickly(env):
     home, repo = env
@@ -1000,6 +1020,170 @@ def test_a_cached_cwd_skips_git(env, monkeypatch):
     assert json.loads(out.getvalue()) == context("PostToolUseFailure", lesson_text(lesson_id))
 
 
+def test_without_telemetry_the_repo_is_found_without_starting_git(tmp_path, monkeypatch):
+    home, repo = make_env(tmp_path, telemetry=False)
+    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
+    monkeypatch.setenv("SCARS_HOME", str(home))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("the hook started a process"))
+    for tool_use_id in ("tu1", "tu2"):
+        out = io.StringIO()
+        payload = claude_failure(repo, tool_use_id=tool_use_id)
+        hook.run(Harness.CLAUDE, "PostToolUseFailure", io.StringIO(json.dumps(payload)), out)
+        assert json.loads(out.getvalue()) == context("PostToolUseFailure", lesson_text(lesson_id))
+
+
+def git_answer(cwd):
+    result = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def test_the_common_dir_read_from_files_matches_git(tmp_path, monkeypatch):
+    for name in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES"):
+        monkeypatch.delenv(name, raising=False)
+    main = git_repo(tmp_path / "main")
+    (main / "src" / "deep").mkdir(parents=True)
+    subprocess.run(
+        ["git", "-C", str(main), "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "x"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(tmp_path / "wt")], check=True)
+    (tmp_path / "wt" / "lib").mkdir()
+    (tmp_path / "link").symlink_to(main / "src")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    cwds = [
+        main,
+        main / "src" / "deep",
+        main / ".git",
+        tmp_path / "wt",
+        tmp_path / "wt" / "lib",
+        tmp_path / "link",
+        plain,
+    ]
+    found = [hook.git_common_dir(str(c)) for c in cwds]
+    assert found == [str(main.resolve() / ".git")] * 6 + [None]
+    assert found == [git_answer(c) for c in cwds]
+
+
+@pytest.mark.parametrize("contents", [("HEAD",), ("HEAD", "objects/"), ("HEAD", "refs/")])
+def test_a_dot_git_directory_git_would_not_accept_is_skipped_as_git_skips_it(tmp_path, monkeypatch, contents):
+    for name in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES"):
+        monkeypatch.delenv(name, raising=False)
+    outer = git_repo(tmp_path / "outer")
+    fake = outer / "vendored" / ".git"
+    fake.mkdir(parents=True)
+    for name in contents:
+        if name.endswith("/"):
+            (fake / name).mkdir()
+        else:
+            (fake / name).write_text("ref: refs/heads/main\n")
+    cwd = outer / "vendored"
+    assert hook.git_common_dir(str(cwd)) == str(outer.resolve() / ".git")
+    assert git_answer(cwd) == str(outer.resolve() / ".git")
+
+
+def test_a_lesson_render_rejects_is_skipped_and_the_others_still_arrive(env):
+    home, repo = env
+    db = seed_store(home, repo)
+    good = add_lesson(db, fingerprint="fp-good", triggers=REPAIR)
+    bad = add_lesson(db, fingerprint="fp-bad", triggers=REPAIR, avoid="npm t\u00e9st")
+    db.execute("update lessons set sessions_seen = 9 where id = ?", (bad,))
+    db.close()
+    result = run_hook(home, "claude", "PostToolUseFailure", claude_failure(repo))
+    assert json.loads(result.stdout) == context("PostToolUseFailure", lesson_text(good))
+    assert [(h[5], h[8], h[10]) for h in hits(home)] == [(good, "shown", "render_rejected")]
+
+
+@pytest.mark.parametrize("damage", ["garbage", "truncated", "garbage wal"])
+def test_a_corrupt_telemetry_db_still_delivers_and_is_left_as_it_was(env, damage):
+    home, repo = env
+    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
+    path = home / "telemetry.db"
+    match damage:
+        case "garbage":
+            path.write_bytes(b"this is not a database at all\n" * 200)
+        case "truncated":
+            path.write_bytes(path.read_bytes()[:4096])
+        case "garbage wal":
+            (home / "telemetry.db-wal").write_bytes(b"\xff" * 8192)
+    before = path.read_bytes()
+    result = run_hook(home, "claude", "PostToolUseFailure", claude_failure(repo))
+    assert json.loads(result.stdout) == context("PostToolUseFailure", lesson_text(lesson_id))
+    if damage != "garbage wal":
+        assert path.read_bytes() == before
+
+
+def test_the_scars_hook_command_honors_the_kill_switch_itself(env):
+    home, repo = env
+    (home / "OFF").touch()
+    command = [sys.executable, "-m", "scars", "hook"]
+    assert run_hook(home, "claude", "PreToolUse", pre_tool(repo, "scars off"), command=command).stdout == ""
+    assert hits(home) == []
+
+
+@pytest.mark.parametrize(
+    ("value", "off"),
+    [
+        ("1", True),
+        ("TRUE", True),
+        ("Yes", True),
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        ("off", False),
+    ],
+)
+def test_scars_off_accepts_only_1_true_or_yes(env, value, off):
+    home, repo = env
+    result = run_hook(home, "claude", "PreToolUse", pre_tool(repo, "scars off"), SCARS_OFF=value)
+    assert result.stdout == ("" if off else deny_json(run_reason("off")))
+
+
+def test_an_import_fault_in_the_package_exits_0_with_no_output(env, tmp_path):
+    home, repo = env
+    broken = tmp_path / "broken"
+    shutil.copytree(
+        Path(hook.__file__).parent, broken / "scars", ignore=shutil.ignore_patterns("__pycache__")
+    )
+    (broken / "scars" / "telemetry.py").write_text("raise RuntimeError('broken install')\n")
+    entry = f"import sys; sys.path.insert(0, {str(broken)!r}); from scars.hook_entry import main; main()"
+    result = run_hook(
+        home, "claude", "PreToolUse", pre_tool(repo, "scars off"), command=[sys.executable, "-c", entry]
+    )
+    assert result.stdout == ""
+
+
+def test_a_deny_to_a_closed_stdout_exits_0_quietly_and_is_recorded(env):
+    home, repo = env
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        result = subprocess.run(
+            [*HOOK, "claude", "PreToolUse"],
+            input=json.dumps(pre_tool(repo, "scars off")),
+            stdout=write_end,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=hook_env(home),
+            timeout=20,
+        )
+    finally:
+        os.close(write_end)
+    assert (result.returncode, result.stderr) == (0, "")
+    assert [h[3:] for h in hits(home)] == [GATE_DENY]
+
+
 # ---------------------------------------------------------------- entry points and latency
 
 
@@ -1052,7 +1236,8 @@ def test_the_hook_entry_imports_only_what_the_path_needs(env):
     assert names & HEAVY == set()
 
     names, out = imported_modules(home, "claude", "PreToolUse", pre_tool(repo, "npm test"))
-    assert out == "" and names & (HEAVY | {"scars.store"}) == set()
+    assert out == "" and "scars.shell" in names
+    assert names & (HEAVY - {"scars.shell"} | {"scars.store"}) == set()
 
     names, out = imported_modules(home, "claude", "PostToolUseFailure", claude_failure(repo, "s3"))
     assert json.loads(out) == context("PostToolUseFailure", lesson_text(lesson_id))

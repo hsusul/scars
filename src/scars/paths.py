@@ -69,5 +69,10 @@ def kill_switch() -> Path:
     return home() / "OFF"
 
 
+def off_value(value: str | None) -> bool:
+    """Whether a `SCARS_OFF` value turns scars off: `1`, `true` or `yes`, in any case."""
+    return (value or "").strip().lower() in ("1", "true", "yes")
+
+
 def is_off() -> bool:
-    return bool(os.environ.get("SCARS_OFF")) or os.path.exists(os.path.join(home_path(), "OFF"))
+    return off_value(os.environ.get("SCARS_OFF")) or os.path.exists(os.path.join(home_path(), "OFF"))

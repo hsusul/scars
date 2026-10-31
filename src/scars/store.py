@@ -41,6 +41,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 SCHEMA_VERSION = 1
+TELEMETRY_SCHEMA_VERSION = 2
+"""2 allows the `ignored` hit outcome, which a version 1 hits table rejects."""
 EXPIRY_SECONDS = 14 * 86400
 GENESIS_HASH = "0" * 64
 BLOCK_MIN_FAILING = 3
@@ -94,7 +96,7 @@ def _statements(sql: str) -> list[str]:
     return out
 
 
-def _init(path: Path, schema: str, synchronous: str) -> sqlite3.Connection:
+def _init(path: Path, schema: str, synchronous: str, version: int = SCHEMA_VERSION) -> sqlite3.Connection:
     from pathlib import Path
 
     path = Path(path)
@@ -109,7 +111,7 @@ def _init(path: Path, schema: str, synchronous: str) -> sqlite3.Connection:
         if db.execute("pragma user_version").fetchone()[0] == 0:
             for statement in _statements(schema_sql(schema)):
                 db.execute(statement)
-            db.execute(f"pragma user_version = {SCHEMA_VERSION}")
+            db.execute(f"pragma user_version = {int(version)}")
         db.execute("commit")
     except BaseException:
         _rollback(db)
@@ -128,7 +130,7 @@ def init_lessons(path: Path) -> sqlite3.Connection:
 
 def init_telemetry(path: Path) -> sqlite3.Connection:
     """Create telemetry.db like `init_lessons`, with `synchronous = NORMAL`: hooks write it best-effort."""
-    return _init(path, "telemetry", "NORMAL")
+    return _init(path, "telemetry", "NORMAL", TELEMETRY_SCHEMA_VERSION)
 
 
 class Conflict(Exception):
@@ -978,11 +980,47 @@ def ensure_miner_schema(db: sqlite3.Connection) -> None:
             db.execute(statement)
 
 
-def ensure_telemetry_schema(db: sqlite3.Connection) -> None:
-    """Add telemetry.db's later indexes to a file made before they existed. Idempotent."""
+def ensure_telemetry_schema(db: sqlite3.Connection) -> int:
+    """Bring telemetry.db up to `TELEMETRY_SCHEMA_VERSION` and add later indexes. Idempotent.
+
+    The upgrades run in order inside one write transaction, so a failure leaves the file as it was. Only
+    the CLI calls this; the hook never upgrades and keeps dropping a write the old schema rejects.
+    Returns the version the file had before.
+    """
+    db.execute("begin immediate")
+    try:
+        found = db.execute("pragma user_version").fetchone()[0]
+        if 0 < found < TELEMETRY_SCHEMA_VERSION:
+            for version in range(found + 1, TELEMETRY_SCHEMA_VERSION + 1):
+                _TELEMETRY_UPGRADES[version](db)
+            db.execute(f"pragma user_version = {TELEMETRY_SCHEMA_VERSION}")
+        for statement in _statements(schema_sql("telemetry")):
+            if "if not exists" in statement:
+                db.execute(statement)
+        db.execute("commit")
+    except BaseException:
+        _rollback(db)
+        raise
+    return found
+
+
+def _rebuild_hits(db: sqlite3.Connection) -> None:
+    """Recreate `hits` from the current DDL, keeping every row and its `seq`: SQLite cannot alter a CHECK."""
+    db.execute("alter table hits rename to hits_old")
+    indexes = db.execute(
+        "select name from sqlite_master where type = 'index' and tbl_name = 'hits_old' and sql is not null"
+    )
+    for (name,) in indexes.fetchall():
+        db.execute(f'drop index "{name}"')
     for statement in _statements(schema_sql("telemetry")):
-        if "if not exists" in statement:
+        if "create table hits " in statement or " on hits(" in statement:
             db.execute(statement)
+    columns = ", ".join(row[1] for row in db.execute("pragma table_info(hits_old)"))
+    db.execute(f"insert into hits ({columns}) select {columns} from hits_old")
+    db.execute("drop table hits_old")
+
+
+_TELEMETRY_UPGRADES = {2: _rebuild_hits}
 
 
 def add_clone(db: sqlite3.Connection, common_dir: str, repo_id: RepoId, at: float | None = None) -> None:

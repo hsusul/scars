@@ -143,6 +143,6 @@ def cmd_on(_: argparse.Namespace, ctx: Context) -> int:
         ctx.print("scars is on: hooks consult lessons again from their next call")
     else:
         ctx.print("scars is already on")
-    if ctx.env.get("SCARS_OFF"):
+    if paths.off_value(ctx.env.get("SCARS_OFF")):
         ctx.print("SCARS_OFF is set in this environment, which keeps hooks started from it off")
     return 0

@@ -74,6 +74,8 @@ class HitOutcome(StrEnum):
     NO_MATCH = "no_match"
     LOG_ONLY = "log_only"
     ERROR = "error"
+    IGNORED = "ignored"
+    """A well-formed event scars does not act on; no lessons were read."""
 
 
 class DelayedOutcome(StrEnum):

@@ -205,6 +205,10 @@ def test_parse_spec_rejects_invalid_specs(kind, spec, reason):
         ("cat", "cat <<EOF\nx\nEOF", False),
         ("pytest", "uv run pytest -k x", True),
         ("pytest", "env -u FOO TZ=UTC python3 -m pytest", True),
+        (":", "> /tmp/log", False),
+        (":", "X=1 > /tmp/log", False),
+        (":", "cd /tmp > /dev/null && pytest", False),
+        ("pytest", "cd /tmp > /dev/null && pytest", True),
     ],
 )
 def test_command_trigger(spec, command, expected):

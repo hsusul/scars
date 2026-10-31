@@ -3,7 +3,7 @@ create table hits (
   harness text not null, harness_version text, model_id text,   -- model_id may be null and is backfilled by the miner
   session_id text not null, tool_use_id text, event text not null, stage text,
   lesson_id text, lesson_revision integer, status_at_injection text, trigger_key text,
-  outcome text not null check (outcome in ('shown','blocked','no_match','log_only','error')),
+  outcome text not null check (outcome in ('shown','blocked','no_match','log_only','error','ignored')),
   injected_chars integer, latency_ms real, error_class text, arm text
 );
 create index hits_session on hits(session_id, at);

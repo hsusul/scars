@@ -73,6 +73,28 @@ def init_home(home: Path) -> None:
     store.init_telemetry(home / "telemetry.db").close()
 
 
+def first_telemetry(path: Path) -> None:
+    """telemetry.db as the first released scars made it: version 1, without the `ignored` outcome."""
+    db = sqlite3.connect(path, isolation_level=None)
+    db.executescript(store.schema_sql("telemetry").replace(",'ignored'", ""))
+    db.execute("pragma journal_mode = wal")
+    db.execute("pragma user_version = 1")
+    db.execute(
+        "insert into hits (seq, at, harness, session_id, event, outcome) "
+        "values (7, ?, 'codex', 's0', 'x', 'no_match')",
+        (NOW - 60,),
+    )
+    db.close()
+
+
+def telemetry_version(path: Path) -> int:
+    db = sqlite3.connect(path)
+    try:
+        return db.execute("pragma user_version").fetchone()[0]
+    finally:
+        db.close()
+
+
 def connect(home: Path) -> sqlite3.Connection:
     db = store.connect(home / "lessons.db")
     db.row_factory = sqlite3.Row

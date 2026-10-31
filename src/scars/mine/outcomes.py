@@ -35,6 +35,7 @@ WINDOW = 5
 IDLE_SECONDS = 24 * 3600
 DAY = 86400.0
 BACKFILL_DAYS = 30
+IGNORED_KEEP_SECONDS = 7 * DAY
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,8 @@ def run(lessons: sqlite3.Connection, telemetry_path: str, now: float, *, root_of
         return Result(0, 0)
     try:
         store.ensure_telemetry_schema(tdb)
+        # The hook writes one ignored row per event it skips; nothing reads them after doctor's day.
+        tdb.execute("delete from hits where outcome = 'ignored' and at < ?", (now - IGNORED_KEEP_SECONDS,))
         return _run(lessons, tdb, now, root_of)
     except sqlite3.Error:
         return Result(0, 0)
