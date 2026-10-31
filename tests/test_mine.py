@@ -1168,6 +1168,21 @@ def test_a_codex_file_url_cwd_is_decoded_to_a_path(env, tmp_path):
     ]
 
 
+@pytest.mark.parametrize(("host", "pairs"), [("localhost", 1), ("build-box", 0)])
+def test_a_codex_file_url_on_another_host_is_an_unknown_directory(env, tmp_path, host, pairs):
+    url = f"file://{host}{env['loose']}"
+    root = tmp_path / "codex"
+    root.mkdir()
+    (root / "rollout-2027-01-15T00-00-00-0000000a-0000-4000-8000-00000000000a.jsonl").write_text(
+        codex_record(0, "session_meta", {"id": "s", "cwd": url})
+        + codex_record(1, "turn_context", {"model": "gpt-test", "cwd": url})
+        + command_item(2, "e1", "pytest --frobnicate tests", 2, FAIL_TEXT)
+        + command_item(3, "e2", "pytest tests", 0)
+    )
+    summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
+    assert (summary.pairs, summary.candidates_created) == (pairs, pairs)
+
+
 def test_cd_into_a_literal_dir_then_one_command_is_that_command_run_there(env):
     work = str(Path(env["repo"]).parent)
     t = (

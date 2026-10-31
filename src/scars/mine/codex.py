@@ -68,10 +68,14 @@ class _Started:
 
 
 def directory(value: object) -> str | None:
-    """A cwd as a path, or None when it is not a string."""
+    """A cwd as a path, or None when it is not a string. A `file://` URL on another host is kept as the
+    URL: it is not an absolute path, so it names no place on this machine and never pairs."""
     if not isinstance(value, str):
         return None
-    return unquote(urlsplit(value).path) if value.startswith("file://") else value
+    if not value.startswith("file://"):
+        return value
+    url = urlsplit(value)
+    return unquote(url.path) if url.netloc.lower() in ("", "localhost") else value
 
 
 def command_text(command: object) -> str | None:
