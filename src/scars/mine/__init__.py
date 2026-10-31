@@ -450,6 +450,8 @@ def _run(
         found.extend(result.pairs)
         still_open.extend(result.still_open)
         counts["failures"] += result.failures
+        if result.operand_mismatch:
+            skipped["operand_mismatch"] += result.operand_mismatch
     rows = [_mined_row(c) for c in new_calls]
     recent = [_recorded(r) for r in stored]
     recent += [_recorded(r) for r in rows if r.at >= since]
