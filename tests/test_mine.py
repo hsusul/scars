@@ -1028,7 +1028,7 @@ def test_no_distinguishing_argument_means_no_pre_trigger_and_the_full_avoid(env)
 
 
 def test_a_candidate_over_the_repair_budget_is_dropped(env):
-    fix = "pytest " + " ".join(f"tests/unit/test_mod{i}.py" for i in range(8))
+    fix = "pytest " + " ".join(f"tests/unit/test_mod{i}.py" for i in range(9))
     t = Claude(env["repo"]).bash("t1", fix + " --frobnicate", FAIL_TEXT).bash("t2", fix)
     write(env, "s1", t.text())
     summary = mine_now(env)
@@ -1088,7 +1088,7 @@ def test_a_failure_and_its_fix_in_two_directories_of_one_repo_pair(env):
     assert (summary.pairs, summary.provisionalized) == (1, 1)
 
 
-MINED_WHY = "failed, then the INSTEAD command passed"
+MINED_WHY = "AVOID failed, INSTEAD passed"
 
 
 def test_a_mined_why_is_the_fixed_template_never_the_error_text(env):

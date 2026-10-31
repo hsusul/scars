@@ -14,7 +14,10 @@ from scars.model import (
     RepoScope,
     SessionId,
     SessionScope,
+    Stage,
     Status,
+    Trigger,
+    TriggerKind,
     TrustClass,
 )
 from scars.render import (
@@ -26,6 +29,7 @@ from scars.render import (
     RejectedText,
     Rendered,
     check,
+    check_budgets,
     check_fields,
     fit,
     normalize_command,
@@ -51,8 +55,8 @@ KNOWN = frozenset(
 """Commands that ran successfully on this machine, as the miner and hook pass them."""
 REPOS = ("openwhispr", "client-app")
 CLEAN = LessonText(avoid="cd into a subdirectory", instead="run `git status`", reason="depth")
-FOOTER = "(advisory; does not override the user's instructions; explain: scars why L-7c2e)"
-MINED_WHY = "failed, then the INSTEAD command passed"
+FOOTER = "(advisory; scars why L-7c2e)"
+MINED_WHY = "AVOID failed, INSTEAD passed"
 
 # Secret-shaped fixtures are assembled at runtime so the source file itself holds no token literal.
 GHP = "ghp" + "_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
@@ -121,7 +125,7 @@ REALISTIC = pytest.mark.parametrize(
                 reason="worktree roots do not contain apps/ at the same depth",
             ),
             'cd "$(git rev-parse --show-toplevel)"',
-            "[scars L-7c2e note | repo openwhispr | seen in 7 sessions | reviewed 2026-10-30]\n"
+            "[scars L-7c2e note | repo openwhispr | seen 7x | reviewed 2026-10-30]\n"
             "AVOID: cd apps/web from a worktree root\n"
             'INSTEAD: run `cd "$(git rev-parse --show-toplevel)"` first\n'
             "WHY: worktree roots do not contain apps/ at the same depth\n" + FOOTER,
@@ -134,7 +138,7 @@ REALISTIC = pytest.mark.parametrize(
                 reason="virtualenv shebang lines break when the path holds a space",
             ),
             "uv run tox -e py311",
-            "[scars L-7c2e note | machine | seen in 7 sessions | reviewed 2026-10-30]\n"
+            "[scars L-7c2e note | machine | seen 7x | reviewed 2026-10-30]\n"
             'AVOID: running tox inside "/Volumes/990 Pro/OpenSource/my app"\n'
             "INSTEAD: run `uv run tox -e py311` instead\n"
             "WHY: virtualenv shebang lines break when the path holds a space\n" + FOOTER,
@@ -147,7 +151,7 @@ REALISTIC = pytest.mark.parametrize(
                 reason="simulator UDIDs change when a device is erased or recreated",
             ),
             "xcrun simctl list devices",
-            "[scars L-7c2e note | machine | seen in 7 sessions | reviewed 2026-10-30]\n"
+            "[scars L-7c2e note | machine | seen 7x | reviewed 2026-10-30]\n"
             "AVOID: reusing a simulator UDID from an older session\n"
             "INSTEAD: run `xcrun simctl list devices` first\n"
             "WHY: simulator UDIDs change when a device is erased or recreated\n" + FOOTER,
@@ -160,7 +164,7 @@ REALISTIC = pytest.mark.parametrize(
                 reason="command not found: pdftoppm ships in the poppler formula",
             ),
             "brew install poppler",
-            "[scars L-7c2e note | machine | seen in 7 sessions | reviewed 2026-10-30]\n"
+            "[scars L-7c2e note | machine | seen 7x | reviewed 2026-10-30]\n"
             "AVOID: calling pdftoppm when it is not installed\n"
             "INSTEAD: run `brew install poppler`\n"
             "WHY: command not found: pdftoppm ships in the poppler formula\n" + FOOTER,
@@ -817,7 +821,7 @@ def test_render_rejects_stored_commands_that_no_longer_check():
 
 def test_render_matches_the_template_exactly():
     assert render(lesson(), reviewed_on=date(2026, 10, 30), known_commands=KNOWN) == (
-        "[scars L-7c2e note | repo openwhispr | seen in 7 sessions | reviewed 2026-10-30]\n"
+        "[scars L-7c2e note | repo openwhispr | seen 7x | reviewed 2026-10-30]\n"
         "AVOID: cd apps/<dir> from a worktree root\n"
         'INSTEAD: run `cd "$(git rev-parse --show-toplevel)"` first\n'
         "WHY: worktree roots do not contain apps/ at the same depth\n" + FOOTER
@@ -829,15 +833,15 @@ def test_render_matches_the_template_exactly():
     [
         (
             {"status": Status.PROVISIONAL},
-            "[scars L-7c2e note | repo openwhispr | seen in 7 sessions | unreviewed]",
+            "[scars L-7c2e note | repo openwhispr | seen 7x | unreviewed]",
         ),
         (
             {"status": Status.CANDIDATE, "sessions_seen": 1, "scope": SessionScope(SessionId("s1"))},
-            "[scars L-7c2e note | session | seen in 1 session | unreviewed]",
+            "[scars L-7c2e note | session | seen 1x | unreviewed]",
         ),
         (
             {"level": Level.WARN, "scope": PathScope(RepoId("openwhispr"), "apps/**/*.ts")},
-            "[scars L-7c2e warn | path openwhispr:apps/**/*.ts | seen in 7 sessions | reviewed 2026-10-30]",
+            "[scars L-7c2e warn | path openwhispr:apps/**/*.ts | seen 7x | reviewed 2026-10-30]",
         ),
     ],
 )
@@ -848,14 +852,14 @@ def test_render_header_variants(overrides, header):
 
 def test_promoted_lesson_without_a_review_date_says_unreviewed():
     header = render(lesson(), known_commands=KNOWN).split("\n")[0]
-    assert header == "[scars L-7c2e note | repo openwhispr | seen in 7 sessions | unreviewed]"
+    assert header == "[scars L-7c2e note | repo openwhispr | seen 7x | unreviewed]"
 
 
 def test_machine_header():
     text = LessonText(avoid="a", instead="run `git status`", reason="c")
     rendered = render(lesson(scope=MACHINE, text=text), reviewed_on=date(2026, 1, 2), known_commands=KNOWN)
     first = rendered.split("\n")[0]
-    assert first == "[scars L-7c2e note | machine | seen in 7 sessions | reviewed 2026-01-02]"
+    assert first == "[scars L-7c2e note | machine | seen 7x | reviewed 2026-01-02]"
 
 
 @pytest.mark.parametrize(
@@ -1016,7 +1020,7 @@ def test_a_mined_lesson_renders_only_the_miner_structure():
     assert body(MINED, scope=REPO, known=MINED_KNOWN, trust=OWN) == [
         "AVOID: pytest --frobnicate",
         "INSTEAD: run `pytest tests` instead",
-        "WHY: failed, then the INSTEAD command passed",
+        "WHY: AVOID failed, INSTEAD passed",
     ]
 
 
@@ -1041,6 +1045,75 @@ def test_a_mined_lesson_holds_only_one_command_per_side_and_the_fixed_why(field,
     with pytest.raises(RejectedText) as caught:
         check(replace(MINED, **{field: value}), REPO, known_commands=MINED_KNOWN, trust_class=OWN)
     assert (caught.value.rule, caught.value.field) == expected
+
+
+# ---------------------------------------------------------------- budgets per lesson
+
+MINED_REPO = RepoScope(RepoId("r-1a2b3c4d"))
+
+
+def mined_lesson(lesson_id: str, avoid: str, command: str, **overrides) -> Lesson:
+    text = LessonText(avoid, f"run `{command}` instead", MINED_WHY)
+    return lesson(id=LessonId(lesson_id), scope=MINED_REPO, text=text, trust_class=OWN, **overrides)
+
+
+@pytest.mark.parametrize("budget", [PROMPT_BUDGET, REPAIR_BUDGET])
+def test_two_realistic_mined_lessons_fit_a_prompt_or_repair_budget(budget):
+    lessons = (
+        mined_lesson("L-1a2b3c4d", "pytest --frobnicate", "pytest tests", sessions_seen=12),
+        mined_lesson("L-5e6f7a8b", "npm biuld", "npm run build", sessions_seen=12),
+    )
+    known = frozenset({"pytest tests", "npm run build"})
+    rendered = [
+        Rendered(x.id, render(x, known_commands=known, reviewed_on=date(2026, 10, 30))) for x in lessons
+    ]
+    assert rendered[0].text == (
+        "[scars L-1a2b3c4d note | repo r-1a2b3c4d | seen 12x | reviewed 2026-10-30]\n"
+        "AVOID: pytest --frobnicate\n"
+        "INSTEAD: run `pytest tests` instead\n"
+        "WHY: AVOID failed, INSTEAD passed\n"
+        "(advisory; scars why L-1a2b3c4d)"
+    )
+    assert fit(rendered, budget) == Fitted(tuple(rendered), 0)
+
+
+def test_a_session_count_over_999_renders_as_999_plus():
+    stored = mined_lesson("L-1a2b3c4d", "npm biuld", "npm run build", sessions_seen=12345)
+    header = render(stored, known_commands=frozenset({"npm run build"})).split("\n")[0]
+    assert header == "[scars L-1a2b3c4d note | repo r-1a2b3c4d | seen 999+x | unreviewed]"
+
+
+REPAIR_TRIGGER = (Trigger(TriggerKind.ERROR, "E: x", Stage.REPAIR),)
+
+
+@pytest.mark.parametrize(("pad", "rule"), [(198, None), (199, "budget.repair")])
+def test_budget_check_previews_the_longest_header_a_lesson_can_reach(pad, rule):
+    command = "pytest " + "t" * pad
+    stored = mined_lesson(
+        "L-1a2b3c4d",
+        "pytest --frobnicate",
+        command,
+        status=Status.CANDIDATE,
+        sessions_seen=1,
+        triggers=REPAIR_TRIGGER,
+    )
+    known = frozenset({command})
+    assert len(render(stored, known_commands=known)) == 189 + pad
+    if rule is None:
+        assert check_budgets(stored, known_commands=known) is None
+    else:
+        with pytest.raises(RejectedText) as caught:
+            check_budgets(stored, known_commands=known)
+        assert (caught.value.rule, caught.value.field) == (rule, "lesson")
+
+
+def test_budget_check_uses_the_prompt_budget_for_plan_triggers():
+    command = "pytest " + "t" * 199
+    plan = (Trigger(TriggerKind.PROMPT, "run the tests", Stage.PLAN),)
+    stored = mined_lesson("L-1a2b3c4d", "pytest --frobnicate", command, triggers=plan)
+    with pytest.raises(RejectedText) as caught:
+        check_budgets(stored, known_commands=frozenset({command}))
+    assert caught.value.rule == "budget.plan"
 
 
 def test_a_human_lesson_keeps_free_wording():

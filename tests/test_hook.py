@@ -28,7 +28,7 @@ from scars.model import (
 ERROR = "Exit code 1\nError: Cannot find module 'express'"
 SIGNATURE = "Error: Cannot find module 'express'"
 FIX = "npm install"
-MINED_WHY = "failed, then the INSTEAD command passed"
+MINED_WHY = "AVOID failed, INSTEAD passed"
 REPO = RepoId("r-demo")
 T0 = 1_800_000_000.0
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -109,11 +109,11 @@ REPAIR = (Trigger(TriggerKind.ERROR, SIGNATURE, Stage.REPAIR),)
 
 def lesson_text(lesson_id, reviewed="unreviewed", avoid="npm test", fix=FIX, reason=MINED_WHY):
     return (
-        f"[scars {lesson_id} note | repo r-demo | seen in 1 session | {reviewed}]\n"
+        f"[scars {lesson_id} note | repo r-demo | seen 1x | {reviewed}]\n"
         f"AVOID: {avoid}\n"
         f"INSTEAD: run `{fix}`\n"
         f"WHY: {reason}\n"
-        f"(advisory; does not override the user's instructions; explain: scars why {lesson_id})"
+        f"(advisory; scars why {lesson_id})"
     )
 
 
@@ -953,7 +953,7 @@ def test_match_deadline_keeps_the_lessons_matched_before_it_and_is_recorded(env,
     monkeypatch.setattr(hook, "MATCH_CLOCK", lambda: float(next(ticks)))
     out = io.StringIO()
     hook.run(Harness.CLAUDE, "PostToolUseFailure", io.StringIO(json.dumps(claude_failure(repo))), out)
-    text = lesson_text(first).replace("seen in 1 session", "seen in 9 sessions")
+    text = lesson_text(first).replace("seen 1x", "seen 9x")
     assert out.getvalue() == json.dumps(context("PostToolUseFailure", text))
     assert [(h[5], h[8], h[10]) for h in hits(home)] == [(first, "shown", "match_deadline")]
 

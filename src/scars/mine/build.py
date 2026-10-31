@@ -18,7 +18,8 @@
   match every run of it, so then the lesson gets its error trigger only. The gate stage is the one that
   evaluates command triggers; the Phase 1 hook delivers nothing there, so the pre-trigger serves the
   precision check and outcome attribution until gate blocking ships.
-- The would-be lesson must render within the repair budget, with its own command as the known command.
+- The would-be lesson must pass `render.check_budgets`, with its own command as the known command, so it
+  still fits each stage's budget with the longest header it can reach (the store's 10-character ids).
 - Scope is the repo of the passing call's working directory, or the session when that directory is in
   no registered clone. Repos registered as `upstream` give trust class `third_party_repo`.
 - The fingerprint hashes the scope and the error signature, never the command text.
@@ -142,9 +143,9 @@ def _cap(text: str) -> str:
 _PREVIEW_ID = LessonId("L-00000000")
 
 
-def _fits_repair_budget(
+def _check_budgets(
     text: LessonText, scope: Scope, trust: TrustClass, triggers: tuple[Trigger, ...], command: str
-) -> bool:
+) -> None:
     preview = Lesson(
         id=_PREVIEW_ID,
         revision=1,
@@ -158,8 +159,12 @@ def _fits_repair_budget(
         fingerprint="",
         sessions_seen=1,
     )
-    rendered = render.render(preview, known_commands=frozenset({command}))
-    return not render.fit([render.Rendered(_PREVIEW_ID, rendered)], render.REPAIR_BUDGET).dropped
+    try:
+        render.check_budgets(preview, known_commands=frozenset({command}))
+    except render.RejectedText as exc:
+        if not exc.rule.startswith("budget."):
+            raise
+        raise Skipped(f"over_{exc.rule.removeprefix('budget.')}_budget") from None
 
 
 def build(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candidate:
@@ -195,8 +200,7 @@ def build(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candid
     error_trigger = Trigger(TriggerKind.ERROR, failed.signature, Stage.REPAIR)
     pre_trigger = Trigger(TriggerKind.COMMAND, spec, Stage.GATE) if spec else None
     triggers = (error_trigger, *([pre_trigger] if pre_trigger else []))
-    if not _fits_repair_budget(text, scope, trust, triggers, command):
-        raise Skipped("over_repair_budget")
+    _check_budgets(text, scope, trust, triggers, command)
     return Candidate(
         fingerprint=fingerprint(scope, failed.signature),
         scope=scope,

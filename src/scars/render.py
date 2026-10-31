@@ -37,7 +37,7 @@ import re
 import shlex
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 
 from scars.model import (
@@ -45,11 +45,13 @@ from scars.model import (
     Lesson,
     LessonId,
     LessonText,
+    Level,
     MachineScope,
     PathScope,
     RepoScope,
     Scope,
     SessionScope,
+    Stage,
     Status,
     TrustClass,
 )
@@ -548,7 +550,7 @@ def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[s
 
 # ---------------------------------------------------------------- mined structure
 
-MINED_REASON = "failed, then the INSTEAD command passed"
+MINED_REASON = "AVOID failed, INSTEAD passed"
 
 
 def plain_command(command: str) -> SimpleCommand | None:
@@ -699,9 +701,15 @@ def _header(lesson: Lesson, reviewed_on: date | None) -> str:
         if lesson.status is Status.PROMOTED and reviewed_on is not None
         else "unreviewed"
     )
-    sessions = "1 session" if lesson.sessions_seen == 1 else f"{lesson.sessions_seen} sessions"
+    seen = (
+        f"{lesson.sessions_seen}" if lesson.sessions_seen <= MAX_SHOWN_SESSIONS else f"{MAX_SHOWN_SESSIONS}+"
+    )
     label = scope_label(lesson.scope)
-    return f"{HEADER_PREFIX}{lesson.id} {lesson.level} | {label} | seen in {sessions} | {reviewed}]"
+    return f"{HEADER_PREFIX}{lesson.id} {lesson.level} | {label} | seen {seen}x | {reviewed}]"
+
+
+MAX_SHOWN_SESSIONS = 999
+"""Higher counts show as `999+`, so the header has a longest form for budget checks to preview."""
 
 
 def _recheck(lesson: Lesson, known_commands: frozenset[str], registered_repos: Sequence[str]) -> None:
@@ -738,7 +746,7 @@ def render(
             f"AVOID: {lesson.text.avoid}",
             f"INSTEAD: {lesson.text.instead}",
             f"WHY: {lesson.text.reason}",
-            f"(advisory; does not override the user's instructions; explain: scars why {lesson.id})",
+            f"(advisory; scars why {lesson.id})",
         )
     )
 
@@ -796,6 +804,40 @@ def fit(rendered: Sequence[Rendered], budget: Budget) -> Fitted:
             kept.append(item)
             used += cost
     return Fitted(tuple(kept), len(rendered) - len(kept))
+
+
+STAGE_BUDGETS = {Stage.PLAN: PROMPT_BUDGET, Stage.REPAIR: REPAIR_BUDGET}
+"""The budget a lesson must fit alone at each stage it is delivered at. The gate stage has none:
+`render_deny` always fits `DENY_CAP` by dropping fields."""
+_LONGEST_LEVEL = max(Level, key=lambda level: len(level.value))
+_LONGEST_REVIEW = date(9999, 12, 31)
+
+
+def check_budgets(
+    lesson: Lesson,
+    *,
+    known_commands: frozenset[str],
+    registered_repos: Sequence[str] = (),
+) -> None:
+    """Raise `RejectedText` (`budget.<stage>`, field `lesson`) unless the lesson fits alone in the budget
+    of every stage its triggers deliver at, and in the session-start budget for when it is pinned.
+
+    The lesson renders with the longest header it can reach (promoted with a review date, the longest
+    level, a session count shown as `999+`), so a lesson that fits when written never stops rendering
+    after a later promotion or sighting. Call it on every path that writes lesson text or triggers. Every
+    `check` rule runs too, and its own `RejectedText` propagates.
+    """
+    longest = replace(
+        lesson, status=Status.PROMOTED, level=_LONGEST_LEVEL, sessions_seen=MAX_SHOWN_SESSIONS + 1
+    )
+    text = render(
+        longest, known_commands=known_commands, reviewed_on=_LONGEST_REVIEW, registered_repos=registered_repos
+    )
+    stages = sorted({t.stage for t in lesson.triggers if t.stage in STAGE_BUDGETS})
+    budgets = [(str(stage), STAGE_BUDGETS[stage]) for stage in stages]
+    for name, budget in [*budgets, ("session_start", SESSION_START_BUDGET)]:
+        if len(text) > budget.chars:
+            raise RejectedText(f"budget.{name}", "lesson")
 
 
 def render_deny(
