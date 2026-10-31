@@ -3,27 +3,27 @@
     {
       "name": "Bash",
       "stdin": {"session_id": "abc123", "prompt_id": "550e8400-e29b-41d4-a716-446655440000", "transcript_path": "/t.jsonl", "cwd": "/home/user/my-project", "permission_mode": "default", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "npm test", "description": "Run test suite", "timeout": 120000, "run_in_background": false}, "tool_use_id": "toolu_01ABC123"},
-      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_01ABC123", "cwd": "/home/user/my-project", "tool_kind": "shell", "command": "npm test", "paths": [], "error_text": null, "prompt": null, "model_id": null}
+      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_01ABC123", "cwd": "/home/user/my-project", "tool_kind": "shell", "command": "npm test", "paths": [], "error_text": null, "prompt": null, "model_id": null, "tool_name": "Bash"}
     },
     {
       "name": "Write",
       "stdin": {"session_id": "abc123", "cwd": "/home/user/my-project", "hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {"file_path": "/home/user/my-project/src/index.ts", "content": "..."}, "tool_use_id": "toolu_02"},
-      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_02", "cwd": "/home/user/my-project", "tool_kind": "edit", "command": null, "paths": ["/home/user/my-project/src/index.ts"], "error_text": null, "prompt": null, "model_id": null}
+      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_02", "cwd": "/home/user/my-project", "tool_kind": "edit", "command": null, "paths": ["/home/user/my-project/src/index.ts"], "error_text": null, "prompt": null, "model_id": null, "tool_name": "Write"}
     },
     {
       "name": "Edit",
       "stdin": {"session_id": "abc123", "cwd": "/p", "hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_input": {"file_path": "/p/a.py", "old_string": "a", "new_string": "b"}, "tool_use_id": "toolu_03"},
-      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_03", "cwd": "/p", "tool_kind": "edit", "command": null, "paths": ["/p/a.py"], "error_text": null, "prompt": null, "model_id": null}
+      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_03", "cwd": "/p", "tool_kind": "edit", "command": null, "paths": ["/p/a.py"], "error_text": null, "prompt": null, "model_id": null, "tool_name": "Edit"}
     },
     {
       "name": "MultiEdit",
       "stdin": {"session_id": "abc123", "cwd": "/p", "hook_event_name": "PreToolUse", "tool_name": "MultiEdit", "tool_input": {"file_path": "/p/b.py", "edits": []}, "tool_use_id": "toolu_04"},
-      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_04", "cwd": "/p", "tool_kind": "edit", "command": null, "paths": ["/p/b.py"], "error_text": null, "prompt": null, "model_id": null}
+      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_04", "cwd": "/p", "tool_kind": "edit", "command": null, "paths": ["/p/b.py"], "error_text": null, "prompt": null, "model_id": null, "tool_name": "MultiEdit"}
     },
     {
       "name": "another tool",
       "stdin": {"session_id": "abc123", "cwd": "/p", "hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": "/p/b.py"}, "tool_use_id": "toolu_05"},
-      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_05", "cwd": "/p", "tool_kind": "other", "command": null, "paths": [], "error_text": null, "prompt": null, "model_id": null}
+      "event": {"harness": "claude", "harness_version": "", "event": "pre_tool", "session_id": "abc123", "tool_use_id": "toolu_05", "cwd": "/p", "tool_kind": "other", "command": null, "paths": [], "error_text": null, "prompt": null, "model_id": null, "tool_name": "Read"}
     },
     {
       "name": "Bash without a command",

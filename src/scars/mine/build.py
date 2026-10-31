@@ -22,6 +22,23 @@
 - Scope is the repo of the passing call's working directory, or the session when that directory is in
   no registered clone. Repos registered as `upstream` give trust class `third_party_repo`.
 - The fingerprint hashes the scope and the error signature, never the command text.
+
+A pair of non-shell tool calls (built-in or MCP) yields a structured tool lesson instead (see
+`render.FieldChange` for its one shape):
+
+- Both inputs must be JSON objects differing in 1 or 2 top-level fields; identical inputs are an
+  `identical_retry`. Each differing field needs a plain key and, on each side that has it, a value
+  `render.tool_value` accepts: a JSON scalar (an object or array is `structured_value_not_scalar`), with a
+  string of at most `render.TOOL_VALUE_CAP` printable ASCII characters and no newline. So prompts and
+  prose never become a lesson.
+- A secret-named key (`api_key`, `auth_token`) anywhere at the top level of either input rejects the pair
+  as `secret.keyed_field`, so no part of such an input is stored.
+- `reason` is `render.MINED_REASON`, the observation's passing input is the `instead` text (so the hook's
+  known commands contain it), and the failed input is stored as recorded, capped at 1 KB.
+- The only trigger is the error trigger at the repair stage, spelled `signature.tool_signature`, so it
+  fires when the same tool fails with the same signature.
+- The fingerprint adds the tool and the differing keys to the scope and signature, so two lessons for
+  one tool and error that change different fields stay apart.
 """
 
 import hashlib
@@ -30,7 +47,7 @@ from dataclasses import dataclass
 
 from scars import render
 from scars.match import InvalidTrigger, parse_spec
-from scars.mine.pairs import Pair
+from scars.mine.pairs import Pair, differing_keys, input_object
 from scars.model import (
     ErrorSignature,
     Lesson,
@@ -50,7 +67,7 @@ from scars.model import (
     TrustClass,
 )
 from scars.shell import SimpleCommand, Unsupported, parse
-from scars.signature import HEADER_PREFIX
+from scars.signature import HEADER_PREFIX, tool_signature
 
 INSTEAD_TEMPLATE = render.INSTEAD_TEMPLATES[2]
 OBSERVATION_CAP = 1024
@@ -80,10 +97,12 @@ class Candidate:
     passing input is the normalized command quoted in `instead`, never cut."""
 
 
-def fingerprint(scope: Scope, sig: str) -> str:
+def fingerprint(scope: Scope, sig: str, tool: str = "", keys: tuple[str, ...] = ()) -> str:
     repo_id = scope.repo_id if isinstance(scope, RepoScope) else ""
     session_id = scope.session_id if isinstance(scope, SessionScope) else ""
-    parts = (scope.kind, repo_id, "", session_id, sig)
+    parts: tuple[str, ...] = (scope.kind, repo_id, "", session_id, sig)
+    if tool:
+        parts += ("tool", tool, ",".join(keys))
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()
 
 
@@ -175,9 +194,86 @@ def _check_budgets(
         raise Skipped(f"over_{exc.rule.removeprefix('budget.')}_budget") from None
 
 
+def _changes(failed: dict[str, object], passing: dict[str, object]) -> tuple[render.FieldChange, ...]:
+    for side, values in (("failed_input", failed), ("passing_input", passing)):
+        if any(render.secret_name(key) for key in values):
+            raise render.RejectedText("secret.keyed_field", side)
+    keys = differing_keys(failed, passing)
+    if not keys:
+        raise Skipped("identical_retry")
+    if len(keys) > render.TOOL_MAX_FIELDS:
+        raise Skipped("structured_too_many_fields")
+    changes = []
+    for key in keys:
+        if not render.field_key_ok(key):
+            raise Skipped("structured_key_not_plain")
+        sides = [values[key] for values in (failed, passing) if key in values]
+        for value in sides:
+            if isinstance(value, dict | list):
+                raise Skipped("structured_value_not_scalar")
+            if isinstance(value, str) and ("\n" in value or "\r" in value):
+                raise Skipped("structured_value_multiline")
+            if isinstance(value, str) and len(value) > render.TOOL_VALUE_CAP:
+                raise Skipped("structured_value_too_long")
+            if render.tool_value(value) is None:
+                raise Skipped("structured_value_not_printable")
+        changes.append(
+            render.FieldChange(
+                key,
+                render.tool_value(failed[key]) if key in failed else None,
+                render.tool_value(passing[key]) if key in passing else None,
+            )
+        )
+    return tuple(changes)
+
+
+def _build_tool(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candidate:
+    failed, passing = pair.failed, pair.passing
+    if HEADER_PREFIX in failed.input.lower() or HEADER_PREFIX in passing.input.lower():
+        raise Skipped("scars_header")
+    if not render.tool_name_ok(passing.tool):
+        raise Skipped("structured_tool_name")
+    failed_fields, passing_fields = input_object(failed.input), input_object(passing.input)
+    if failed_fields is None or passing_fields is None:
+        raise Skipped("structured_not_object")
+    changes = _changes(failed_fields, passing_fields)
+    avoid, instead = render.tool_text(passing.tool, changes)
+    scope: Scope = RepoScope(repo_id) if repo_id else SessionScope(SessionId(failed.session_id))
+    trust = TrustClass.THIRD_PARTY_REPO if owner_class == "upstream" else TrustClass.OWN_CODE
+    text = render.check_fields(
+        avoid, instead, render.MINED_REASON, scope, known_commands=frozenset({instead}), trust_class=trust
+    )
+    inputs = (("failed_input", failed.input), ("passing_input", passing.input), ("reason", failed.signature))
+    for field, value in inputs:
+        if (rule := secret_rule(value)) is not None:
+            raise render.RejectedText(rule, field)
+    spec = tool_signature(passing.tool, failed.signature)
+    try:
+        parse_spec(TriggerKind.ERROR, spec)
+    except InvalidTrigger:
+        raise Skipped("invalid_error_trigger") from None
+    error_trigger = Trigger(TriggerKind.ERROR, spec, Stage.REPAIR)
+    _check_budgets(text, scope, trust, (error_trigger,), instead)
+    keys = tuple(c.key for c in changes)
+    return Candidate(
+        fingerprint=fingerprint(scope, failed.signature, passing.tool, keys),
+        scope=scope,
+        trust_class=trust,
+        text=text,
+        error_trigger=error_trigger,
+        pre_trigger=None,
+        fix_program=passing.tool,
+        signature=failed.signature,
+        failed_input=_cap(failed.input),
+        passing_input=instead,
+    )
+
+
 def build(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candidate:
     """Raise `Skipped` or `render.RejectedText`, or return a checked candidate."""
     failed, passing = pair.failed, pair.passing
+    if passing.tool_kind is ToolKind.OTHER:
+        return _build_tool(pair, repo_id, owner_class)
     if passing.tool_kind is not ToolKind.SHELL or passing.command is None:
         raise Skipped("non_shell_tool")
     failed_cmd, passing_cmd = _plain(failed.input), _plain(passing.input)

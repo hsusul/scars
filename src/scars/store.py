@@ -895,14 +895,16 @@ def active_for_stage(
     pinned_only: bool,
     trigger_kinds: Iterable[TriggerKind] | None,
     error_signature: str | None = None,
+    tool_error_signature: str | None = None,
 ) -> list[Lesson]:
     """`active_for_hook`, narrowed in SQL to lessons that can fire at one stage, so the hook builds no
     others.
 
     With `pinned_only`, only pinned lessons. With `trigger_kinds`, only lessons with a trigger of one of
     those kinds at `stage`; with `error_signature` too, an `error` trigger counts only when its spec is
-    exactly that signature, which is the only way an error trigger fires. Each lesson keeps all its
-    triggers. With `trigger_kinds` None the stage selects without triggers, so no trigger is required.
+    exactly that signature or `tool_error_signature`, which is the only way an error trigger fires. Each
+    lesson keeps all its triggers. With `trigger_kinds` None the stage selects without triggers, so no
+    trigger is required.
     """
     where = f"({ACTIVE_FOR_HOOK_WHERE})"
     params: list[object] = [repo_id]
@@ -913,8 +915,8 @@ def active_for_stage(
         fires = f"t.stage = ? and t.kind in ({','.join('?' * len(kinds))})"
         params += [stage.value, *kinds]
         if error_signature is not None:
-            fires += " and (t.kind <> 'error' or t.spec = ?)"
-            params.append(error_signature)
+            fires += " and (t.kind <> 'error' or t.spec in (?, ?))"
+            params += [error_signature, tool_error_signature or error_signature]
         where += f" and exists (select 1 from triggers t where t.lesson_id = lessons.id and {fires})"
     return _load(db, where, params)
 

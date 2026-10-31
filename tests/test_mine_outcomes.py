@@ -118,3 +118,17 @@ def test_a_redirection_with_no_program_does_not_match_a_null_command_trigger():
 
 def test_plan_hit_ignores_matching_calls_before_the_hit():
     assert decide(PLAN, FACTS, [failing(0), shell(1)], True) is DelayedOutcome.NO_ATTEMPT
+
+
+def sim(i: int, tool: str = "mcp__Claude_Code_iOS_Simulator__control", status: str = "failed") -> MinedCall:
+    sig = "No simulator with UDID <uuid>." if status == "failed" else None
+    return MinedCall(f"c{i}", "claude", "s", T0 + i, tool, "other", None, (), status, sig, "/r", None)
+
+
+def test_a_tool_lesson_counts_only_failures_of_its_own_tool():
+    facts = LessonFacts("[tool mcp__Claude_Code_iOS_Simulator__control] No simulator with UDID <uuid>.", ())
+    closed = [read(2), read(3), read(4), read(5), read(6)]
+    assert decide(REPAIR, facts, [sim(0), sim(1), *closed], False) is DelayedOutcome.IGNORED_THEN_FAILED
+    other = sim(1, tool="mcp__other__control")
+    assert decide(REPAIR, facts, [sim(0), other, *closed], False) is DelayedOutcome.UNKNOWN
+    assert decide(REPAIR, facts, [sim(0), sim(1, status="ok"), *closed], False) is DelayedOutcome.HEEDED

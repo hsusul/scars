@@ -27,12 +27,16 @@ roots only) rather than a list of bad phrases.
    parsed calls, never transcript prose. `avoid` is one plain command and the command in `instead` is
    another with the same program, each written as `shlex.join` of its words (see `plain_command`), and
    `reason` is exactly `MINED_REASON`. The agent already sees its own error at the repair stage, so the
-   error text adds nothing a lesson needs and is the one field an attacker fully controls.
+   error text adds nothing a lesson needs and is the one field an attacker fully controls. A mined lesson
+   about a non-shell tool takes the one other shape `tool_text` writes instead (see `FieldChange`): it is
+   recognized when `instead` has no backtick and reads as field changes, and it must then read back to
+   exactly the same text.
 
 Rejection messages name the field and the rule, never the matched text, so a secret or a private repo
 name cannot leak through an error message or a log line.
 """
 
+import json
 import math
 import re
 import shlex
@@ -325,6 +329,22 @@ def _template_pattern(template: str) -> str:
 _INSTEAD_SHAPE = re.compile("|".join(f"(?:{_template_pattern(t)})" for t in INSTEAD_TEMPLATES))
 _CODE_SPAN = re.compile(r"`|<\s*/?\s*(?:code|pre|kbd)\b|\$\(", re.IGNORECASE)
 """A backtick, an HTML `code`, `pre` or `kbd` tag (opening or closing, any case), or `$(`."""
+
+
+def _check_tool_shape(values: Mapping[str, str], known_commands: frozenset[str]) -> None:
+    """The structural rules for a structured tool lesson: no code span in any field, both fields read
+    back as the same field changes, and `instead` is one this machine observed as written."""
+    for field in FIELDS:
+        if _CODE_SPAN.search(values[field]):
+            raise RejectedText("lint.code_span_outside_instead", field)
+    parsed = parse_tool_text(values["avoid"], values["instead"])
+    if parsed is None:
+        raise RejectedText("mined.tool_avoid_shape", "avoid")
+    tool, changes = parsed
+    if not _consistent(changes) or tool_text(tool, changes) != (values["avoid"], values["instead"]):
+        raise RejectedText("mined.tool_fields_mismatch", "instead")
+    if values["instead"] not in known_commands:
+        raise RejectedText("mined.tool_unobserved", "instead")
 
 
 def _check_instead_command(instead: str, known_commands: frozenset[str], trust_class: TrustClass) -> None:
@@ -659,6 +679,172 @@ def _check_mined(values: Mapping[str, str]) -> None:
         raise RejectedText("mined.reason_template", "reason")
 
 
+# ---------------------------------------------------------------- structured tool lessons
+
+TOOL_VALUE_CAP = 100
+"""The longest string value a structured tool lesson may name; longer ones are prose, not a setting."""
+TOOL_MAX_FIELDS = 2
+_TOOL_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,127}")
+_FIELD_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
+_JSON = json.JSONDecoder()
+
+
+@dataclass(frozen=True)
+class FieldChange:
+    """One top-level input field that differs between a failed non-shell tool call and its fix.
+
+    `failed` and `passing` are the field's value as compact JSON, or None when that call has no such
+    field. Values are JSON scalars (string, number, boolean, null); a string holds only printable ASCII
+    and at most `TOOL_VALUE_CAP` characters (`tool_value` builds them).
+
+    The lesson text is `tool_text(tool, changes)`, sorted by key, at most `TOOL_MAX_FIELDS` changes:
+    `avoid` is `<tool> with <k>=<v>` per change (`<k> missing` when the failed call had no such field),
+    joined by `, `; `instead` is `<k>=<v>` for a changed value, `add <k>=<v>` for an added field and
+    `omit <k>` for a removed one, joined by `, `.
+    """
+
+    key: str
+    failed: str | None
+    passing: str | None
+
+
+def tool_value(value: object) -> str | None:
+    """`value` as compact JSON when a structured tool lesson may name it, else None."""
+    if isinstance(value, str):
+        if len(value) > TOOL_VALUE_CAP or any(not 0x20 <= ord(ch) <= 0x7E for ch in value):
+            return None
+    elif value is not None and not isinstance(value, bool | int | float):
+        return None
+    try:
+        return json.dumps(value, allow_nan=False)
+    except ValueError:
+        return None
+
+
+def tool_name_ok(tool: str) -> bool:
+    return _TOOL_NAME.fullmatch(tool) is not None
+
+
+def field_key_ok(key: str) -> bool:
+    return _FIELD_KEY.fullmatch(key) is not None
+
+
+def secret_name(key: str) -> bool:
+    """Whether a field or option name says it holds a secret (`api_key`, `auth_token`)."""
+    return _SECRET_WORD.search(key) is not None
+
+
+def tool_text(tool: str, changes: Sequence[FieldChange]) -> tuple[str, str]:
+    """`avoid` and `instead` for a structured tool lesson, in the one shape `FieldChange` describes."""
+    avoid = ", ".join(f"{c.key}={c.failed}" if c.failed is not None else f"{c.key} missing" for c in changes)
+    instead = ", ".join(
+        f"omit {c.key}"
+        if c.passing is None
+        else f"add {c.key}={c.passing}"
+        if c.failed is None
+        else f"{c.key}={c.passing}"
+        for c in changes
+    )
+    return f"{tool} with {avoid}", instead
+
+
+def _value(text: str, pos: int) -> tuple[str, int] | None:
+    """The canonical JSON scalar at `pos` and where it ends, or None."""
+    try:
+        value, end = _JSON.raw_decode(text, pos)
+    except ValueError:
+        return None
+    raw = text[pos:end]
+    return (raw, end) if tool_value(value) == raw else None
+
+
+def _items(text: str, parse_one: Callable[[str, int], tuple[tuple[str, str | None, str], int] | None]):
+    items, pos = [], 0
+    while True:
+        item = parse_one(text, pos)
+        if item is None:
+            return None
+        items.append(item[0])
+        pos = item[1]
+        if pos == len(text):
+            return items
+        if not text.startswith(", ", pos) or len(items) >= TOOL_MAX_FIELDS:
+            return None
+        pos += 2
+
+
+def _avoid_item(text: str, pos: int):
+    key = _FIELD_KEY.match(text, pos)
+    if key is None:
+        return None
+    end = key.end()
+    if text.startswith(" missing", end):
+        return (key.group(), None, "missing"), end + len(" missing")
+    if not text.startswith("=", end) or (value := _value(text, end + 1)) is None:
+        return None
+    return (key.group(), value[0], "set"), value[1]
+
+
+def _instead_item(text: str, pos: int):
+    op = next((o for o in ("omit ", "add ") if text.startswith(o, pos)), "")
+    key = _FIELD_KEY.match(text, pos + len(op))
+    if key is None:
+        return None
+    end = key.end()
+    if op == "omit ":
+        return (key.group(), None, "omit"), end
+    if not text.startswith("=", end) or (value := _value(text, end + 1)) is None:
+        return None
+    return (key.group(), value[0], "add" if op else "set"), value[1]
+
+
+def parse_instead_fields(instead: str) -> list[tuple[str, str | None, str]] | None:
+    return _items(instead, _instead_item)
+
+
+def parse_tool_text(avoid: str, instead: str) -> tuple[str, tuple[FieldChange, ...]] | None:
+    """The tool and field changes `avoid` and `instead` spell, or None when either is not that shape.
+    Consistency between the two fields is `_consistent`'s job."""
+    tool = _TOOL_NAME.match(avoid)
+    if tool is None or not avoid.startswith(" with ", tool.end()):
+        return None
+    failed = _items(avoid[tool.end() + len(" with ") :], _avoid_item)
+    passing = parse_instead_fields(instead)
+    if failed is None or passing is None:
+        return None
+    if [k for k, _, _ in failed] != [k for k, _, _ in passing]:
+        return tool.group(), ()
+    changes = tuple(
+        FieldChange(key, failed_value, None if op == "omit" else passing_value)
+        for (key, failed_value, _), (_, passing_value, op) in zip(failed, passing, strict=True)
+    )
+    ops = tuple(op for _, _, op in passing)
+    return tool.group(), changes if all(_op_fits(c, op) for c, op in zip(changes, ops, strict=True)) else ()
+
+
+def _op_fits(change: FieldChange, op: str) -> bool:
+    if change.failed is None:
+        return op == "add"
+    return op == ("omit" if change.passing is None else "set")
+
+
+def _consistent(changes: Sequence[FieldChange]) -> bool:
+    keys = [c.key for c in changes]
+    return (
+        1 <= len(changes) <= TOOL_MAX_FIELDS
+        and keys == sorted(set(keys))
+        and all(c.failed != c.passing for c in changes)
+    )
+
+
+def _is_tool_shape(values: Mapping[str, str], trust_class: TrustClass) -> bool:
+    return (
+        trust_class is not TrustClass.HUMAN
+        and "`" not in values["instead"]
+        and parse_instead_fields(values["instead"]) is not None
+    )
+
+
 # ---------------------------------------------------------------- check
 
 
@@ -679,11 +865,17 @@ def _check_values(
 ) -> None:
     _run(SANITIZER_RULES, values)
     _run(IMPERATIVE_RULES, values)
-    _check_shape(values, known_commands, trust_class)
+    tool_shape = _is_tool_shape(values, trust_class)
+    if tool_shape:
+        _check_tool_shape(values, known_commands)
+    else:
+        _check_shape(values, known_commands, trust_class)
     _run(SECRET_RULES, values)
     if isinstance(scope, MachineScope):
         _check_machine_scope(values, registered_repos, writing and trust_class is TrustClass.HUMAN)
-    if trust_class is not TrustClass.HUMAN:
+    if tool_shape and values["reason"] != MINED_REASON:
+        raise RejectedText("mined.reason_template", "reason")
+    if not tool_shape and trust_class is not TrustClass.HUMAN:
         _check_mined(values)
 
 

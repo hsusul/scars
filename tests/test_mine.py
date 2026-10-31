@@ -1487,3 +1487,181 @@ def test_a_failure_skips_a_pass_on_another_target_and_pairs_with_the_later_fix(e
     summary = mine_now(env)
     assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 1, {"operand_mismatch": 1})
     assert the_lesson(env).text.instead == "run `sed -n -e 1,240p a` instead"
+
+
+# ---------------------------------------------------------------- structured tool lessons
+
+SIM_TOOL = "mcp__Claude_Code_iOS_Simulator__control"
+STALE = "D9C36E75-8409-4A69-9636-A6E35C689FBA"
+LIVE = "FDCC5BE5-85E9-4BFE-A6FA-17A6BFCBA89E"
+SIM_ERROR = (
+    f"No simulator with UDID {STALE}. Pass a real device, or omit 'device' to use the attached or first "
+    "booted simulator."
+)
+SIM_SIG = (
+    "No simulator with UDID <uuid>. Pass a real device, or omit 'device' to use the attached or first "
+    "booted simulator."
+)
+PLAN_TOOL = "mcp__ccd_turn__update_plan"
+PLAN_ERROR = (
+    'items also needs "scope": "first_task", "continuation" or "new_task" - what this request is to the '
+    "session."
+)
+PLAN_ITEMS = [
+    {"content": "Read playbook and routed skills", "status": "completed"},
+    {"content": "Report back", "status": "pending"},
+]
+
+
+def stale_device_pair(cwd: str, start: float = START, prefix: str = "s") -> Claude:
+    return (
+        Claude(cwd, start)
+        .call(f"{prefix}1", SIM_TOOL, {"action": "screenshot", "device": STALE}, SIM_ERROR)
+        .read(f"{prefix}2")
+        .call(f"{prefix}3", SIM_TOOL, {"action": "screenshot", "device": LIVE})
+    )
+
+
+def test_stale_simulator_device_then_live_device_is_one_candidate_naming_only_the_device(env):
+    write(env, "s1", stale_device_pair(env["repo"]).text())
+    summary = mine_now(env)
+    assert summary == Summary(
+        sessions_read=1, calls=3, failures=1, pairs=1, candidates_created=1, observations=1
+    )
+    db = lessons_db(env)
+    (lesson,) = store.inbox_candidates(db)
+    assert (lesson.trust_class, lesson.scope) == (TrustClass.OWN_CODE, RepoScope(RepoId("own-app")))
+    assert (lesson.text.avoid, lesson.text.instead, lesson.text.reason) == (
+        f'{SIM_TOOL} with device="{STALE}"',
+        f'device="{LIVE}"',
+        MINED_WHY,
+    )
+    assert lesson.triggers == (Trigger(TriggerKind.ERROR, f"[tool {SIM_TOOL}] {SIM_SIG}", Stage.REPAIR),)
+    assert db.execute("select failed_input, error_signature, passing_input from observations").fetchall() == [
+        (
+            json.dumps({"action": "screenshot", "device": STALE}, separators=(",", ":")),
+            SIM_SIG,
+            f'device="{LIVE}"',
+        )
+    ]
+    assert store.verify(db) == []
+
+
+def test_update_plan_without_scope_then_with_it_says_to_add_scope(env):
+    t = (
+        Claude(env["repo"])
+        .call("p1", PLAN_TOOL, {"items": PLAN_ITEMS}, PLAN_ERROR)
+        .call("p2", PLAN_TOOL, {"items": PLAN_ITEMS, "scope": "continuation"})
+    )
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 1, {})
+    (lesson,) = store.inbox_candidates(lessons_db(env))
+    assert (lesson.text.avoid, lesson.text.instead) == (
+        f"{PLAN_TOOL} with scope missing",
+        'add scope="continuation"',
+    )
+
+
+def test_a_retry_that_drops_a_field_says_to_omit_it(env):
+    t = (
+        Claude(env["repo"])
+        .call(
+            "w1",
+            "WebSearch",
+            {"max_results": "5", "query": "PaywallColor init"},
+            "WebSearch failed: invalid query",
+        )
+        .call("w2", "WebSearch", {"query": "PaywallColor init"})
+    )
+    write(env, "s1", t.text())
+    mine_now(env)
+    (lesson,) = store.inbox_candidates(lessons_db(env))
+    assert (lesson.text.avoid, lesson.text.instead) == ('WebSearch with max_results="5"', "omit max_results")
+
+
+def test_two_agent_calls_with_different_long_or_multiline_prompts_are_skipped(env):
+    long_a = "Audit the payment module for race conditions. " * 4
+    long_b = "Audit the payment module for race conditions and stale caches. " * 3
+    t = (
+        Claude(env["repo"])
+        .call("a1", "Agent", {"description": "Audit", "prompt": long_a}, "Prompt is too long")
+        .call("a2", "Agent", {"description": "Audit", "prompt": long_b})
+        .call("a3", "Agent", {"description": "Audit", "prompt": "Step one\nStep two"}, "Prompt is too long")
+        .call("a4", "Agent", {"description": "Audit", "prompt": "Step one\nStep three"})
+    )
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.rejected) == (2, 0, {})
+    assert summary.skipped == {"structured_value_multiline": 1, "structured_value_too_long": 1}
+
+
+def test_three_changed_fields_are_skipped_and_the_failure_waits(env):
+    t = (
+        Claude(env["repo"])
+        .call("d1", SIM_TOOL, {"action": "wait", "duration": 6, "udid": STALE}, SIM_ERROR)
+        .call("d2", SIM_TOOL, {"action": "screenshot", "udid": LIVE})
+    )
+    write(env, "s1", t.text())
+    summary = mine_now(env, now=START + 60)
+    assert (summary.pairs, summary.candidates_created) == (0, 0)
+    assert summary.skipped == {"structured_too_many_fields": 1}
+    assert lessons_db(env).execute("select tool_use_id from pending_failures").fetchall() == [("d1",)]
+
+
+def test_identical_tool_retry_is_skipped(env):
+    args = {"action": "screenshot", "device": STALE}
+    t = Claude(env["repo"]).call("i1", SIM_TOOL, args, SIM_ERROR).call("i2", SIM_TOOL, args)
+    write(env, "s1", t.text())
+    assert mine_now(env).skipped == {"identical_retry": 1}
+
+
+@pytest.mark.parametrize(
+    ("failed", "passing"),
+    [
+        (
+            {"query": "PaywallColor", "api_key": "plainvalue1"},
+            {"query": "PaywallColor init", "api_key": "plainvalue1"},
+        ),
+        (
+            {"query": "PaywallColor", "auth_token": "plainvalue1"},
+            {"query": "PaywallColor", "auth_token": "plainvalue2"},
+        ),
+    ],
+)
+def test_a_secret_named_field_is_never_mined(env, failed, passing):
+    t = (
+        Claude(env["repo"])
+        .call("k1", "mcp__search__query", failed, "WebSearch failed: invalid query")
+        .call("k2", "mcp__search__query", passing)
+    )
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.rejected) == (1, 0, {"secret.keyed_field": 1})
+    db = lessons_db(env)
+    assert db.execute("select count(*) from observations").fetchone()[0] == 0
+    stored = "\n".join(str(r) for t in dump(db) for r in t)
+    assert "plainvalue" not in stored
+
+
+def test_tool_lessons_with_different_fields_do_not_merge(env):
+    write(env, "s1", stale_device_pair(env["repo"]).text())
+    other = (
+        Claude(env["repo"], START + 100)
+        .call("o1", SIM_TOOL, {"action": "screenshot", "device": STALE}, SIM_ERROR)
+        .call("o2", SIM_TOOL, {"action": "attach", "device": LIVE})
+    )
+    write(env, "s2", other.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created) == (2, 2)
+    instead = sorted(le.text.instead for le in store.inbox_candidates(lessons_db(env)))
+    assert instead == [f'action="attach", device="{LIVE}"', f'device="{LIVE}"']
+
+
+def test_a_second_session_sights_the_same_tool_lesson(env):
+    write(env, "s1", stale_device_pair(env["repo"]).text())
+    write(env, "s2", stale_device_pair(env["repo"], START + DAY, prefix="u").text())
+    summary = mine_now(env, now=START + 2 * DAY)
+    assert (summary.pairs, summary.candidates_created, summary.observations) == (2, 1, 2)
+    (lesson,) = store.inbox_candidates(lessons_db(env))
+    assert lesson.sessions_seen == 2

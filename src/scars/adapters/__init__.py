@@ -106,6 +106,7 @@ def event(
     paths: tuple[str, ...] = (),
     error_text: str | None = None,
     prompt: str | None = None,
+    tool_name: str | None = None,
 ) -> HookEvent:
     """Build the normalized event with every free-text field capped at 4 KB.
 
@@ -128,6 +129,7 @@ def event(
         error_text=cap(error_text) if error_text is not None else None,
         prompt=cap(prompt) if prompt is not None else None,
         model_id=base.model_id,
+        tool_name=tool_name,
     )
 
 

@@ -108,4 +108,5 @@ def _tool(
         command=command,
         paths=paths,
         error_text=error_text,
+        tool_name=name,
     )

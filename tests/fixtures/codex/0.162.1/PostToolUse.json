@@ -3,12 +3,12 @@
     {
       "name": "Bash failure with an exit-code header",
       "stdin": {"session_id": "thr_123", "transcript_path": null, "cwd": "/workspace", "hook_event_name": "PostToolUse", "model": "gpt-5.5-codex", "permission_mode": "default", "turn_id": "turn_1", "tool_name": "Bash", "tool_use_id": "call_1", "tool_input": {"command": "cargo test -p core"}, "tool_response": "Wall time: 1.2000 seconds\nProcess exited with code 101\nOutput:\nerror: package ID specification `core` did not match any packages"},
-      "event": {"harness": "codex", "harness_version": "", "event": "tool_failed", "session_id": "thr_123", "tool_use_id": "call_1", "cwd": "/workspace", "tool_kind": "shell", "command": "cargo test -p core", "paths": [], "error_text": "error: package ID specification `core` did not match any packages", "prompt": null, "model_id": "gpt-5.5-codex"}
+      "event": {"harness": "codex", "harness_version": "", "event": "tool_failed", "session_id": "thr_123", "tool_use_id": "call_1", "cwd": "/workspace", "tool_kind": "shell", "command": "cargo test -p core", "paths": [], "error_text": "error: package ID specification `core` did not match any packages", "prompt": null, "model_id": "gpt-5.5-codex", "tool_name": "Bash"}
     },
     {
       "name": "Bash failure as an object with exit_code",
       "stdin": {"session_id": "thr_123", "transcript_path": null, "cwd": "/workspace", "hook_event_name": "PostToolUse", "model": "gpt-5.5-codex", "permission_mode": "default", "turn_id": "turn_1", "tool_name": "Bash", "tool_use_id": "call_2", "tool_input": {"command": "make"}, "tool_response": {"exit_code": 2, "output": "make: *** No targets specified and no makefile found.  Stop."}},
-      "event": {"harness": "codex", "harness_version": "", "event": "tool_failed", "session_id": "thr_123", "tool_use_id": "call_2", "cwd": "/workspace", "tool_kind": "shell", "command": "make", "paths": [], "error_text": "make: *** No targets specified and no makefile found.  Stop.", "prompt": null, "model_id": "gpt-5.5-codex"}
+      "event": {"harness": "codex", "harness_version": "", "event": "tool_failed", "session_id": "thr_123", "tool_use_id": "call_2", "cwd": "/workspace", "tool_kind": "shell", "command": "make", "paths": [], "error_text": "make: *** No targets specified and no makefile found.  Stop.", "prompt": null, "model_id": "gpt-5.5-codex", "tool_name": "Bash"}
     },
     {
       "name": "Bash output text with no exit code, as Codex 0.162.1 sends it",
@@ -23,7 +23,7 @@
     {
       "name": "apply_patch failure with no file headers has no paths",
       "stdin": {"session_id": "thr_123", "transcript_path": null, "cwd": "/workspace", "hook_event_name": "PostToolUse", "model": "gpt-5.5-codex", "permission_mode": "default", "turn_id": "turn_1", "tool_name": "apply_patch", "tool_use_id": "call_6", "tool_input": {"command": "*** Begin Patch\n*** End Patch\n"}, "tool_response": {"exit_code": 1, "output": "No files were modified."}},
-      "event": {"harness": "codex", "harness_version": "", "event": "tool_failed", "session_id": "thr_123", "tool_use_id": "call_6", "cwd": "/workspace", "tool_kind": "edit", "command": null, "paths": [], "error_text": "No files were modified.", "prompt": null, "model_id": "gpt-5.5-codex"}
+      "event": {"harness": "codex", "harness_version": "", "event": "tool_failed", "session_id": "thr_123", "tool_use_id": "call_6", "cwd": "/workspace", "tool_kind": "edit", "command": null, "paths": [], "error_text": "No files were modified.", "prompt": null, "model_id": "gpt-5.5-codex", "tool_name": "apply_patch"}
     },
     {
       "name": "apply_patch success text",

@@ -5,7 +5,7 @@ import os
 import subprocess
 import time
 
-from cli_helpers import FAILURE_PAIR, SIG, claude_transcript, git_repo, make_ctx, run
+from cli_helpers import FAILURE_PAIR, SIG, claude_transcript, git_repo, iso, make_ctx, run
 from scars import store
 
 pytest_plugins = ("cli_fixtures",)
@@ -70,3 +70,99 @@ def test_init_mine_inbox_then_the_hook_shows_the_lesson(work, monkeypatch):
 
     code, out, _ = run(make_ctx(user_home), "why", "last")
     assert out.startswith(f"{lesson.id}  promoted  level note  not pinned  repo app")
+
+
+SIM_TOOL = "mcp__Claude_Code_iOS_Simulator__control"
+STALE = "D9C36E75-8409-4A69-9636-A6E35C689FBA"
+LIVE = "FDCC5BE5-85E9-4BFE-A6FA-17A6BFCBA89E"
+SIM_ERROR = (
+    "No simulator with UDID {udid}. Pass a real device, or omit 'device' to use the attached or first "
+    "booted simulator."
+)
+
+
+def tool_transcript(cwd: str, start: float) -> str:
+    records: list[object] = []
+    calls = [
+        ("m1", {"action": "screenshot", "device": STALE}, SIM_ERROR.format(udid=STALE)),
+        ("m2", {"action": "screenshot", "device": LIVE}, None),
+    ]
+    for i, (tool_id, args, error) in enumerate(calls):
+        at = start + 10 * (i + 1)
+        use = {"type": "tool_use", "id": tool_id, "name": SIM_TOOL, "input": args}
+        records.append(
+            {
+                "type": "assistant",
+                "timestamp": iso(at),
+                "cwd": cwd,
+                "message": {"model": "m", "content": [use]},
+            }
+        )
+        result = {"type": "tool_result", "tool_use_id": tool_id, "is_error": error is not None}
+        result["content"] = error if error is not None else "fine"
+        records.append(
+            {"type": "user", "timestamp": iso(at + 1), "cwd": cwd, "message": {"content": [result]}}
+        )
+    return "".join(json.dumps(r) + "\n" for r in records)
+
+
+def test_a_mined_tool_lesson_reaches_the_hook_only_after_promotion(work, monkeypatch):
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    user_home = work / "user"
+    scars_home = user_home / ".scars"
+    monkeypatch.setenv("SCARS_HOME", str(scars_home))
+    for name in ("SCARS_OFF", "CLAUDECODE", "CODEX_SANDBOX"):
+        monkeypatch.delenv(name, raising=False)
+    repo = git_repo(work / "app")
+    transcript = user_home / ".claude" / "projects" / "app" / "s1.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(tool_transcript(str(repo), time.time() - 3600))
+    code, out, err = run(make_ctx(user_home, clock=time.time), "init", "--yes", "--allow-dev-install")
+    assert (code, err) == (0, "")
+    assert "lessons: 1 new, 1 observations, 0 expired\n" in out
+
+    hooks = json.loads((scars_home / "plugins" / "claude" / "hooks" / "hooks.json").read_text())
+    command = hooks["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"]
+
+    def fail(tool: str, udid: str) -> str:
+        payload = {
+            "session_id": "next-session",
+            "cwd": str(repo),
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": tool,
+            "tool_input": {"action": "screenshot", "device": udid},
+            "tool_use_id": f"toolu_{tool}_{udid[:4]}",
+            "error": SIM_ERROR.format(udid=udid),
+        }
+        result = subprocess.run(
+            ["/bin/sh", "-c", command], input=json.dumps(payload), capture_output=True, text=True, timeout=10
+        )
+        assert (result.returncode, result.stderr) == (0, "")
+        return (
+            json.loads(result.stdout)["hookSpecificOutput"].get("additionalContext", "")
+            if result.stdout
+            else ""
+        )
+
+    other = "0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D"
+    assert fail(SIM_TOOL, other) == ""
+
+    code, out, err = run(make_ctx(user_home, keys="a", clock=time.time), "inbox")
+    assert (code, err) == (0, "")
+    assert f'  avoid:   {SIM_TOOL} with device="{STALE}"\n' in out
+    assert f'  instead: device="{LIVE}"\n' in out
+    assert f'    failed: {{"action":"screenshot","device":"{STALE}"}}\n' in out
+    assert f'    passed: device="{LIVE}"\n' in out
+    db = store.connect(scars_home / "lessons.db")
+    [lesson] = store.list_lessons(db)
+    db.close()
+    assert lesson.status.value == "promoted"
+
+    context = fail(SIM_TOOL, other)
+    assert context.splitlines()[1:4] == [
+        f'AVOID: {SIM_TOOL} with device="{STALE}"',
+        f'INSTEAD: device="{LIVE}"',
+        "WHY: AVOID failed, INSTEAD passed",
+    ]
+    assert fail("mcp__other_simulator__control", other) == ""
