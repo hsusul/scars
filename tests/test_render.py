@@ -285,7 +285,8 @@ def test_human_near_misses_render_in_machine_scope_and_other_trust_classes_need_
         ("reason", "the path /Volumes/990 Pro/OpenSource holds every clone"),
         ("reason", "~/.scars/lessons.db, /usr/local/bin, /tmp/build and /opt/homebrew are fine"),
         ("reason", "NODE_OPTIONS and test_render_budget_fits_exact_boundary are ordinary names"),
-        ("reason", "internationalization of src/scars/render.py and tokenizer.json"),
+        ("reason", "internationalization of render.py and tokenizer.json"),
+        ("reason", "retry at 10:30, after version 1.2.3"),
         ("reason", "risk-free, task-runner and disk-usage are words"),
         ("reason", "AKIA alone is not a key, and process.env is code"),
         ("reason", "a rule override in ruff config is fine"),
@@ -560,6 +561,13 @@ def test_within_one_field_rule_order_decides():
         ("copy /tmp/x=/Users/henry/y", "machine.absolute_path"),
         ('cd "/tmp/x -I/Users/henry"', "machine.absolute_path"),
         ("-I/tmp/../Users/henry", "machine.dotdot_path"),
+        ("see apps/web/src for the config", "machine.relative_path"),
+        ("hsusul/widgets/tree/main has it", "machine.relative_path"),
+        ("./apps/web/src holds it", "machine.relative_path"),
+        ("start the server on localhost:8080 first", "machine.host"),
+        ("connect to db.internal:5432", "machine.host"),
+        ("check 10.0.0.1 is up", "machine.host"),
+        ("open 192.168.1.5/admin", "machine.host"),
     ],
 )
 def test_machine_scope_lint(value, rule):

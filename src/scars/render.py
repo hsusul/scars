@@ -21,7 +21,8 @@ roots only) rather than a list of bad phrases.
 3. Secret scan: known token formats, matched wherever they start, and a high-entropy fallback.
 4. Machine-scope lint: machine lessons reach every repo, so they may not name a repo, a GitHub
    `owner/name`, a `..` path segment, or an absolute path outside `ALLOWED_ROOTS`, including a path
-   attached to an option (`-I/x`, `--prefix=/x`, `key=/x`).
+   attached to an option (`-I/x`, `--prefix=/x`, `key=/x`), a relative path of three or more
+   segments, or a host (`localhost`, an IPv4 address, `host:port`).
 5. Mined structure: a lesson whose trust class is not `human` holds only what the miner builds from
    parsed calls, never transcript prose. `avoid` is one plain command and the command in `instead` is
    another with the same program, each written as `shlex.join` of its words (see `plain_command`), and
@@ -447,6 +448,16 @@ _ROOTS_LONGEST_FIRST = sorted(ALLOWED_ROOTS, key=len, reverse=True)
 _OWNER_NAME = re.compile(r"(?<![\w.~$/@:-])([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?![\w./-])")
 """Exactly two slash-separated segments in GitHub's owner and repo alphabets. This also flags two-segment
 relative paths such as `apps/web`; a machine-scope lesson should describe a layout in words instead."""
+_RELATIVE_PATH = re.compile(r"(?<![\w.~$/@:-])[\w.-]+(?:/[\w.-]+){2,}")
+"""A relative path of three or more segments, which names one repo's layout (or `owner/repo/...`)."""
+_HOST = re.compile(
+    r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])"
+    r"|\blocalhost\b"
+    r"|(?<![\w.-])(?=[\w.-]*[A-Za-z])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*:\d{2,5}\b",
+    re.IGNORECASE,
+)
+"""An IPv4 address, `localhost`, or `host:port`: a service on one machine or network. A `file:line`
+with a line of two or more digits reads as `host:port` and is rejected too; blunt on purpose."""
 
 
 @dataclass(frozen=True)
@@ -546,6 +557,10 @@ def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[s
         rest = "".join(masked)
         if any(m.group(1).lower() not in _GIT_REMOTES for m in _OWNER_NAME.finditer(rest)):
             raise RejectedText("machine.github_repo", field)
+        if _RELATIVE_PATH.search(rest):
+            raise RejectedText("machine.relative_path", field)
+        if _HOST.search(value):
+            raise RejectedText("machine.host", field)
 
 
 # ---------------------------------------------------------------- mined structure
