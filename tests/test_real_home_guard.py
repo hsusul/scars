@@ -26,6 +26,25 @@ def test_the_guard_sees_files_created_changed_and_removed(tmp_path):
     assert str(tree / "OFF") in changed(after, real_home_state(**watched))
 
 
+def test_the_guard_ignores_what_a_live_install_writes_but_not_the_store(tmp_path):
+    tree = tmp_path / ".scars"
+    (tree / "logs").mkdir(parents=True)
+    (tree / "lessons.db").write_text("a")
+    (tree / "telemetry.db").write_text("t")
+    watched = {"trees": (tree,), "files": ()}
+    before = real_home_state(**watched)
+    (tree / "telemetry.db").write_text("tt")
+    for name in ("telemetry.db-wal", "telemetry.db-shm", "lessons.db-shm", "lessons.db-wal"):
+        (tree / name).write_text("x")
+    (tree / "logs" / "hook.log").write_text("line")
+    (tree / "lessons.db-shm").unlink()
+    assert changed(before, real_home_state(**watched)) == []
+    (tree / "lessons.db").write_text("ab")
+    (tree / "OFF").touch()
+    after = real_home_state(**watched)
+    assert changed(before, after) == [str(tree), str(tree / "OFF"), str(tree / "lessons.db")]
+
+
 def test_home_is_a_temp_dir_in_every_cli_test(tmp_path):
     from conftest import REAL_HOME
 
