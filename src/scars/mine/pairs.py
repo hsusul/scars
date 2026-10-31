@@ -266,7 +266,7 @@ def open_failure(call: Call) -> OpenFailure | None:
         return None
     if call.tool_kind is ToolKind.SHELL and call.program is None:
         return None
-    sig = signature(call.output)
+    sig = signature(call.output, command=call.command)
     if sig is None:
         return None
     return OpenFailure(

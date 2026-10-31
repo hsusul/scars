@@ -28,13 +28,21 @@ _UNLESSONABLE = re.compile(
     re.I,
 )
 _USER_REJECTION = "The user doesn't want to proceed"
+_ERROR_LINE = re.compile(
+    r"^(?:[\w./+\-]+|\(eval\))(?:\[\d+\])?:"
+    r"|\b(?:error|fatal|no such|not found|denied|invalid|unknown)\b"
+    r"|\b[\w.]+(?:Error|Exception|Exit|Interrupt)\b",
+    re.I,
+)
 _MAX = 120
 
 
-def signature(text: str) -> ErrorSignature | None:
+def signature(text: str, *, command: str | None = None) -> ErrorSignature | None:
     """Normalize tool error output to a signature, or None when no lesson could address it.
 
     Output that quotes a rendered lesson is None, so a lesson cannot seed another from its own text.
+    Prefer error-shaped lines to stdout. A compound or unsupported shell command needs such a line;
+    a single command or non-shell tool keeps the first usable line as its fallback.
     """
     if text.startswith(_USER_REJECTION) or HEADER_PREFIX in text.lower():
         return None
@@ -42,6 +50,7 @@ def signature(text: str) -> ErrorSignature | None:
     if any(ln.startswith("Traceback") for ln in lines):
         exceptions = [ln for ln in lines if re.match(r"^[\w.]+(Error|Exception|Exit|Interrupt)\b", ln)]
         lines = exceptions[-1:] or lines
+    fallback = None
     for line in lines:
         normalized = line
         for pattern, replacement in _NOISE:
@@ -49,8 +58,20 @@ def signature(text: str) -> ErrorSignature | None:
         if _SKIP_LINE.match(normalized) or not re.search(r"[A-Za-z]{3,}", normalized):
             continue
         result = normalized.strip()[:_MAX]
-        return None if _UNLESSONABLE.search(result) else ErrorSignature(result)
-    return None
+        if _ERROR_LINE.search(line):
+            return None if _UNLESSONABLE.search(result) else ErrorSignature(result)
+        if fallback is None:
+            fallback = result
+    if command is not None and re.search(r"[;&|\n()<>`]", command):
+        from scars.shell import Unsupported, parse
+
+        try:
+            commands = parse(command, null_commands=True)
+        except Unsupported:
+            return None
+        if len(commands) > 1 or any(c.cwd is not None or not c.cwd_known for c in commands):
+            return None
+    return None if fallback is None or _UNLESSONABLE.search(fallback) else ErrorSignature(fallback)
 
 
 TOOL_PREFIX = "[tool "
