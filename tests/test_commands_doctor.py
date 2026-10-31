@@ -68,6 +68,19 @@ def test_doctor_fails_on_an_active_lesson_that_cannot_render(home, user_home, mo
     assert f"FAIL  lessons render: {legacy}: mined.reason_template in reason\n" in out
 
 
+def test_doctor_fails_on_a_promoted_lesson_that_names_a_secret_argument(home, user_home, monkeypatch):
+    from cli_helpers import human
+    from scars.model import EventType
+
+    stub(monkeypatch)
+    lesson_id = seed(home, avoid="pytest --frobnicate --token hunter2")
+    human(home, lesson_id, EventType.PROMOTED)
+    code, out, _ = run(make_ctx(user_home), "doctor")
+    assert code == 1
+    assert f"FAIL  lessons render: {lesson_id}: secret.keyed_argument in avoid\n" in out
+    assert "hunter2" not in out
+
+
 def test_each_failing_check_makes_doctor_exit_1(home, user_home, monkeypatch):
     stub(monkeypatch, location="it is on an external disk", canary=doctor.Check("canary", False, "no lesson"))
     lesson_id = seed(home)

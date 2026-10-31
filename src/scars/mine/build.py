@@ -138,7 +138,7 @@ for the entropy rule."""
 
 def secret_rule(text: str) -> str | None:
     """The name of the first secret rule `text` trips, or None."""
-    if _KEYED_SECRET.search(text) or render.names_secret(text):
+    if _KEYED_SECRET.search(text):
         return "secret.keyed_argument"
     return next((rule.name for rule in render.SECRET_RULES if rule.hits(text)), None)
 

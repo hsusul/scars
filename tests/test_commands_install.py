@@ -553,3 +553,18 @@ def test_store_directory_is_private(machine):
     run(make_ctx(user, platform="linux", clock=time.time), "init", "--yes")
     assert oct(os.stat(scars_home).st_mode & 0o777) == "0o700"
     assert oct(os.stat(scars_home / "lessons.db").st_mode & 0o777) == "0o600"
+
+
+def test_init_top_list_never_offers_a_lesson_that_names_a_secret_argument(home, user_home):
+    from cli_helpers import seed
+
+    a = seed(home)
+    seed(home, avoid="pytest --frobnicate --token hunter2", sig="pytest: error: other")
+    ctx = make_ctx(user_home)
+    install.show_top(ctx, home)
+    assert ctx.stdout.getvalue() == (
+        "top lessons waiting for review:\n"
+        f"  {a}  provisional  AVOID pytest --frobnicate\n"
+        "    would have fired 0 times in the last 30 days\n"
+        "review them with: scars inbox\n"
+    )

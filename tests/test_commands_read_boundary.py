@@ -293,3 +293,10 @@ def test_a_hit_with_an_unreadable_time_is_reported_not_raised(home, user_home, m
     code, out, err = run(make_ctx(user_home), "doctor")
     assert code == 1
     assert "FAIL  telemetry: cannot read telemetry.db: " in out
+
+
+def test_a_printed_line_masks_a_secret_named_argument():
+    from scars.commands import clean
+
+    line = "failed: deploy --token:hunter2 GITHUB_TOKEN=x"
+    assert clean(line) == "failed: deploy --token:*** GITHUB_TOKEN=***"

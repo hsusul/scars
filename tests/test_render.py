@@ -32,6 +32,8 @@ from scars.render import (
     check_budgets,
     check_fields,
     fit,
+    mask_secrets,
+    names_secret,
     normalize_command,
     render,
     render_deny,
@@ -1151,3 +1153,54 @@ def test_budget_check_uses_the_prompt_budget_for_plan_triggers():
 def test_a_human_lesson_keeps_free_wording():
     text = replace(MINED, avoid="cd into a subdirectory", reason="worktree roots differ")
     assert check(text, REPO, known_commands=frozenset(), trust_class=HUMAN) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "named", "masked"),
+    [
+        ("deploy --token hunter2", True, "deploy --token ***"),
+        ("deploy --token=hunter2", True, "deploy --token=***"),
+        ("deploy --token:hunter2", True, "deploy --token:***"),
+        ("deploy --password:secret", True, "deploy --password:***"),
+        ("deploy --secret-key hunter2", True, "deploy --secret-key ***"),
+        ("aws configure --secret-access-key hunter2", True, "aws configure --secret-access-key ***"),
+        ("gh run --github-token x", True, "gh run --github-token ***"),
+        ("deploy --api-key 'a b'", True, "deploy --api-key ***"),
+        ("GITHUB_TOKEN=x make", True, "GITHUB_TOKEN=*** make"),
+        ("API_KEY=x make", True, "API_KEY=*** make"),
+        ("db_password=x make", True, "db_password=*** make"),
+        ("AUTH=x make", True, "AUTH=*** make"),
+        ("tokenizer=fast make", False, "tokenizer=fast make"),
+        ("author=ada make", False, "author=ada make"),
+        ("SECRETARY=Jane make", False, "SECRETARY=Jane make"),
+        ("passwordless=1 make", False, "passwordless=1 make"),
+        ("train --tokenizer fast", False, "train --tokenizer fast"),
+        ("train --tokenizer:fast", False, "train --tokenizer:fast"),
+        ("git log --author ada", False, "git log --author ada"),
+        ("hire --secretary Jane", False, "hire --secretary Jane"),
+        ("ssh --passwordless 1", False, "ssh --passwordless 1"),
+        ("deploy --token", False, "deploy --token"),
+        ("deploy --token= now", False, "deploy --token= now"),
+        ("deploy --token --verbose", False, "deploy --token --verbose"),
+        ("deploy --token ***", False, "deploy --token ***"),
+    ],
+)
+def test_secret_named_arguments_table(text, named, masked):
+    assert (names_secret(text), mask_secrets(text)) == (named, masked)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("avoid", "deploy --token hunter2"), ("instead", "run `deploy --token hunter2` instead")],
+)
+def test_a_stored_lesson_naming_a_secret_argument_never_renders(field, value):
+    stored = lesson(text=tampered(CLEAN, **{field: value}))
+    with pytest.raises(RejectedText) as caught:
+        render(stored, known_commands=KNOWN)
+    assert str(caught.value) == f"{field}: secret.keyed_argument"
+
+
+def test_a_human_edit_naming_a_secret_argument_is_refused():
+    with pytest.raises(RejectedText) as caught:
+        check_fields("deploy", "pass --token:hunter2", "c", REPO, known_commands=KNOWN, trust_class=HUMAN)
+    assert str(caught.value) == "instead: secret.keyed_argument"

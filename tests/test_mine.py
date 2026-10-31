@@ -354,8 +354,8 @@ def test_candidate_with_a_secret_is_dropped_and_counted(env):
     token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
     t = (
         Claude(env["repo"])
-        .bash("t1", "deploy --token=bad", "deploy: invalid token for target")
-        .bash("t2", f"deploy --token={token}")
+        .bash("t1", "deploy --target=bad", "deploy: invalid token for target")
+        .bash("t2", f"deploy --target={token}")
     )
     write(env, "s1", t.text())
     summary = mine_now(env)
@@ -454,13 +454,13 @@ def test_a_mined_lesson_that_no_longer_renders_is_retired_and_mined_afresh(env):
     assert store.verify(db) == []
 
 
-def legacy_lesson(env, fingerprint="fp-legacy", reason=FAIL_TEXT):
+def legacy_lesson(env, fingerprint="fp-legacy", reason=FAIL_TEXT, avoid="pytest --frobnicate tests"):
     from scars.model import LessonText
 
     db = lessons_db(env)
     legacy = store.create_lesson(
         db,
-        text=LessonText("pytest --frobnicate tests", "run `pytest tests` instead", reason),
+        text=LessonText(avoid, "run `pytest tests` instead", reason),
         scope=RepoScope(RepoId("own-app")),
         trust_class=TrustClass.OWN_CODE,
         triggers=(Trigger(TriggerKind.ERROR, "pytest: error: old signature", Stage.REPAIR),),
@@ -492,6 +492,12 @@ def test_a_legacy_lesson_is_retired_on_any_run_once_and_never_beside_its_re_mine
     assert db.execute("select avoid, status from lessons where status != 'retired'").fetchall() == [
         ("pytest --frobnicate tests", "candidate")
     ]
+
+
+def test_a_legacy_lesson_naming_a_secret_argument_is_retired(env):
+    db, legacy = legacy_lesson(env, reason=MINED_WHY, avoid="pytest --frobnicate --token hunter2")
+    assert mine_now(env).retired_unrenderable == {"secret.keyed_argument": 1}
+    assert store.get_lesson(db, legacy).status is Status.RETIRED
 
 
 def test_a_legacy_lesson_is_retired_even_when_no_transcript_sights_it(env):

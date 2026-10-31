@@ -85,12 +85,33 @@ def test_inbox_hides_what_it_cannot_render_or_approve_and_counts_only_the_rest(h
 
 
 def test_inbox_shows_source_evidence_with_secret_values_masked(home, user_home):
-    a = seed(home, avoid="pytest --frobnicate --token abc123")
+    a = seed(home)
+    db = connect(home)
+    db.execute("update observations set failed_input = 'pytest --frobnicate --token abc123 tests'")
+    db.commit()
     out = run(make_ctx(user_home, keys="q"), "inbox")[1]
     assert "    failed: pytest --frobnicate --token *** tests\n" in out
-    assert "  avoid:   pytest --frobnicate --token ***\n" in out
     assert "abc123" not in out
     assert a in out
+
+
+def test_inbox_hides_a_lesson_whose_text_names_a_secret_argument(home, user_home):
+    a = seed(home, avoid="pytest --frobnicate --token hunter2")
+    out = run(make_ctx(user_home, keys="a"), "inbox")[1]
+    assert out == "hidden: 1 that cannot render (scars doctor names the rule)\ninbox is empty\n"
+    assert store.get_lesson(connect(home), a).status is Status.PROVISIONAL
+
+
+def test_an_edit_that_names_a_secret_argument_is_refused(home, user_home):
+    a = seed(home)
+
+    def editor(text):
+        return text.replace("avoid: pytest --frobnicate", "avoid: pytest --frobnicate --token hunter2")
+
+    out = run(make_ctx(user_home, keys="eyq", edit=editor), "inbox")[1]
+    assert "not applied: avoid breaks secret.keyed_argument\n" in out
+    assert "hunter2" not in out
+    assert store.get_lesson(connect(home), a).text.avoid == "pytest --frobnicate"
 
 
 def test_empty_inbox(home, user_home):

@@ -403,6 +403,50 @@ def _high_entropy(text: str) -> bool:
     return any(shannon_entropy(t) > ENTROPY_THRESHOLD for t in _ENTROPY_TOKEN.findall(text))
 
 
+_SECRET_WORD = re.compile(
+    r"(?:^|[-_.])(?:password|passwd|token|secret|auth|api[-_]?key|access[-_]key|private[-_]key)(?=$|[-_.])",
+    re.IGNORECASE,
+)
+_SECRET_VALUE = r"(?=('[^']*'|\"[^\"]*\"|[^\s'\"]+))"
+_NAMED_OPTION = re.compile(
+    r"(?<![\w-])--([a-z0-9]++(?:[-_][a-z0-9]++)*+)(?:[=:](?=\S)|\s++(?!-))" + _SECRET_VALUE, re.IGNORECASE
+)
+_NAMED_KEY = re.compile(r"(?<![\w./-])([a-z0-9_][a-z0-9_.-]*+)=" + _SECRET_VALUE, re.IGNORECASE)
+"""An option (`--github-token X`, `--token=X`, `--token:X`) or a `NAME=value` key (`DB_PASSWORD=X`) has a
+secret name when one of its `-`, `_` or `.` separated parts is a secret word, so `--tokenizer` and
+`author=` do not. Any non-empty value counts, however plain: the name is the evidence. The value is
+matched in a lookahead, so a key in the value of another name (`FOO=TOKEN=x`) is still found. Names are
+matched possessively and checked for the word afterwards, which keeps the scan linear."""
+
+
+def _secret_values(text: str) -> list[tuple[int, int]]:
+    """Spans of the values passed to secret-named options and keys, except the `***` that masking leaves."""
+    spans = [
+        m.span(2)
+        for pattern in (_NAMED_OPTION, _NAMED_KEY)
+        for m in pattern.finditer(text)
+        if _SECRET_WORD.search(m.group(1)) and m.group(2) != "***"
+    ]
+    return sorted(spans)
+
+
+def names_secret(text: str) -> bool:
+    """Whether `text` passes a value to an option or key named as a secret."""
+    return bool(_secret_values(text))
+
+
+def mask_secrets(text: str) -> str:
+    """`text` with the value of every option or key named as a secret replaced by `***`."""
+    out, end = [], 0
+    for start, stop in _secret_values(text):
+        if start < end:
+            end = max(end, stop)
+            continue
+        out += [text[end:start], "***"]
+        end = stop
+    return "".join(out) + text[end:]
+
+
 SECRET_RULES: tuple[Rule, ...] = (
     # Named formats match wherever they start, so a prefix such as `-` or `x` cannot hide them.
     Rule("secret.github_token", _pattern(r"(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]")),
@@ -422,32 +466,8 @@ SECRET_RULES: tuple[Rule, ...] = (
     Rule("secret.url_userinfo", _pattern(r"//[^\s/@:]+:[^\s/@]*@")),
     Rule("secret.pem_header", _pattern(r"-----BEGIN [A-Z0-9 ]*-----")),
     Rule("secret.high_entropy", _high_entropy),
+    Rule("secret.keyed_argument", names_secret),
 )
-
-_SECRET_VALUE = r"('[^']*'|\"[^\"]*\"|[^\s'\"]+)"
-_SECRET_OPTION = re.compile(
-    r"(?<![\w-])(--(?:password|passwd|token|api-key|apikey|secret|auth|access-key|private-key))"
-    r"(=(?=\S)|\s+(?!-))" + _SECRET_VALUE,
-    re.IGNORECASE,
-)
-_SECRET_KEY = re.compile(
-    r"(?<![\w./-])((?:[A-Za-z_][\w.]*?)?(?:token|password|passwd|secret|api[-_]?key|auth)[\w.]*)="
-    + _SECRET_VALUE,
-    re.IGNORECASE,
-)
-"""An option (`--token X`, `--token=X`) or a `NAME=value` key whose name says its value is a secret. Any
-non-empty value counts, however plain: the name is the evidence."""
-
-
-def names_secret(text: str) -> bool:
-    """Whether `text` passes a value to an option or key named as a secret."""
-    return _SECRET_OPTION.search(text) is not None or _SECRET_KEY.search(text) is not None
-
-
-def mask_secrets(text: str) -> str:
-    """`text` with the value of every option or key named as a secret replaced by `***`."""
-    text = _SECRET_OPTION.sub(r"\1\2***", text)
-    return _SECRET_KEY.sub(r"\1=***", text)
 
 
 # ---------------------------------------------------------------- machine-scope lint

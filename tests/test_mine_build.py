@@ -67,7 +67,6 @@ def test_avoid_is_the_failed_command_as_run_not_the_arguments_the_fix_dropped():
         "token=hunter2hunter2hunter2",
         "PASSWORD=hunter2hunter2hunter2",
         "secret=hunter2hunter2hunter2",
-        "key=hunter2hunter2hunter2",
     ],
 )
 @pytest.mark.parametrize("side", ["failed", "passing"])
@@ -75,6 +74,17 @@ def test_an_argument_named_as_a_secret_is_never_mined(secret_arg, side):
     failed = f"npm publish --tag next {secret_arg}" if side == "failed" else "npm publish --tag next"
     passing = f"npm publish {secret_arg}" if side == "passing" else "npm publish"
     assert build.secret_rule(secret_arg) == "secret.keyed_argument"
+    with pytest.raises(build.render.RejectedText) as caught:
+        build.build(pair(failed, passing), RepoId("r"), "own")
+    field = "avoid" if side == "failed" else "instead"
+    assert (caught.value.rule, caught.value.field) == ("secret.keyed_argument", field)
+
+
+@pytest.mark.parametrize("side", ["failed", "passing"])
+def test_a_long_key_value_is_never_mined(side):
+    secret_arg = "key=hunter2hunter2hunter2"
+    failed = f"npm publish --tag next {secret_arg}" if side == "failed" else "npm publish --tag next"
+    passing = f"npm publish {secret_arg}" if side == "passing" else "npm publish"
     with pytest.raises(build.render.RejectedText) as caught:
         build.build(pair(failed, passing), RepoId("r"), "own")
     assert (caught.value.rule, caught.value.field) == ("secret.keyed_argument", f"{side}_input")
@@ -106,7 +116,7 @@ def test_an_argument_named_as_a_secret_is_never_mined_whatever_its_value_or_sepa
     assert build.secret_rule(f"npm publish {secret_arg} --tag next") == "secret.keyed_argument"
     with pytest.raises(build.render.RejectedText) as caught:
         build.build(pair("npm publish --tag next", f"npm publish {secret_arg}"), RepoId("r"), "own")
-    assert (caught.value.rule, caught.value.field) == ("secret.keyed_argument", "passing_input")
+    assert (caught.value.rule, caught.value.field) == ("secret.keyed_argument", "instead")
 
 
 @pytest.mark.parametrize(

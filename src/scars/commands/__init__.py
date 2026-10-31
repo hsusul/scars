@@ -366,7 +366,8 @@ LINE_RULES = (*(r for r in render.SANITIZER_RULES if r.name in _LINE_SANITIZER),
 
 
 def clean(line: str) -> str:
-    """`line`, or `[hidden: <rule>]` when it breaks one of `LINE_RULES`."""
+    """`line` with secret-named values masked, or `[hidden: <rule>]` when it breaks one of `LINE_RULES`."""
+    line = render.mask_secrets(line)
     for rule in LINE_RULES:
         if rule.hits(line):
             return f"[hidden: {rule.name}]"
