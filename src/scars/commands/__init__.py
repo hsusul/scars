@@ -417,8 +417,11 @@ def shown(value: str) -> str:
     Agents run the read commands too, so whatever they print is a way into an agent's context. Stored
     values (lesson text, trigger specs, mined inputs, observations, event payloads) came from transcripts
     and are held to the same rules as lesson text before they are printed. An empty value breaks the
-    sanitizer's empty rule too; a call site where empty is normal says so in words instead.
+    sanitizer's empty rule too; a call site where empty is normal says so in words instead. The value of
+    an option or key named as a secret (`--token X`, `DB_PASSWORD=X`) is masked, for rows stored before
+    the miner refused them.
     """
+    value = render.mask_secrets(value)
     for rule in DISPLAY_RULES:
         if rule.hits(value):
             return f"[hidden: {rule.name}]"

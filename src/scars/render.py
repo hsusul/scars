@@ -424,6 +424,32 @@ SECRET_RULES: tuple[Rule, ...] = (
     Rule("secret.high_entropy", _high_entropy),
 )
 
+_SECRET_VALUE = r"('[^']*'|\"[^\"]*\"|[^\s'\"]+)"
+_SECRET_OPTION = re.compile(
+    r"(?<![\w-])(--(?:password|passwd|token|api-key|apikey|secret|auth|access-key|private-key))"
+    r"(=(?=\S)|\s+(?!-))" + _SECRET_VALUE,
+    re.IGNORECASE,
+)
+_SECRET_KEY = re.compile(
+    r"(?<![\w./-])((?:[A-Za-z_][\w.]*?)?(?:token|password|passwd|secret|api[-_]?key|auth)[\w.]*)="
+    + _SECRET_VALUE,
+    re.IGNORECASE,
+)
+"""An option (`--token X`, `--token=X`) or a `NAME=value` key whose name says its value is a secret. Any
+non-empty value counts, however plain: the name is the evidence."""
+
+
+def names_secret(text: str) -> bool:
+    """Whether `text` passes a value to an option or key named as a secret."""
+    return _SECRET_OPTION.search(text) is not None or _SECRET_KEY.search(text) is not None
+
+
+def mask_secrets(text: str) -> str:
+    """`text` with the value of every option or key named as a secret replaced by `***`."""
+    text = _SECRET_OPTION.sub(r"\1\2***", text)
+    return _SECRET_KEY.sub(r"\1=***", text)
+
+
 # ---------------------------------------------------------------- machine-scope lint
 
 ALLOWED_ROOTS = ("~/.scars", "/Volumes/990 Pro", "/tmp", "/usr", "/opt")

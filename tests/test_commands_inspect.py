@@ -119,6 +119,20 @@ def test_why_without_a_hit_or_mined_input(home, user_home):
     )
 
 
+def test_ls_and_why_mask_the_value_of_an_argument_named_as_a_secret(home, user_home):
+    lesson_id = seed(
+        home, avoid="pytest --frobnicate --token abc123", passing="pytest DB_PASSWORD=hunter2 tests"
+    )
+    listed = run(make_ctx(user_home), "ls")[1]
+    assert f"{lesson_id:<11} provisional note -      1  repo app  pytest --frobnicate --token ***\n" in listed
+    why = run(make_ctx(user_home), "why", lesson_id)[1]
+    assert "  avoid:   pytest --frobnicate --token ***\n" in why
+    assert "    failed: pytest --frobnicate --token *** tests\n" in why
+    assert "    passed: pytest DB_PASSWORD=*** tests\n" in why
+    assert "abc123" not in listed + why
+    assert "hunter2" not in listed + why
+
+
 def test_why_last_with_no_hits_is_a_user_error(home, user_home):
     assert run(make_ctx(user_home), "why", "last") == (1, "", "scars why: no lesson has been shown yet\n")
 

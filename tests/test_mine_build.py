@@ -81,9 +81,46 @@ def test_an_argument_named_as_a_secret_is_never_mined(secret_arg, side):
 
 
 @pytest.mark.parametrize(
-    "arg", ["--token=short", "--keyword=hunter2hunter2hunter2", "monkey=hunter2hunter2hunter2"]
+    "secret_arg",
+    [
+        "--token abc",
+        "--token=abc",
+        "--password 'p w'",
+        "--passwd x",
+        "--api-key k",
+        "--apikey=k",
+        "--secret s",
+        "--auth u:p",
+        "--access-key AK",
+        "--private-key=pk",
+        "GITHUB_TOKEN=x",
+        "db_password=x",
+        "MY_PASSWD=x",
+        "CLIENT_SECRET=x",
+        "APIKEY=x",
+        "stripe_api_key=x",
+        "BASIC_AUTH=x",
+    ],
 )
-def test_a_short_value_or_another_key_is_not_a_keyed_secret(arg):
+def test_an_argument_named_as_a_secret_is_never_mined_whatever_its_value_or_separator(secret_arg):
+    assert build.secret_rule(f"npm publish {secret_arg} --tag next") == "secret.keyed_argument"
+    with pytest.raises(build.render.RejectedText) as caught:
+        build.build(pair("npm publish --tag next", f"npm publish {secret_arg}"), RepoId("r"), "own")
+    assert (caught.value.rule, caught.value.field) == ("secret.keyed_argument", "passing_input")
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [
+        "--keyword=hunter2hunter2hunter2",
+        "monkey=hunter2hunter2hunter2",
+        "--tokenizer fast",
+        "--author=me",
+        "--token",
+        "--token=",
+    ],
+)
+def test_another_name_or_an_empty_value_is_not_a_keyed_secret(arg):
     assert build.secret_rule(arg) is None
 
 
