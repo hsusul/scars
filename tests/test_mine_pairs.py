@@ -98,10 +98,13 @@ def test_a_pass_on_another_operand_is_skipped_and_the_failure_keeps_waiting():
         ("kubectl --namespace=a get pods", Target("kubectl", ("get",), ("pods",), {"--namespace": ("a",)})),
         ("tail -n 5 build.log", Target("tail", (), ("build.log",), {})),
         ("rm -f a", Target("rm", (), ("a",), {})),
-        ("kubectl --kubeconfig cfg get pods", Target("kubectl", ("get",), ("cfg", "pods"), {})),
+        (
+            "kubectl --kubeconfig cfg get pods",
+            Target("kubectl", ("get",), ("pods",), {"--kubeconfig": ("cfg",)}),
+        ),
         ("npm run build", Target("npm", ("run",), ("build",), {})),
         ("xcrun simctl boot 1111-AAAA", Target("xcrun", ("simctl", "boot"), ("1111-AAAA",), {})),
-        ("xcodebuild -scheme App build", Target("xcodebuild", (), ("App", "build"), {})),
+        ("xcodebuild -scheme App build", Target("xcodebuild", (), ("build",), {"-scheme": ("App",)})),
         ("make -C app test", Target("make", (), ("test",), {"--directory": ("app",)})),
         ("cat --number -- -notes.md", Target("cat", (), ("-notes.md",), {})),
         ("gh api repos/o/r?ref=x", Target("gh", ("api", "repos/o/r?ref=x"), (), {})),
@@ -122,3 +125,86 @@ def test_a_failure_one_second_short_of_a_day_still_pairs():
         (), [failed("f", START, command="pytest --x tests"), late], START + IDLE_SECONDS - 1
     )
     assert outcome(result) == ([("f", "p")], [], 1, 0, 0)
+
+
+NEW_SELECTORS = [
+    ("pnpm", "-C", "test"),
+    ("pnpm", "--dir", "test"),
+    ("pnpm", "--filter", "test"),
+    ("pnpm", "-F", "test"),
+    ("yarn", "--cwd", "test"),
+    ("uv", "--directory", "sync"),
+    ("uv", "--project", "sync"),
+    ("xcodebuild", "-project", "build"),
+    ("xcodebuild", "-workspace", "build"),
+    ("xcodebuild", "-scheme", "build"),
+    ("kubectl", "--kubeconfig", "get pods"),
+    ("kubectl", "-l", "get pods"),
+    ("kubectl", "--selector", "get pods"),
+]
+
+
+@pytest.mark.parametrize(("program", "option", "action"), NEW_SELECTORS)
+def test_new_selectors_skip_a_different_target_and_wait_for_the_fix(program, option, action):
+    result = pair_session(
+        (),
+        [
+            failed("f", START, command=f"{program} {option}=app {action}"),
+            call("other", START + 1, command=f"{program} {option}=other {action}"),
+            call("fix", START + 2, command=f"{program} {option} app {action}"),
+        ],
+        START + 3,
+    )
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 1)
+
+
+@pytest.mark.parametrize(("program", "option", "action"), NEW_SELECTORS)
+def test_adding_or_removing_a_target_selector_still_pairs(program, option, action):
+    results = [
+        pair_session(
+            (),
+            [failed("f", START, command=a), call("p", START + 1, command=b)],
+            START + 2,
+        )
+        for a, b in [
+            (f"{program} {action}", f"{program} {option} app {action}"),
+            (f"{program} {option} app {action}", f"{program} {action}"),
+        ]
+    ]
+    assert [(outcome(result), result.operand_mismatch) for result in results] == [
+        (([("f", "p")], [], 1, 0, 0), 0),
+        (([("f", "p")], [], 1, 0, 0), 0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("program", "short", "long", "action"),
+    [
+        ("git", "-C", "-C", "status"),
+        ("gh", "-R", "--repo", "pr list"),
+        ("npm", "-w", "--workspace", "test"),
+        ("make", "-C", "--directory", "test"),
+        ("make", "-f", "--file", "test"),
+        ("cargo", "-p", "--package", "build"),
+        ("kubectl", "-n", "--namespace", "get pods"),
+        ("kubectl", "-l", "--selector", "get pods"),
+        ("docker", "-H", "--host", "ps"),
+        ("docker", "-c", "--context", "ps"),
+        ("pnpm", "-C", "--dir", "test"),
+        ("pnpm", "-F", "--filter", "test"),
+    ],
+)
+@pytest.mark.parametrize(("value", "other"), [("app", "other"), ("app=one", "other=two")])
+def test_attached_short_selectors_compare_values_and_match_separate_aliases(
+    program, short, long, action, value, other
+):
+    result = pair_session(
+        (),
+        [
+            failed("f", START, command=f"{program} {short}{value} {action}"),
+            call("other", START + 1, command=f"{program} {short}{other} {action}"),
+            call("fix", START + 2, command=f"{program} {long} {value} {action}"),
+        ],
+        START + 3,
+    )
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 1)
