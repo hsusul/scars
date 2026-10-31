@@ -4,9 +4,8 @@
   and the passing input must each be one plain command (`render.plain_command`): a compound, wrapped,
   redirected or run-time-expanded command is not lessonable, and neither is an input holding the scars
   header, so a lesson shown to an agent never feeds back into a new one.
-- `avoid` is the failed command reduced to its program plus the arguments the passing command does not
-  have, written as `shlex.join` and never backticked. When the failed command has no such argument,
-  `avoid` is the whole failed command, because the bare program name would warn against every use of it.
+- `avoid` is the failed command as it ran, written as `shlex.join` of its parsed words (so only its
+  whitespace and quoting are normalized) and never backticked.
 - `instead` is `run `<passing command>` instead`, with the passing command written as `shlex.join` of its
   words. The observation stores that same text as its passing input, so the hook's known commands always
   contain it; one over the 1 KB observation cap drops the candidate instead of being cut.
@@ -26,7 +25,7 @@
 """
 
 import hashlib
-import shlex
+import re
 from dataclasses import dataclass
 
 from scars import render
@@ -130,8 +129,17 @@ def pre_trigger_spec(failed: SimpleCommand, differing: frozenset[str]) -> str | 
     return spec
 
 
+_KEYED_SECRET = re.compile(
+    r"(?<![\w-])-{0,2}(?:token|password|api-key|secret|key)=['\"]?[^\s'\"]{16,}", re.IGNORECASE
+)
+"""An argument whose name says it holds a secret, such as `--token=...`, even when the value is too plain
+for the entropy rule."""
+
+
 def secret_rule(text: str) -> str | None:
     """The name of the first secret rule `text` trips, or None."""
+    if _KEYED_SECRET.search(text):
+        return "secret.keyed_argument"
     return next((rule.name for rule in render.SECRET_RULES if rule.hits(text)), None)
 
 
@@ -178,7 +186,7 @@ def build(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candid
     if failed_cmd.args == passing_cmd.args:
         raise Skipped("identical_retry")
     differing = [a for a in failed_cmd.args if a not in set(passing_cmd.args)]
-    avoid = shlex.join([failed_cmd.program, *(differing or failed_cmd.args)])
+    avoid = render.plain_text(failed_cmd)
     command = render.plain_text(passing_cmd)
     if len(command.encode()) > OBSERVATION_CAP:
         raise Skipped("passing_input_too_long")

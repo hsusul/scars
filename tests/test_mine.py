@@ -154,7 +154,7 @@ def test_pair_in_own_repo_is_an_own_code_candidate_with_both_triggers(env):
     assert lesson.status is Status.CANDIDATE
     assert lesson.trust_class is TrustClass.OWN_CODE
     assert (lesson.text.avoid, lesson.text.instead, lesson.text.reason) == (
-        "pytest --frobnicate",
+        "pytest --frobnicate tests",
         "run `pytest tests` instead",
         MINED_WHY,
     )
@@ -1105,7 +1105,7 @@ def test_a_mined_why_is_the_fixed_template_never_the_error_text(env):
     mine_now(env)
     lesson = the_lesson(env)
     assert (lesson.text.avoid, lesson.text.instead, lesson.text.reason) == (
-        "pytest --frobnicate",
+        "pytest --frobnicate tests",
         "run `pytest tests` instead",
         MINED_WHY,
     )
