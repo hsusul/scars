@@ -4,6 +4,9 @@ import re
 
 from scars.model import ErrorSignature
 
+HEADER_PREFIX = "[scars "
+"""How every rendered lesson starts. Text holding it, in any case, is never mined."""
+
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _NOISE = [
     (
@@ -29,8 +32,11 @@ _MAX = 120
 
 
 def signature(text: str) -> ErrorSignature | None:
-    """Normalize tool error output to a signature, or None when no lesson could address it."""
-    if text.startswith(_USER_REJECTION):
+    """Normalize tool error output to a signature, or None when no lesson could address it.
+
+    Output that quotes a rendered lesson is None, so a lesson cannot seed another from its own text.
+    """
+    if text.startswith(_USER_REJECTION) or HEADER_PREFIX in text.lower():
         return None
     lines = [ln.strip() for ln in _ANSI.sub("", text).strip().splitlines()]
     if any(ln.startswith("Traceback") for ln in lines):

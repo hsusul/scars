@@ -4,7 +4,7 @@ import os
 import time
 
 from cli_helpers import DAY, NOW, SIG, claude_transcript, connect, make_ctx, run
-from scars import mine, store, telemetry
+from scars import mine, render, store, telemetry
 from scars.commands import doctor
 from scars.model import HitOutcome, LessonText, RepoScope, Stage, Trigger, TriggerKind, TrustClass
 
@@ -137,15 +137,22 @@ def big_store(home):
 
 def add_lesson(db, i):
     sig = f"tool{i}: error: unknown flag --bad{i}"
-    store.create_lesson(
+    at = NOW - (i % 60) * DAY
+    lesson_id = store.create_lesson(
         db,
-        text=LessonText(f"tool{i} --bad{i}", f"run `tool{i} --good` instead", sig),
+        text=LessonText(f"tool{i} --bad{i}", f"run `tool{i} --good` instead", render.MINED_REASON),
         scope=RepoScope("app"),
         trust_class=TrustClass.OWN_CODE,
         triggers=[Trigger(TriggerKind.ERROR, sig, Stage.REPAIR)],
         fingerprint=f"fp-{i}",
         actor="miner",
-        at=NOW - (i % 60) * DAY,
+        at=at,
+    )
+    store.add_observation(
+        db,
+        store.Observation(
+            lesson_id, "claude", f"s{i}", f"tu{i}", f"tool{i} --bad{i}", sig, f"tool{i} --good", at
+        ),
     )
 
 

@@ -1,13 +1,15 @@
 """Turn one failure-then-fix pair into a candidate lesson, or a named reason why not.
 
-- `avoid` is the failed command reduced to its program plus the arguments the passing command does not
-  have, shell-quoted and never backticked. When the failed command has no such argument, `avoid` is the
-  whole normalized failed command, because the bare program name would warn against every use of it.
-- `instead` is `run `<passing command>` instead`, with the passing command normalized, so it equals the
-  observed command the render check compares it with. The observation stores that same normalized
-  command as its passing input, so the hook's known commands always contain it; a normalized command
-  over the 1 KB observation cap drops the candidate instead of being cut to a different string.
-- `reason` is the error signature.
+- Only structured data built from the parsed calls goes into a lesson, never transcript prose. The failed
+  and the passing input must each be one plain command (`render.plain_command`): a compound, wrapped,
+  redirected or run-time-expanded command is not lessonable, and neither is an input holding the scars
+  header, so a lesson shown to an agent never feeds back into a new one.
+- `avoid` is the failed command as it ran, written as `shlex.join` of its parsed words (so only its
+  whitespace and quoting are normalized) and never backticked.
+- `instead` is `run `<passing command>` instead`, with the passing command written as `shlex.join` of its
+  words. The observation stores that same text as its passing input, so the hook's known commands always
+  contain it; one over the 1 KB observation cap drops the candidate instead of being cut.
+- `reason` is `render.MINED_REASON`. The error signature is kept only as the error trigger.
 - Triggers: the `error` trigger at the repair stage, plus a `command` pre-trigger at the gate stage made
   from the program and its distinguishing arguments (`prog ** arg1 ** arg2`), when at least one such
   argument can be written as a spec token. An argument after `--`, one the shell expands at run time, or
@@ -15,14 +17,15 @@
   match every run of it, so then the lesson gets its error trigger only. The gate stage is the one that
   evaluates command triggers; the Phase 1 hook delivers nothing there, so the pre-trigger serves the
   precision check and outcome attribution until gate blocking ships.
-- The would-be lesson must render within the repair budget, with its own command as the known command.
+- The would-be lesson must pass `render.check_budgets`, with its own command as the known command, so it
+  still fits each stage's budget with the longest header it can reach (the store's 10-character ids).
 - Scope is the repo of the passing call's working directory, or the session when that directory is in
   no registered clone. Repos registered as `upstream` give trust class `third_party_repo`.
 - The fingerprint hashes the scope and the error signature, never the command text.
 """
 
 import hashlib
-import shlex
+import re
 from dataclasses import dataclass
 
 from scars import render
@@ -47,6 +50,7 @@ from scars.model import (
     TrustClass,
 )
 from scars.shell import SimpleCommand, Unsupported, parse
+from scars.signature import HEADER_PREFIX
 
 INSTEAD_TEMPLATE = render.INSTEAD_TEMPLATES[2]
 OBSERVATION_CAP = 1024
@@ -83,14 +87,21 @@ def fingerprint(scope: Scope, sig: str) -> str:
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()
 
 
-def _first(command: str) -> SimpleCommand:
+def _plain(command: str) -> SimpleCommand:
+    if HEADER_PREFIX in command.lower():
+        raise Skipped("scars_header")
     try:
         commands = parse(command)
     except Unsupported:
         raise Skipped("unparseable_command") from None
     if not commands:
         raise Skipped("unparseable_command")
-    return commands[0]
+    if len(commands) > 1:
+        raise Skipped("compound_command")
+    simple = render.plain_command(command)
+    if simple is None:
+        raise Skipped("not_plain_command")
+    return simple
 
 
 def _spec_token(arg: str) -> bool:
@@ -118,8 +129,17 @@ def pre_trigger_spec(failed: SimpleCommand, differing: frozenset[str]) -> str | 
     return spec
 
 
+_KEYED_SECRET = re.compile(
+    r"(?<![\w-])-{0,2}(?:token|password|api-key|secret|key)=['\"]?[^\s'\"]{16,}", re.IGNORECASE
+)
+"""An argument whose name says it holds a secret, such as `--token=...`, even when the value is too plain
+for the entropy rule."""
+
+
 def secret_rule(text: str) -> str | None:
     """The name of the first secret rule `text` trips, or None."""
+    if _KEYED_SECRET.search(text):
+        return "secret.keyed_argument"
     return next((rule.name for rule in render.SECRET_RULES if rule.hits(text)), None)
 
 
@@ -131,9 +151,9 @@ def _cap(text: str) -> str:
 _PREVIEW_ID = LessonId("L-00000000")
 
 
-def _fits_repair_budget(
+def _check_budgets(
     text: LessonText, scope: Scope, trust: TrustClass, triggers: tuple[Trigger, ...], command: str
-) -> bool:
+) -> None:
     preview = Lesson(
         id=_PREVIEW_ID,
         revision=1,
@@ -147,8 +167,12 @@ def _fits_repair_budget(
         fingerprint="",
         sessions_seen=1,
     )
-    rendered = render.render(preview, known_commands=frozenset({command}))
-    return not render.fit([render.Rendered(_PREVIEW_ID, rendered)], render.REPAIR_BUDGET).dropped
+    try:
+        render.check_budgets(preview, known_commands=frozenset({command}))
+    except render.RejectedText as exc:
+        if not exc.rule.startswith("budget."):
+            raise
+        raise Skipped(f"over_{exc.rule.removeprefix('budget.')}_budget") from None
 
 
 def build(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candidate:
@@ -156,24 +180,24 @@ def build(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candid
     failed, passing = pair.failed, pair.passing
     if passing.tool_kind is not ToolKind.SHELL or passing.command is None:
         raise Skipped("non_shell_tool")
-    if render.normalize_command(failed.input) == render.normalize_command(passing.input):
+    failed_cmd, passing_cmd = _plain(failed.input), _plain(passing.input)
+    if failed_cmd.program != passing_cmd.program:
+        raise Skipped("program_mismatch")
+    if failed_cmd.args == passing_cmd.args:
         raise Skipped("identical_retry")
-    failed_cmd, passing_cmd = _first(failed.input), _first(passing.input)
     differing = [a for a in failed_cmd.args if a not in set(passing_cmd.args)]
-    if differing:
-        avoid = " ".join([failed_cmd.program, *(shlex.quote(a) for a in differing)])
-    else:
-        avoid = render.normalize_command(failed.input)
-    command = render.normalize_command(passing.input)
+    avoid = render.plain_text(failed_cmd)
+    command = render.plain_text(passing_cmd)
     if len(command.encode()) > OBSERVATION_CAP:
         raise Skipped("passing_input_too_long")
     instead = INSTEAD_TEMPLATE.format(command=command)
     scope: Scope = RepoScope(repo_id) if repo_id else SessionScope(SessionId(failed.session_id))
     trust = TrustClass.THIRD_PARTY_REPO if owner_class == "upstream" else TrustClass.OWN_CODE
     text = render.check_fields(
-        avoid, instead, failed.signature, scope, known_commands=frozenset({command}), trust_class=trust
+        avoid, instead, render.MINED_REASON, scope, known_commands=frozenset({command}), trust_class=trust
     )
-    for field, value in (("failed_input", failed.input), ("passing_input", passing.input)):
+    inputs = (("failed_input", failed.input), ("passing_input", passing.input), ("reason", failed.signature))
+    for field, value in inputs:
         if (rule := secret_rule(value)) is not None:
             raise render.RejectedText(rule, field)
     try:
@@ -184,8 +208,7 @@ def build(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candid
     error_trigger = Trigger(TriggerKind.ERROR, failed.signature, Stage.REPAIR)
     pre_trigger = Trigger(TriggerKind.COMMAND, spec, Stage.GATE) if spec else None
     triggers = (error_trigger, *([pre_trigger] if pre_trigger else []))
-    if not _fits_repair_budget(text, scope, trust, triggers, command):
-        raise Skipped("over_repair_budget")
+    _check_budgets(text, scope, trust, triggers, command)
     return Candidate(
         fingerprint=fingerprint(scope, failed.signature),
         scope=scope,

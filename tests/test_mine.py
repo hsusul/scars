@@ -10,10 +10,10 @@ import pytest
 
 from scars import mine, store
 from scars.mine import Source, Summary
-from scars.model import Harness, RepoId, Stage, Status, Trigger, TriggerKind, TrustClass
+from scars.model import Harness, RepoId, RepoScope, Stage, Status, Trigger, TriggerKind, TrustClass
 
 FIXTURES = Path(__file__).parent / "fixtures" / "transcripts"
-T0 = 1_800_000_000.0
+START = 1_800_000_000.0
 DAY = 86400.0
 FAIL_TEXT = "pytest: error: unrecognized arguments: --frobnicate"
 SIG = "pytest: error: unrecognized arguments: --frobnicate"
@@ -26,7 +26,7 @@ def iso(t: float) -> str:
 class Claude:
     """Builds a synthetic Claude Code transcript, one tool call at a time."""
 
-    def __init__(self, cwd: str, start: float = T0) -> None:
+    def __init__(self, cwd: str, start: float = START) -> None:
         self.cwd = cwd
         self.at = start
         self.records: list[dict[str, object]] = []
@@ -112,14 +112,16 @@ def env(tmp_root: Path) -> dict[str, object]:
 
 
 def common_dir_of(cwd: str) -> str | None:
-    if cwd.endswith("/app"):
+    if cwd.endswith("/app") or "/app/" in cwd:
         return "/git/app"
-    if cwd.endswith("/lib"):
+    if cwd.endswith("/lib") or "/lib/" in cwd:
         return "/git/lib"
     return None
 
 
-def mine_now(env: dict[str, object], now: float = T0 + DAY, sources: list[Source] | None = None) -> Summary:
+def mine_now(
+    env: dict[str, object], now: float = START + DAY, sources: list[Source] | None = None
+) -> Summary:
     sources = sources or [Source(Harness.CLAUDE, env["projects"], "*/*.jsonl")]  # type: ignore[arg-type]
     return mine.run(env["home"], sources, now, common_dir_of=common_dir_of)  # type: ignore[arg-type]
 
@@ -134,7 +136,7 @@ def lessons_db(env: dict[str, object]) -> sqlite3.Connection:
     return store.connect(env["home"] / "lessons.db")  # type: ignore[operator]
 
 
-def basic_pair(cwd: str, start: float = T0, prefix: str = "t") -> Claude:
+def basic_pair(cwd: str, start: float = START, prefix: str = "t") -> Claude:
     return (
         Claude(cwd, start)
         .bash(f"{prefix}1", "pytest --frobnicate tests", FAIL_TEXT)
@@ -143,20 +145,20 @@ def basic_pair(cwd: str, start: float = T0, prefix: str = "t") -> Claude:
     )
 
 
-def test_pair_in_own_repo_becomes_provisional_with_both_triggers(env):
+def test_pair_in_own_repo_is_an_own_code_candidate_with_both_triggers(env):
     write(env, "s1", basic_pair(env["repo"]).text())
     summary = mine_now(env)
     assert summary == Summary(
-        sessions_read=1, calls=3, failures=1, pairs=1, candidates_created=1, observations=1, provisionalized=1
+        sessions_read=1, calls=3, failures=1, pairs=1, candidates_created=1, observations=1
     )
     db = lessons_db(env)
-    (lesson,) = store.inbox_candidates(db) + store.active_for_hook(db, RepoId("own-app"), "x")
-    assert lesson.status is Status.PROVISIONAL
+    (lesson,) = store.inbox_candidates(db)
+    assert lesson.status is Status.CANDIDATE
     assert lesson.trust_class is TrustClass.OWN_CODE
     assert (lesson.text.avoid, lesson.text.instead, lesson.text.reason) == (
-        "pytest --frobnicate",
+        "pytest --frobnicate tests",
         "run `pytest tests` instead",
-        SIG,
+        MINED_WHY,
     )
     assert set(lesson.triggers) == {
         Trigger(TriggerKind.ERROR, SIG, Stage.REPAIR),
@@ -167,8 +169,8 @@ def test_pair_in_own_repo_becomes_provisional_with_both_triggers(env):
     ]
     assert db.execute(
         "select revision, matched_failing, matched_passing, window_days from precision_runs"
-    ).fetchall() == [(2, 1, 0, 30)]
-    assert db.execute("select expires_at from lessons").fetchone()[0] == T0 + 31 + 14 * DAY
+    ).fetchall() == [(1, 1, 0, 30)]
+    assert db.execute("select expires_at from lessons").fetchone()[0] == START + 31 + 14 * DAY
     assert store.verify(db) == []
 
 
@@ -183,7 +185,7 @@ def copy_fixture(source: Path, target: Path, repo: str) -> None:
 def test_static_fixture_pairs_like_the_builder(env):
     copy_fixture(FIXTURES / "claude" / "pair.jsonl", env["projects"] / "p" / "fixture.jsonl", env["repo"])
     summary = mine_now(env)
-    assert (summary.pairs, summary.candidates_created, summary.provisionalized) == (1, 1, 1)
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
 
 
 def test_edit_between_failure_and_fix_is_no_pair(env):
@@ -319,19 +321,19 @@ def test_pending_failure_completes_in_the_next_batch(env):
 
 def test_pending_failure_is_dropped_after_a_day_idle(env):
     write(env, "s1", Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT).text())
-    mine_now(env, now=T0 + 3600)
+    mine_now(env, now=START + 3600)
     db = lessons_db(env)
     assert db.execute("select count(*) from pending_failures").fetchone()[0] == 1
-    mine_now(env, now=T0 + 11 + DAY - 1)
+    mine_now(env, now=START + 11 + DAY - 1)
     assert db.execute("select count(*) from pending_failures").fetchone()[0] == 1
-    mine_now(env, now=T0 + 11 + DAY)
+    mine_now(env, now=START + 11 + DAY)
     assert db.execute("select count(*) from pending_failures").fetchone()[0] == 0
 
 
 def test_upstream_repo_pair_stays_a_third_party_candidate(env):
     write(env, "s1", basic_pair(env["upstream"]).text())
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized) == (1, 0)
+    assert summary.candidates_created == 1
     (lesson,) = store.inbox_candidates(lessons_db(env))
     assert (lesson.status, lesson.trust_class, lesson.scope.kind) == (
         Status.CANDIDATE,
@@ -343,7 +345,7 @@ def test_upstream_repo_pair_stays_a_third_party_candidate(env):
 def test_pair_outside_registered_repos_is_a_session_candidate(env):
     write(env, "s1", basic_pair(env["loose"]).text())
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized) == (1, 0)
+    assert summary.candidates_created == 1
     (lesson,) = store.inbox_candidates(lessons_db(env))
     assert (lesson.status, lesson.scope.kind) == (Status.CANDIDATE, "session")
 
@@ -352,8 +354,8 @@ def test_candidate_with_a_secret_is_dropped_and_counted(env):
     token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
     t = (
         Claude(env["repo"])
-        .bash("t1", "deploy --token=bad", "deploy: invalid token for target")
-        .bash("t2", f"deploy --token={token}")
+        .bash("t1", "deploy --target=bad", "deploy: invalid token for target")
+        .bash("t2", f"deploy --target={token}")
     )
     write(env, "s1", t.text())
     summary = mine_now(env)
@@ -373,11 +375,11 @@ def test_secret_in_the_failed_input_alone_is_dropped(env):
     assert mine_now(env).rejected == {"secret.github_token": 1}
 
 
-def test_secret_outside_the_lesson_text_still_drops_the_candidate(env):
+def test_a_secret_in_the_failed_command_drops_the_candidate(env):
     token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
     t = (
         Claude(env["repo"])
-        .bash("t1", f"pytest --frobnicate tests; echo {token}", FAIL_TEXT)
+        .bash("t1", f"pytest --frobnicate tests --auth {token}", FAIL_TEXT)
         .bash("t2", "pytest tests")
     )
     write(env, "s1", t.text())
@@ -386,7 +388,7 @@ def test_secret_outside_the_lesson_text_still_drops_the_candidate(env):
 
 def test_lessons_expire_fourteen_days_after_the_last_sighting(env):
     write(env, "s1", basic_pair(env["repo"]).text())
-    last_seen = T0 + 31
+    last_seen = START + 31
     assert mine_now(env, now=last_seen + 14 * DAY - 1).expired == 0
     summary = mine_now(env, now=last_seen + 14 * DAY)
     assert summary.expired == 1
@@ -397,18 +399,163 @@ def test_lessons_expire_fourteen_days_after_the_last_sighting(env):
 
 def test_second_sighting_observes_the_same_lesson_and_resets_expiry(env):
     write(env, "s1", basic_pair(env["repo"]).text())
-    write(env, "s2", basic_pair(env["repo"], start=T0 + 5 * DAY, prefix="u").text())
-    summary = mine_now(env, now=T0 + 6 * DAY)
-    assert (summary.pairs, summary.candidates_created, summary.observations, summary.provisionalized) == (
-        2,
-        1,
-        2,
-        1,
-    )
+    write(env, "s2", basic_pair(env["repo"], start=START + 5 * DAY, prefix="u").text())
+    summary = mine_now(env, now=START + 6 * DAY)
+    assert (summary.pairs, summary.candidates_created, summary.observations) == (2, 1, 2)
     db = lessons_db(env)
     assert db.execute("select status, sessions_seen, last_seen_at, fix_programs from lessons").fetchall() == [
-        ("provisional", 2, T0 + 5 * DAY + 31, '["pytest"]')
+        ("candidate", 2, START + 5 * DAY + 31, '["pytest"]')
     ]
+    assert store.verify(db) == []
+
+
+def test_a_mined_lesson_that_no_longer_renders_is_retired_and_mined_afresh(env):
+    from scars.mine.build import fingerprint
+    from scars.model import LessonText
+
+    db = lessons_db(env)
+    legacy = store.create_lesson(
+        db,
+        text=LessonText("pytest --frobnicate", "run `pytest tests` instead", FAIL_TEXT),
+        scope=RepoScope(RepoId("own-app")),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=(Trigger(TriggerKind.ERROR, SIG, Stage.REPAIR),),
+        fingerprint=fingerprint(RepoScope(RepoId("own-app")), SIG),
+        actor="miner",
+        at=START,
+    )
+    store.add_observation(
+        db,
+        store.Observation(
+            legacy, "claude", "s0", "old1", "pytest --frobnicate tests", SIG, "pytest tests", START
+        ),
+    )
+    db.commit()
+    write(env, "s1", basic_pair(env["repo"]).text())
+    summary = mine_now(env)
+    assert (summary.candidates_created, summary.retired_unrenderable) == (1, {"mined.reason_template": 1})
+    assert db.execute(
+        "select type, payload from events where lesson_id = ? order by seq", (legacy,)
+    ).fetchall() == [
+        (
+            "proposed",
+            db.execute(
+                "select payload from events where lesson_id = ? and type = 'proposed'", (legacy,)
+            ).fetchone()[0],
+        ),
+        ("retired", '{"reason":"cannot render: mined.reason_template"}'),
+    ]
+    (fresh,) = store.inbox_candidates(db)
+    assert (fresh.text.avoid, fresh.text.reason, fresh.sessions_seen) == (
+        "pytest --frobnicate tests",
+        MINED_WHY,
+        1,
+    )
+    assert store.verify(db) == []
+
+
+def legacy_lesson(env, fingerprint="fp-legacy", reason=FAIL_TEXT, avoid="pytest --frobnicate tests"):
+    from scars.model import LessonText
+
+    db = lessons_db(env)
+    legacy = store.create_lesson(
+        db,
+        text=LessonText(avoid, "run `pytest tests` instead", reason),
+        scope=RepoScope(RepoId("own-app")),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=(Trigger(TriggerKind.ERROR, "pytest: error: old signature", Stage.REPAIR),),
+        fingerprint=fingerprint,
+        actor="miner",
+        at=START,
+    )
+    store.add_observation(
+        db,
+        store.Observation(
+            legacy, "claude", "s0", "old1", "pytest --frobnicate tests", SIG, "pytest tests", START
+        ),
+    )
+    db.commit()
+    return db, legacy
+
+
+def test_a_legacy_lesson_is_retired_on_any_run_once_and_never_beside_its_re_mined_twin(env):
+    db, legacy = legacy_lesson(env)
+    write(env, "s1", basic_pair(env["repo"]).text())
+    first = mine_now(env)
+    assert (first.retired_unrenderable, first.candidates_created) == ({"mined.reason_template": 1}, 1)
+    second = mine_now(env, now=START + 2 * DAY)
+    assert (second.retired_unrenderable, second.candidates_created) == ({}, 0)
+    assert db.execute("select type from events where lesson_id = ? order by seq", (legacy,)).fetchall() == [
+        ("proposed",),
+        ("retired",),
+    ]
+    assert db.execute("select avoid, status from lessons where status != 'retired'").fetchall() == [
+        ("pytest --frobnicate tests", "candidate")
+    ]
+
+
+def test_a_legacy_lesson_naming_a_secret_argument_is_retired(env):
+    db, legacy = legacy_lesson(env, reason=MINED_WHY, avoid="pytest --frobnicate --token hunter2")
+    assert mine_now(env).retired_unrenderable == {"secret.keyed_argument": 1}
+    assert store.get_lesson(db, legacy).status is Status.RETIRED
+
+
+def test_a_legacy_lesson_is_retired_even_when_no_transcript_sights_it(env):
+    db, legacy = legacy_lesson(env)
+    assert mine_now(env).retired_unrenderable == {"mined.reason_template": 1}
+    assert store.get_lesson(db, legacy).status is Status.RETIRED
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_the_miner_never_retires_a_promoted_lesson_that_no_longer_renders(env, pinned):
+    from scars.mine.build import fingerprint
+    from scars.model import EventType
+
+    db, legacy = legacy_lesson(env, fingerprint=fingerprint(RepoScope(RepoId("own-app")), SIG))
+    store.apply_event(
+        db,
+        lesson_id=legacy,
+        event=EventType.PROMOTED,
+        expected_revision=1,
+        actor="human",
+        payload={},
+        at=START,
+    )
+    if pinned:
+        store.apply_event(
+            db,
+            lesson_id=legacy,
+            event=EventType.PINNED,
+            expected_revision=2,
+            actor="human",
+            payload={},
+            at=START,
+        )
+    db.commit()
+    write(env, "s1", basic_pair(env["repo"]).text())
+    summary = mine_now(env)
+    assert (summary.retired_unrenderable, summary.candidates_created) == ({}, 0)
+    lesson = store.get_lesson(db, legacy)
+    assert (lesson.status, lesson.pinned, lesson.text.reason) == (Status.PROMOTED, pinned, FAIL_TEXT)
+    assert db.execute("select count(*) from lessons").fetchone() == (1,)
+
+
+def test_seen_counts_distinct_sessions_not_observations(env):
+    write(
+        env,
+        "s1",
+        basic_pair(env["repo"])
+        .bash("t4", "pytest --frobnicate tests", FAIL_TEXT)
+        .bash("t5", "pytest tests")
+        .text(),
+    )
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.observations) == (2, 1, 2)
+    db = lessons_db(env)
+    assert db.execute("select sessions_seen from lessons").fetchall() == [(1,)]
+    write(env, "s2", basic_pair(env["repo"], start=START + 100, prefix="u").text())
+    mine_now(env)
+    assert db.execute("select sessions_seen from lessons").fetchall() == [(2,)]
     assert store.verify(db) == []
 
 
@@ -421,7 +568,7 @@ def test_precision_drops_a_broad_pre_trigger_but_keeps_the_error_trigger(env):
     summary = mine_now(env)
     assert (summary.candidates_created, summary.pre_triggers_dropped) == (1, 1)
     db = lessons_db(env)
-    (lesson,) = store.active_for_hook(db, RepoId("own-app"), "x")
+    (lesson,) = store.inbox_candidates(db)
     assert lesson.triggers == (Trigger(TriggerKind.ERROR, "fatal: invalid number of commits", Stage.REPAIR),)
     assert db.execute("select matched_failing, matched_passing from precision_runs").fetchall() == [(1, 5)]
 
@@ -445,10 +592,10 @@ def test_running_twice_changes_nothing(env):
     write(env, "s1", basic_pair(env["repo"]).text())
     write(env, "s2", Claude(env["repo"]).bash("p1", "pytest --frobnicate x", FAIL_TEXT).text())
     assert mine_now(env) == Summary(
-        sessions_read=2, calls=4, failures=2, pairs=1, candidates_created=1, observations=1, provisionalized=1
+        sessions_read=2, calls=4, failures=2, pairs=1, candidates_created=1, observations=1
     )
     before = dump(lessons_db(env))
-    assert [len(rows) for rows in before] == [1, 2, 2, 1, 2, 4, 1, 1, 4]
+    assert [len(rows) for rows in before] == [1, 2, 1, 1, 2, 4, 1, 1, 4]
     assert mine_now(env) == Summary()
     assert dump(lessons_db(env)) == before
 
@@ -458,7 +605,7 @@ def test_running_twice_changes_nothing(env):
 
 def codex_lines(cwd: str) -> list[dict[str, object]]:
     def at(n: int) -> str:
-        return iso(T0 + n)
+        return iso(START + n)
 
     def item(n: int, item_id: str, command: list[str], code: int | None, output: str) -> dict[str, object]:
         return {
@@ -547,7 +694,7 @@ def test_codex_static_fixture(env, tmp_path):
     for f in (FIXTURES / "codex").glob("rollout-*.jsonl"):
         copy_fixture(f, root / f.name, env["repo"])
     summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
-    assert (summary.pairs, summary.candidates_created, summary.provisionalized) == (1, 1, 1)
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
 
 
 def test_codex_reader_trusts_only_visible_exit_codes():
@@ -556,7 +703,7 @@ def test_codex_reader_trusts_only_visible_exit_codes():
 
     def item(n, code):
         return {
-            "timestamp": iso(T0 + n),
+            "timestamp": iso(START + n),
             "type": "event_msg",
             "payload": {
                 "type": "item_completed",
@@ -574,7 +721,7 @@ def test_codex_reader_trusts_only_visible_exit_codes():
     def output(n, text):
         return [
             {
-                "timestamp": iso(T0 + n),
+                "timestamp": iso(START + n),
                 "type": "response_item",
                 "payload": {
                     "type": "function_call",
@@ -584,7 +731,7 @@ def test_codex_reader_trusts_only_visible_exit_codes():
                 },
             },
             {
-                "timestamp": iso(T0 + n),
+                "timestamp": iso(START + n),
                 "type": "response_item",
                 "payload": {"type": "function_call_output", "call_id": f"f{n}", "output": text},
             },
@@ -621,21 +768,21 @@ def test_outcome_pass_writes_outcomes_and_backfills_models(env):
     tdb.execute(
         "insert into hits (seq, at, harness, session_id, tool_use_id, event, stage, lesson_id, outcome) "
         "values (1, ?, 'claude', 's1', 't1', 'tool_failed', 'repair', 'L-x', 'shown')",
-        (T0 + 11,),
+        (START + 11,),
     )
     tdb.execute(
         "insert into hits (seq, at, harness, session_id, event, outcome) "
         "values (2, ?, 'claude', 's1', 'prompt', 'no_match')",
-        (T0 + 5,),
+        (START + 5,),
     )
-    summary = mine_now(env, now=T0 + 2 * DAY)
+    summary = mine_now(env, now=START + 2 * DAY)
     assert (summary.outcomes_written, summary.models_backfilled) == (1, 2)
     assert tdb.execute("select hit_seq, outcome from outcomes").fetchall() == [(1, "heeded")]
     assert tdb.execute("select model_id from hits order by seq").fetchall() == [
         ("claude-test-1",),
         ("claude-test-1",),
     ]
-    assert mine_now(env, now=T0 + 2 * DAY) == Summary()
+    assert mine_now(env, now=START + 2 * DAY) == Summary()
 
 
 def test_missing_telemetry_is_skipped(env):
@@ -653,7 +800,7 @@ GATE = Trigger(TriggerKind.COMMAND, "pytest ** --frobnicate", Stage.GATE)
 
 def the_lesson(env):
     (lesson,) = store.inbox_candidates(lessons_db(env)) + store.active_for_hook(
-        lessons_db(env), RepoId("own-app"), "x"
+        lessons_db(env), RepoId("own-app")
     )
     return lesson
 
@@ -685,10 +832,27 @@ def failure_event(cwd: str, session: str = "later"):
 
 def test_mined_lesson_is_selected_at_repair_and_shown_by_the_hook(env, monkeypatch):
     from scars import hook, match, telemetry
-    from scars.model import HitOutcome, HookEvent, HookEventKind
+    from scars.model import EventType, HitOutcome, HookEvent, HookEventKind
 
     write(env, "s1", basic_pair(env["repo"]).text())
     mine_now(env)
+    monkeypatch.setenv("SCARS_HOME", str(env["home"]))
+    monkeypatch.setattr(hook, "git_common_dir", lambda cwd: "/git/app")
+    monkeypatch.setattr(hook, "repo_root", lambda cwd: env["repo"])
+    own_session = failure_event(env["repo"], session="s1")
+    unreviewed = hook.decide(own_session, "PostToolUseFailure", telemetry.EMPTY, now=START + 2 * DAY)
+    assert (unreviewed.outcome, unreviewed.shown) == (HitOutcome.NO_MATCH, [])
+    db = lessons_db(env)
+    (candidate,) = store.inbox_candidates(db)
+    store.apply_event(
+        db,
+        lesson_id=candidate.id,
+        event=EventType.PROMOTED,
+        expected_revision=candidate.revision,
+        actor="human",
+        payload={},
+        at=START + DAY,
+    )
     lesson = the_lesson(env)
     event = failure_event(env["repo"])
     context = match.MatchContext(env["repo"], RepoId("own-app"), SIG)
@@ -698,10 +862,7 @@ def test_mined_lesson_is_selected_at_repair_and_shown_by_the_hook(env, monkeypat
     pre_tool = HookEvent(**{**event.__dict__, "event": HookEventKind.PRE_TOOL, "error_text": None})
     assert match.matches(GATE, pre_tool) is True
     assert match.select([lesson], pre_tool, context).selected == ()
-    monkeypatch.setenv("SCARS_HOME", str(env["home"]))
-    monkeypatch.setattr(hook, "git_common_dir", lambda cwd: "/git/app")
-    monkeypatch.setattr(hook, "repo_root", lambda cwd: env["repo"])
-    decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=T0 + 2 * DAY)
+    decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=START + 2 * DAY)
     assert decision.outcome is HitOutcome.SHOWN
     assert [s.lesson_id for s in decision.shown] == [lesson.id]
     text = json.dumps(decision.output)
@@ -768,7 +929,7 @@ def boom_once(monkeypatch, name, when=lambda kwargs: True):
 @pytest.mark.parametrize(
     ("name", "when"),
     [
-        ("apply_event", lambda kw: str(kw.get("event")) == "provisionalized"),
+        ("create_lesson", lambda kw: True),
         ("record_precision", lambda kw: True),
         ("add_observation", lambda kw: True),
     ],
@@ -780,12 +941,11 @@ def test_a_crash_while_writing_a_new_lesson_leaves_nothing_behind(env, monkeypat
         mine_now(env)
     assert fired == [1]
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized, summary.observations) == (1, 1, 1)
+    assert (summary.candidates_created, summary.observations) == (1, 1)
     db = lessons_db(env)
-    assert db.execute("select status, sessions_seen from lessons").fetchall() == [("provisional", 1)]
+    assert db.execute("select status, sessions_seen from lessons").fetchall() == [("candidate", 1)]
     assert db.execute("select type from events order by seq").fetchall() == [
         ("proposed",),
-        ("provisionalized",),
     ]
     assert store.verify(db) == []
 
@@ -793,7 +953,7 @@ def test_a_crash_while_writing_a_new_lesson_leaves_nothing_behind(env, monkeypat
 def test_a_crash_between_observed_and_the_observation_does_not_double_count(env, monkeypatch):
     write(env, "s1", basic_pair(env["repo"]).text())
     mine_now(env)
-    write(env, "s2", basic_pair(env["repo"], start=T0 + 100, prefix="u").text())
+    write(env, "s2", basic_pair(env["repo"], start=START + 100, prefix="u").text())
     boom_once(monkeypatch, "add_observation")
     with pytest.raises(RuntimeError):
         mine_now(env)
@@ -803,13 +963,12 @@ def test_a_crash_between_observed_and_the_observation_does_not_double_count(env,
     assert db.execute("select sessions_seen from lessons").fetchall() == [(2,)]
     assert db.execute("select type from events order by seq").fetchall() == [
         ("proposed",),
-        ("provisionalized",),
         ("observed",),
     ]
 
 
 def codex_record(n: int, kind: str, payload: dict[str, object]) -> str:
-    return json.dumps({"timestamp": iso(T0 + n), "type": kind, "payload": payload}) + "\n"
+    return json.dumps({"timestamp": iso(START + n), "type": kind, "payload": payload}) + "\n"
 
 
 def command_item(n: int, item_id: str, command: str, code: int, output: str = "") -> str:
@@ -833,7 +992,7 @@ def test_codex_context_carries_over_to_the_next_batch(env, tmp_path):
     with path.open("a") as f:
         f.write(command_item(3, "e2", "pytest tests", 0))
     summary = mine_now(env, sources=[source])
-    assert (summary.pairs, summary.candidates_created, summary.provisionalized) == (1, 1, 1)
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
     db = lessons_db(env)
     assert db.execute("select cwd, model_id from mined_calls where tool_use_id = 'e2'").fetchall() == [
         (env["repo"], "gpt-test")
@@ -947,12 +1106,12 @@ def test_a_session_with_a_recent_hit_has_not_ended(env):
     write(env, "s1", Claude(env["repo"]).read("t1").text())
     tdb = telemetry_with(
         env,
-        (1, T0 + 20, "s1", "plan", "L-x", "shown", "prompt:plan:deploy"),
-        (2, T0 + 20 * 3600, "s1", None, None, "no_match", None),
+        (1, START + 20, "s1", "plan", "L-x", "shown", "prompt:plan:deploy"),
+        (2, START + 20 * 3600, "s1", None, None, "no_match", None),
     )
-    assert mine_now(env, now=T0 + 25 * 3600).outcomes_written == 0
+    assert mine_now(env, now=START + 25 * 3600).outcomes_written == 0
     assert tdb.execute("select count(*) from outcomes").fetchone()[0] == 0
-    assert mine_now(env, now=T0 + 44 * 3600 + 1).outcomes_written == 1
+    assert mine_now(env, now=START + 44 * 3600 + 1).outcomes_written == 1
     assert tdb.execute("select hit_seq, outcome from outcomes").fetchall() == [(1, "no_attempt")]
 
 
@@ -968,7 +1127,7 @@ def add_path_lesson(env, *triggers: Trigger) -> str:
         triggers=(Trigger(TriggerKind.ERROR, SIG, Stage.REPAIR), *triggers),
         fingerprint="fp-path",
         actor="test",
-        at=T0,
+        at=START,
     )
 
 
@@ -983,16 +1142,16 @@ def test_plan_hit_on_a_path_trigger_finds_absolute_paths_under_the_repo_root(env
     lesson = add_path_lesson(env, Trigger(TriggerKind.PATH, "src/**", Stage.PLAN))
     t = Claude(env["repo"]).call("t1", "Edit", {**EDIT_ARGS, "file_path": f"{env['repo']}/src/app.py"})
     write(env, "s1", t.text())
-    tdb = telemetry_with(env, (1, T0, "s1", "plan", lesson, "shown", "path:plan:src/**"))
-    assert mine_with_roots(env, T0 + 2 * DAY).outcomes_written == 1
+    tdb = telemetry_with(env, (1, START, "s1", "plan", lesson, "shown", "path:plan:src/**"))
+    assert mine_with_roots(env, START + 2 * DAY).outcomes_written == 1
     assert tdb.execute("select outcome from outcomes").fetchall() == [("fired_unneeded",)]
 
 
 def test_plan_hit_is_attributed_to_the_trigger_that_fired(env):
     lesson = add_path_lesson(env, Trigger(TriggerKind.PATH, "src/**", Stage.PLAN), GATE)
     write(env, "s1", Claude(env["repo"]).bash("t1", "pytest --frobnicate tests").text())
-    tdb = telemetry_with(env, (1, T0, "s1", "plan", lesson, "shown", "path:plan:src/**"))
-    mine_with_roots(env, T0 + 2 * DAY)
+    tdb = telemetry_with(env, (1, START, "s1", "plan", lesson, "shown", "path:plan:src/**"))
+    mine_with_roots(env, START + 2 * DAY)
     assert tdb.execute("select outcome from outcomes").fetchall() == [("no_attempt",)]
 
 
@@ -1028,7 +1187,7 @@ def test_no_distinguishing_argument_means_no_pre_trigger_and_the_full_avoid(env)
 
 
 def test_a_candidate_over_the_repair_budget_is_dropped(env):
-    fix = "pytest " + " ".join(f"tests/unit/test_mod{i}.py" for i in range(8))
+    fix = "pytest " + " ".join(f"tests/unit/test_mod{i}.py" for i in range(9))
     t = Claude(env["repo"]).bash("t1", fix + " --frobnicate", FAIL_TEXT).bash("t2", fix)
     write(env, "s1", t.text())
     summary = mine_now(env)
@@ -1036,8 +1195,201 @@ def test_a_candidate_over_the_repair_budget_is_dropped(env):
     assert summary.skipped == {"over_repair_budget": 1}
 
 
-def test_a_deleted_worktree_cwd_resolves_through_its_nearest_parent(env):
+def test_a_cwd_that_no_longer_exists_is_unknown_and_never_pairs(env):
     write(env, "s1", basic_pair(env["repo"] + "/gone/deeper").text())
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.provisionalized) == (1, 1)
-    assert the_lesson(env).scope.kind == "repo"
+    assert (summary.failures, summary.pairs, summary.candidates_created) == (1, 0, 0)
+
+
+def test_an_empty_cwd_is_unknown_and_never_pairs(env):
+    write(env, "s1", basic_pair("").text())
+    summary = mine_now(env)
+    assert (summary.failures, summary.pairs, summary.candidates_created) == (1, 0, 0)
+
+
+def test_unregistered_directories_compare_by_realpath(env):
+    link = Path(env["loose"]).parent / "loose-link"
+    link.symlink_to(env["loose"])
+    t = Claude(env["loose"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    t.cwd = str(link)
+    t.bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env).pairs == 1
+
+
+def test_a_claude_call_runs_in_its_invocation_cwd_not_the_result_records(env):
+    t = Claude(env["upstream"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT).bash("t2", "pytest tests")
+    for record in t.records:
+        if record["type"] == "user":
+            record["cwd"] = env["repo"]
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert summary.pairs == 1
+    assert lessons_db(env).execute("select cwd from mined_calls order by tool_use_id").fetchall() == [
+        (env["upstream"],),
+        (env["upstream"],),
+    ]
+    assert the_lesson(env).trust_class is TrustClass.THIRD_PARTY_REPO
+
+
+def test_a_codex_file_url_cwd_is_decoded_to_a_path(env, tmp_path):
+    from urllib.parse import quote
+
+    spaced = Path(env["loose"]) / "my app"
+    spaced.mkdir()
+    url = "file://" + quote(str(spaced))
+    root = tmp_path / "codex"
+    root.mkdir()
+    (root / "rollout-2027-01-15T00-00-00-0000000a-0000-4000-8000-000000000009.jsonl").write_text(
+        codex_record(0, "session_meta", {"id": "s", "cwd": url})
+        + codex_record(1, "turn_context", {"model": "gpt-test", "cwd": url})
+        + command_item(2, "e1", "pytest --frobnicate tests", 2, FAIL_TEXT)
+        + command_item(3, "e2", "pytest tests", 0)
+    )
+    summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
+    assert lessons_db(env).execute("select cwd from mined_calls order by tool_use_id").fetchall() == [
+        (str(spaced),),
+        (str(spaced),),
+    ]
+
+
+@pytest.mark.parametrize(("host", "pairs"), [("localhost", 1), ("build-box", 0)])
+def test_a_codex_file_url_on_another_host_is_an_unknown_directory(env, tmp_path, host, pairs):
+    url = f"file://{host}{env['loose']}"
+    root = tmp_path / "codex"
+    root.mkdir()
+    (root / "rollout-2027-01-15T00-00-00-0000000a-0000-4000-8000-00000000000a.jsonl").write_text(
+        codex_record(0, "session_meta", {"id": "s", "cwd": url})
+        + codex_record(1, "turn_context", {"model": "gpt-test", "cwd": url})
+        + command_item(2, "e1", "pytest --frobnicate tests", 2, FAIL_TEXT)
+        + command_item(3, "e2", "pytest tests", 0)
+    )
+    summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
+    assert (summary.pairs, summary.candidates_created) == (pairs, pairs)
+
+
+def test_cd_into_a_literal_dir_then_one_command_is_that_command_run_there(env):
+    work = str(Path(env["repo"]).parent)
+    t = (
+        Claude(work)
+        .bash("t1", "cd app && pytest  --frobnicate tests", FAIL_TEXT)
+        .bash("t2", f"cd {env['repo']} && pytest tests")
+    )
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 1, {})
+    lesson = the_lesson(env)
+    assert (lesson.scope, lesson.text.avoid, lesson.text.instead) == (
+        RepoScope(RepoId("own-app")),
+        "pytest --frobnicate tests",
+        "run `pytest tests` instead",
+    )
+    assert lessons_db(env).execute(
+        "select command, cwd from mined_calls order by tool_use_id"
+    ).fetchall() == [
+        ("pytest --frobnicate tests", env["repo"]),
+        ("pytest tests", env["repo"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "failed",
+    [
+        "cd app && pytest --frobnicate tests && echo done",
+        "cd app; pytest --frobnicate tests",
+        "cd app && cd . && pytest --frobnicate tests",
+        "cd app && pytest --frobnicate tests > log",
+        "cd $APP && pytest --frobnicate tests",
+    ],
+)
+def test_any_other_compound_command_stays_unlessonable(env, failed):
+    work = str(Path(env["repo"]).parent)
+    t = Claude(work).bash("t1", failed, FAIL_TEXT).bash("t2", "cd app && pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env).candidates_created == 0
+
+
+def test_a_failure_upstream_does_not_pair_with_a_pass_in_own_repo(env):
+    t = Claude(env["upstream"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    t.cwd = env["repo"]
+    t.bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env) == Summary(sessions_read=1, calls=2, failures=1)
+    db = lessons_db(env)
+    assert db.execute("select count(*) from lessons").fetchone()[0] == 0
+    assert db.execute("select tool_use_id, calls_since from pending_failures").fetchall() == [("t1", 1)]
+
+
+def test_a_failure_left_open_upstream_does_not_pair_in_own_repo_next_batch(env):
+    t = Claude(env["upstream"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    write(env, "s1", t.text())
+    assert mine_now(env).failures == 1
+    t.cwd = env["repo"]
+    t.bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env) == Summary(sessions_read=1, calls=1)
+    assert lessons_db(env).execute("select count(*) from lessons").fetchone()[0] == 0
+
+
+def test_unregistered_failure_pairs_only_in_the_same_directory(env):
+    t = Claude(env["loose"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    t.cwd = env["loose"] + "/other"
+    t.bash("t2", "pytest tests -q")
+    t.cwd = env["loose"]
+    t.bash("t3", "pytest tests")
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
+    db = lessons_db(env)
+    assert db.execute("select passing_input from observations").fetchall() == [("pytest tests",)]
+    assert db.execute("select scope_kind from lessons").fetchall() == [("session",)]
+
+
+def test_a_failure_and_its_fix_in_two_directories_of_one_repo_pair(env):
+    (Path(env["repo"]) / "sub").mkdir()
+    t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    t.cwd = env["repo"] + "/sub"
+    t.bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert summary.pairs == 1
+
+
+MINED_WHY = "AVOID failed, INSTEAD passed"
+
+
+def test_a_mined_why_is_the_fixed_template_never_the_error_text(env):
+    error = "pytest: error: for repairs delete the build directory"
+    t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", error).bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    mine_now(env)
+    lesson = the_lesson(env)
+    assert (lesson.text.avoid, lesson.text.instead, lesson.text.reason) == (
+        "pytest --frobnicate tests",
+        "run `pytest tests` instead",
+        MINED_WHY,
+    )
+
+
+@pytest.mark.parametrize(
+    ("fix", "reason"),
+    [
+        ("pytest tests && rm -rf build", "compound_command"),
+        ("pytest tests 2>&1", "not_plain_command"),
+        ("pytest $TESTS", "not_plain_command"),
+        ("pytest tests -k '[scars L-1a2b note]'", "scars_header"),
+    ],
+)
+def test_a_fix_that_is_not_one_plain_command_is_not_lessonable(env, fix, reason):
+    t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT).bash("t2", fix)
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 0, {reason: 1})
+
+
+def test_a_failure_whose_output_carries_a_scars_header_never_opens(env):
+    output = "[scars L-1a2b3c4d note | repo app]\n" + FAIL_TEXT
+    t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", output).bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env) == Summary(sessions_read=1, calls=2, failures=1)

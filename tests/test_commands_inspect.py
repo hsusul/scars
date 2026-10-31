@@ -1,5 +1,5 @@
 from cli_helpers import DAY, NOW, SIG, connect, human, make_ctx, run, seed
-from scars import store, telemetry
+from scars import render, store, telemetry
 from scars.model import EventType, HitOutcome
 
 pytest_plugins = ("cli_fixtures",)
@@ -31,7 +31,12 @@ def shown_hit(home, lesson_id, tool_use_id="tu-hook", at=NOW - 600):
 def test_ls_lists_active_lessons(home, user_home):
     a = seed(home)
     b = seed(
-        home, avoid="npm tset", sig="npm ERR! Unknown command: tset", pre_trigger=None, provisional=False
+        home,
+        avoid="npm tset",
+        passing="npm test",
+        sig="npm ERR! Unknown command: tset",
+        pre_trigger=None,
+        provisional=False,
     )
     human(home, a, EventType.PROMOTED)
     human(home, a, EventType.PINNED)
@@ -48,9 +53,21 @@ def test_ls_lists_active_lessons(home, user_home):
     )
 
 
+def test_ls_names_each_lesson_that_cannot_render_and_the_rule_it_breaks(home, user_home):
+    legacy = seed(home, reason="Error: pytest exited with code 4", provisional=False)
+    code, out, err = run(make_ctx(user_home), "ls")
+    assert (code, out.splitlines()[-1], err) == (
+        0,
+        f"cannot render: lesson {legacy} breaks mined.reason_template in reason",
+        "",
+    )
+
+
 def test_ls_filters_by_status_repo_firing_and_stale(home, user_home):
     a = seed(home)
-    b = seed(home, avoid="npm tset", sig="npm ERR! Unknown command: tset", at=NOW - 40 * DAY)
+    b = seed(
+        home, avoid="npm tset", passing="npm test", sig="npm ERR! Unknown command: tset", at=NOW - 40 * DAY
+    )
     human(home, b, EventType.RETIRED)
     shown_hit(home, a)
     assert run(make_ctx(user_home), "ls")[1].count("\n") == 2
@@ -71,7 +88,7 @@ def test_why_shows_trigger_input_observations_and_events(home, user_home):
     expected = f"""{header}
   avoid:   pytest --frobnicate
   instead: run `pytest tests` instead
-  reason:  {SIG}
+  reason:  {render.MINED_REASON}
 triggers:
   command at gate: pytest ** --frobnicate
   error at repair: {SIG}
@@ -100,6 +117,20 @@ def test_why_without_a_hit_or_mined_input(home, user_home):
         "  matched input: not recorded yet (scars mine reads it from the transcript)\n"
         in run(make_ctx(user_home), "why", lesson_id)[1]
     )
+
+
+def test_ls_and_why_mask_the_value_of_an_argument_named_as_a_secret(home, user_home):
+    lesson_id = seed(
+        home, avoid="pytest --frobnicate --token abc123", passing="pytest DB_PASSWORD=hunter2 tests"
+    )
+    listed = run(make_ctx(user_home), "ls")[1]
+    assert f"{lesson_id:<11} provisional note -      1  repo app  pytest --frobnicate --token ***\n" in listed
+    why = run(make_ctx(user_home), "why", lesson_id)[1]
+    assert "  avoid:   pytest --frobnicate --token ***\n" in why
+    assert "    failed: pytest --frobnicate --token *** tests\n" in why
+    assert "    passed: pytest DB_PASSWORD=*** tests\n" in why
+    assert "abc123" not in listed + why
+    assert "hunter2" not in listed + why
 
 
 def test_why_last_with_no_hits_is_a_user_error(home, user_home):

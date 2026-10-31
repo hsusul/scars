@@ -481,20 +481,18 @@ def test_repair_error_trigger_fires_when_the_command_is_unsupported():
     assert ids(select([err], event(HookEventKind.TOOL_FAILED, command="$(xcodebuild)"), ctx)) == ["L-err"]
 
 
-def test_repair_ranks_promoted_then_provisional_and_admits_this_sessions_candidates():
+def test_repair_delivers_only_promoted_lessons_not_even_this_sessions_own_candidates():
     err = Trigger(TriggerKind.ERROR, "boom", Stage.REPAIR)
     ctx = MatchContext(repo_root=ROOT, repo_id=REPO, error_signature=ErrorSignature("boom"))
     lessons = [
-        lesson("L-cand", err, status=Status.CANDIDATE, scope=SessionScope(SessionId("s1")), seen=1),
+        lesson("L-cand", err, status=Status.CANDIDATE, scope=SessionScope(SessionId("s1")), seen=9),
         lesson("L-prov", err, status=Status.PROVISIONAL, seen=9),
         lesson("L-cand-repo", err, status=Status.CANDIDATE, seen=9),
-        lesson("L-cand-other", err, status=Status.CANDIDATE, scope=SessionScope(SessionId("s2")), seen=9),
         lesson("L-retired", err, status=Status.RETIRED, seen=9),
     ]
     failed = event(HookEventKind.TOOL_FAILED)
-    assert ids(select(lessons, failed, ctx)) == ["L-prov", "L-cand"]
-    assert ids(select([*lessons, lesson("L-prom", err, seen=9)], failed, ctx)) == ["L-prom", "L-prov"]
-    assert ids(select([*lessons, lesson("L-prom", err, seen=1)], failed, ctx)) == ["L-prov", "L-prom"]
+    assert ids(select(lessons, failed, ctx)) == []
+    assert ids(select([*lessons, lesson("L-prom", err, seen=1)], failed, ctx)) == ["L-prom"]
 
 
 def test_path_scope_glob_must_match_an_event_path():
@@ -967,14 +965,14 @@ def test_path_scope_admits_a_plan_lesson_from_the_session_cwd():
 # Ranking by score
 
 
-def test_select_ranks_by_score_then_status_then_id():
+def test_select_ranks_by_score_then_id():
     err = Trigger(TriggerKind.ERROR, "boom", Stage.REPAIR)
     ctx = MatchContext(repo_root=ROOT, repo_id=REPO, error_signature=ErrorSignature("boom"))
     failed = event(HookEventKind.TOOL_FAILED)
     lessons = [
         lesson("L-a", err, seen=9),
         lesson("L-b", err, seen=1),
-        lesson("L-c", err, seen=1, status=Status.PROVISIONAL),
+        lesson("L-c", err, seen=1),
         lesson("L-d", err, seen=1),
     ]
     assert ids(select(lessons, failed, ctx)) == ["L-a", "L-b"]
@@ -984,4 +982,4 @@ def test_select_ranks_by_score_then_status_then_id():
     ]
     assert ids(select(lessons, failed, ctx, scores={LessonId("L-c"): 0.5})) == ["L-c", "L-a"]
     assert ids(select(lessons, failed, ctx, scores={})) == ["L-a", "L-b"]
-    assert ids(select(lessons[1:], failed, ctx, scores={})) == ["L-b", "L-d"]
+    assert ids(select(lessons[1:], failed, ctx, scores={})) == ["L-b", "L-c"]

@@ -7,6 +7,7 @@ never a gate lesson that could deny a call, which would make a safety control de
 A deny reason is a quoted string right after the word `deny`, as in `decide deny "..."`. The reason's
 first clause (up to `:` or the first sentence end) becomes `avoid` and the rest `instead`; `reason`
 names the guard. Each lesson's fingerprint comes from the deny text, so importing twice adds nothing.
+A reason whose lesson would not fit the session-start budget is skipped, like one that breaks a text rule.
 """
 
 from __future__ import annotations
@@ -19,14 +20,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scars import render, store
-from scars.commands import Context, UserError, lessons_db, require_human
+from scars.commands import Context, UserError, lessons_db, rejection, require_human
 from scars.model import (
     EventType,
+    Lesson,
     LessonId,
     LessonText,
+    Level,
     MachineScope,
     SessionId,
     SessionScope,
+    Status,
     Trigger,
     TrustClass,
 )
@@ -107,6 +111,23 @@ def create_pinned(
     return lesson_id
 
 
+def preview(text: LessonText) -> Lesson:
+    """The lesson an import would create, for the budget check. The id is as long as the store's."""
+    return Lesson(
+        id=LessonId("L-00000000"),
+        revision=1,
+        status=Status.PROMOTED,
+        level=Level.NOTE,
+        pinned=True,
+        scope=MachineScope(),
+        text=text,
+        trust_class=TrustClass.HUMAN,
+        triggers=(),
+        fingerprint="",
+        sessions_seen=0,
+    )
+
+
 def fingerprint(deny: str) -> str:
     return "guard:" + hashlib.sha256(deny.encode()).hexdigest()
 
@@ -139,8 +160,9 @@ def cmd_import_guard(args: argparse.Namespace, ctx: Context) -> int:
                     trust_class=TrustClass.HUMAN,
                     registered_repos=repos,
                 )
+                render.check_budgets(preview(text), known_commands=frozenset(), registered_repos=repos)
             except render.RejectedText as exc:
-                ctx.print(f"skipped ({exc.field} breaks {exc.rule}): {deny[:60]}")
+                ctx.print(f"skipped ({rejection(exc)}): {deny[:60]}")
                 continue
             lesson_id = create_pinned(db, text, (), fingerprint(deny), actor=ACTOR, at=ctx.clock())
             ctx.print(f"imported {lesson_id}: AVOID {text.avoid}")

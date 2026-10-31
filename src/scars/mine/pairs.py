@@ -1,9 +1,14 @@
 """The pair rule: which failed calls have a fix.
 
-A failed call pairs with the first later call in the same session that succeeds with the same tool and,
-for shell calls, the same program, provided it comes within the next 10 calls and no edit call
-(`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `apply_patch`) comes before it. An edit means the fix was a
-source change, which is ordinary debugging and not a lesson.
+A failed call pairs with the first later call in the same session and the same place that succeeds with
+the same tool and, for shell calls, the same program, provided it comes within the next 10 calls and no
+edit call (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `apply_patch`) comes before it. An edit means
+the fix was a source change, which is ordinary debugging and not a lesson.
+
+The same place means the same registered repo, or the same working directory when neither directory is
+in a registered repo. A lesson takes its scope and trust from the passing call's repo, so a failure in an
+upstream clone fixed by a call in an own repo would otherwise come out trusted as own code. A call whose
+place is unknown (an empty, relative or deleted working directory) never pairs.
 
 A failure still undecided when the batch ends stays open: its count of calls seen so far is carried to
 the next batch. It is dropped once it has seen 10 calls, or once its session has been idle for 24 hours
@@ -14,7 +19,7 @@ edit call would end its window before it could pair. A failed shell call whose c
 rejects never opens either: its program is unknown, so no later call can be shown to run the same one.
 """
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Sequence
 from dataclasses import dataclass, replace
 
 from scars.mine.calls import EDIT_TOOLS, Call, CallStatus
@@ -36,6 +41,16 @@ class OpenFailure:
     signature: ErrorSignature
     calls_since: int
     last_call_at: float
+    cwd: str | None
+
+
+Place = Callable[[str], Hashable | None]
+"""Maps a working directory to where it is (its registered repo, or the directory itself), or None when
+that is unknown."""
+
+
+def same_directory(cwd: str) -> Hashable | None:
+    return cwd or None
 
 
 @dataclass(frozen=True)
@@ -75,14 +90,24 @@ def open_failure(call: Call) -> OpenFailure | None:
         signature=sig,
         calls_since=0,
         last_call_at=call.at,
+        cwd=call.cwd,
     )
 
 
-def _fixes(failure: OpenFailure, call: Call) -> bool:
-    return call.status is CallStatus.OK and call.tool == failure.tool and call.program == failure.program
+def _fixes(failure: OpenFailure, call: Call, place: Place) -> bool:
+    return (
+        call.status is CallStatus.OK
+        and call.tool == failure.tool
+        and call.program == failure.program
+        and failure.cwd is not None
+        and (where := place(failure.cwd)) is not None
+        and where == place(call.cwd)
+    )
 
 
-def pair_session(waiting: Iterable[OpenFailure], calls: Sequence[Call], now: float) -> Paired:
+def pair_session(
+    waiting: Iterable[OpenFailure], calls: Sequence[Call], now: float, place: Place = same_directory
+) -> Paired:
     """Advance one session's open failures over its new calls, in order, and open the new failures."""
     active = list(waiting)
     pairs: list[Pair] = []
@@ -92,7 +117,7 @@ def pair_session(waiting: Iterable[OpenFailure], calls: Sequence[Call], now: flo
         for failure in active:
             if call.at - failure.last_call_at >= IDLE_SECONDS or call.tool in EDIT_TOOLS:
                 dropped += 1
-            elif _fixes(failure, call):
+            elif _fixes(failure, call, place):
                 pairs.append(Pair(failure, call))
             elif failure.calls_since + 1 >= WINDOW:
                 dropped += 1

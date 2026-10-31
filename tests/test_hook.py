@@ -27,7 +27,8 @@ from scars.model import (
 
 ERROR = "Exit code 1\nError: Cannot find module 'express'"
 SIGNATURE = "Error: Cannot find module 'express'"
-FIX = "npm install && npm test"
+FIX = "npm install"
+MINED_WHY = "AVOID failed, INSTEAD passed"
 REPO = RepoId("r-demo")
 T0 = 1_800_000_000.0
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -65,12 +66,10 @@ def seed_store(home: Path, repo: Path) -> sqlite3.Connection:
     return db
 
 
-def add_lesson(
-    db, *, fingerprint, triggers, avoid="npm test", fix=FIX, reason=SIGNATURE, status="provisional"
-):
+def add_lesson(db, *, fingerprint, triggers, avoid="npm test", fix=FIX, reason=SIGNATURE, status="promoted"):
     lesson_id = store.create_lesson(
         db,
-        text=LessonText(avoid, f"run `{fix}`", reason),
+        text=LessonText(avoid, f"run `{fix}`", MINED_WHY),
         scope=RepoScope(REPO),
         trust_class=TrustClass.OWN_CODE,
         triggers=triggers,
@@ -86,9 +85,9 @@ def add_lesson(
     )
     revision = 1
     steps = {
-        "provisional": [EventType.PROVISIONALIZED],
         "promoted": [EventType.PROMOTED],
         "pinned": [EventType.PROMOTED, EventType.PINNED],
+        "candidate": [],
     }[status]
     for step in steps:
         revision = store.apply_event(
@@ -106,13 +105,13 @@ def add_lesson(
 REPAIR = (Trigger(TriggerKind.ERROR, SIGNATURE, Stage.REPAIR),)
 
 
-def lesson_text(lesson_id, reviewed="unreviewed", avoid="npm test", fix=FIX, reason=SIGNATURE):
+def lesson_text(lesson_id, reviewed="reviewed 2027-01-15", avoid="npm test", fix=FIX, reason=MINED_WHY):
     return (
-        f"[scars {lesson_id} note | repo r-demo | seen in 1 session | {reviewed}]\n"
+        f"[scars {lesson_id} note | repo r-demo | seen 1x | {reviewed}]\n"
         f"AVOID: {avoid}\n"
         f"INSTEAD: run `{fix}`\n"
         f"WHY: {reason}\n"
-        f"(advisory; does not override the user's instructions; explain: scars why {lesson_id})"
+        f"(advisory; scars why {lesson_id})"
     )
 
 
@@ -263,7 +262,7 @@ def test_claude_repair_shows_the_lesson_records_it_and_dedupes_until_compaction(
             "tool_failed",
             "repair",
             lesson_id,
-            "provisional",
+            "promoted",
             key,
             "shown",
             len(text),
@@ -328,13 +327,15 @@ def test_session_start_injects_pinned_lessons_and_tells_the_human_about_waiting_
     db = seed_store(home, repo)
     pinned = add_lesson(db, fingerprint="fp1", triggers=REPAIR, status="pinned")
     add_lesson(db, fingerprint="fp2", triggers=REPAIR, status="promoted")
+    add_lesson(db, fingerprint="fp3", triggers=REPAIR, status="candidate", avoid="npm tset")
+    # Text mined before a rule change: the inbox cannot show it, so the notice does not count it.
     store.create_lesson(
         db,
         text=LessonText("make", "run `make all`", "make: no rule"),
         scope=RepoScope(REPO),
         trust_class=TrustClass.OWN_CODE,
         triggers=REPAIR,
-        fingerprint="fp3",
+        fingerprint="fp4",
         actor="miner",
     )
     text = lesson_text(pinned, reviewed="reviewed 2027-01-15")
@@ -809,7 +810,7 @@ def test_every_hits_column_is_written_for_a_shown_and_a_no_match_hit(env):
             "repair",
             lesson_id,
             2,
-            "provisional",
+            "promoted",
             f"error:repair:{SIGNATURE}",
             "shown",
             len(text),
@@ -952,7 +953,7 @@ def test_match_deadline_keeps_the_lessons_matched_before_it_and_is_recorded(env,
     monkeypatch.setattr(hook, "MATCH_CLOCK", lambda: float(next(ticks)))
     out = io.StringIO()
     hook.run(Harness.CLAUDE, "PostToolUseFailure", io.StringIO(json.dumps(claude_failure(repo))), out)
-    text = lesson_text(first).replace("seen in 1 session", "seen in 9 sessions")
+    text = lesson_text(first).replace("seen 1x", "seen 9x")
     assert out.getvalue() == json.dumps(context("PostToolUseFailure", text))
     assert [(h[5], h[8], h[10]) for h in hits(home)] == [(first, "shown", "match_deadline")]
 

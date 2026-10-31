@@ -30,7 +30,7 @@ def test_init_mine_inbox_then_the_hook_shows_the_lesson(work, monkeypatch):
     assert (scars_home / "lessons.db").exists() and (scars_home / "telemetry.db").exists()
     assert "repo app: registered as app (own)\n" in out
     assert "read 1 transcripts: 2 calls, 1 failures, 1 pairs\n" in out
-    assert "lessons: 1 new, 1 observations, 1 provisional, 0 expired\n" in out
+    assert "lessons: 1 new, 1 observations, 0 expired\n" in out
     assert "would have fired 1 time in the last 30 days\n" in out
     for path in (
         scars_home / "plugins" / ".claude-plugin" / "marketplace.json",
@@ -65,7 +65,7 @@ def test_init_mine_inbox_then_the_hook_shows_the_lesson(work, monkeypatch):
     )
     assert (result.returncode, result.stderr) == (0, "")
     context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert f"[scars {lesson.id} note | repo app | seen in 1 session | reviewed " in context
+    assert f"[scars {lesson.id} note | repo app | seen 1x | reviewed " in context
     assert "pytest --frobnicate" in context
 
     code, out, _ = run(make_ctx(user_home), "why", "last")

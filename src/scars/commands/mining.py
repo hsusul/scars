@@ -13,7 +13,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from scars import mine, paths, store
+from scars import mine, paths, review, store
 from scars.commands import Context, UserError
 from scars.mine import Source, Summary
 
@@ -58,9 +58,11 @@ def recent_sources(
 def summary_lines(s: Summary) -> list[str]:
     lines = [
         f"read {s.sessions_read} transcripts: {s.calls} calls, {s.failures} failures, {s.pairs} pairs",
-        f"lessons: {s.candidates_created} new, {s.observations} observations, "
-        f"{s.provisionalized} provisional, {s.expired} expired",
+        f"lessons: {s.candidates_created} new, {s.observations} observations, {s.expired} expired",
     ]
+    if s.retired_unrenderable:
+        rules = ", ".join(f"{k} {v}" for k, v in s.retired_unrenderable.items())
+        lines.append(f"retired because they no longer render: {rules}")
     if s.pre_triggers_dropped:
         lines.append(f"pre-triggers dropped by the precision check: {s.pre_triggers_dropped}")
     if s.skipped:
@@ -82,15 +84,23 @@ def run(ctx: Context, since: float | None = None) -> Summary:
     return mine.run(paths.home(), sources, ctx.clock(), skipped_sessions=skipped)
 
 
-def waiting_line(home: Path) -> str | None:
+def _waiting(home: Path) -> review.Waiting:
     db = store.connect(home / "lessons.db", readonly=True)
     try:
-        waiting = store.candidate_count(db)
+        return review.waiting(db)
     finally:
         db.close()
+
+
+def _count_line(found: review.Waiting) -> str | None:
+    waiting = len(found.lessons)
     if not waiting:
         return None
     return f"{waiting} lesson{'s' if waiting != 1 else ''} waiting: run scars inbox"
+
+
+def waiting_line(home: Path) -> str | None:
+    return _count_line(_waiting(home))
 
 
 def cmd_mine(args: argparse.Namespace, ctx: Context) -> int:
@@ -98,6 +108,8 @@ def cmd_mine(args: argparse.Namespace, ctx: Context) -> int:
     summary = run(ctx, since)
     for line in summary_lines(summary):
         ctx.print(line)
-    if (line := waiting_line(paths.home())) is not None:
-        ctx.print(line)
+    found = _waiting(paths.home())
+    for line in (_count_line(found), review.hidden_line(found)):
+        if line is not None:
+            ctx.print(line)
     return 0

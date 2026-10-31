@@ -33,7 +33,7 @@ def test_an_edit_may_set_trust_class_human_and_nothing_else(home):
 
 def test_list_lessons_filters_by_status_and_repo(home):
     a = seed(home)
-    b = seed(home, avoid="npm tset", sig="npm ERR! tset", provisional=False)
+    b = seed(home, avoid="npm tset", passing="npm test", sig="npm ERR! tset", provisional=False)
     db = connect(home)
     assert [le.id for le in store.list_lessons(db, statuses=[Status.CANDIDATE])] == [b]
     assert sorted(le.id for le in store.list_lessons(db, repo_id="app")) == sorted([a, b])

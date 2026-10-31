@@ -12,7 +12,8 @@ the editor's word alone (the editor could be a script that rewrites mined text):
 lesson exactly as agents will see it and applies the edit only after the person presses `y`. When the
 new `instead` names a backticked command that never passed on this machine, it says so and needs a
 second `y`. Any other key cancels. The edit sends the lesson back to candidate, and the inbox shows it
-again so the person can approve the new wording at once.
+again so the person can approve the new wording at once. An edit that would not fit a stage budget once
+its header reaches its longest form is refused before the preview, so it never stops rendering later.
 """
 
 from __future__ import annotations
@@ -24,11 +25,11 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
-from scars import render, store
-from scars.commands import Context, UserError, lessons_db, require_human
+from scars import render, review, store
+from scars.commands import Context, UserError, lessons_db, rejection, require_human, shown
 from scars.commands.inspect import describe
 from scars.commands.lifecycle import apply, promote
-from scars.model import EventType, Lesson, SessionScope, Status, TrustClass
+from scars.model import EventType, Lesson, Status, TrustClass
 
 PAGE = 5
 HALF_LIFE_DAYS = 14
@@ -70,9 +71,9 @@ class Ranked:
 
 
 def rank(db: sqlite3.Connection, now: float) -> list[Ranked]:
-    """Every candidate and provisional lesson with its inbox score, best first, ties by id."""
+    """Every waiting lesson (see `review.waiting`) with its inbox score, best first, ties by id."""
     out = []
-    for lesson in store.list_lessons(db, statuses=(Status.CANDIDATE, Status.PROVISIONAL)):
+    for lesson in review.waiting(db).lessons:
         seen = store.lesson_last_seen(db, lesson.id) or now
         age_days = max(0.0, now - seen) / DAY
         passing = [o.passing_input for o in store.observations(db, lesson.id)]
@@ -137,9 +138,10 @@ def edit(db: sqlite3.Connection, ctx: Context, lesson: Lesson) -> Edit:
             registered_repos=repos,
         )
         after = replace(lesson, text=text, trust_class=TrustClass.HUMAN, status=Status.CANDIDATE)
+        render.check_budgets(after, known_commands=known, registered_repos=repos)
         shown = render.render(after, known_commands=known, registered_repos=repos)
     except render.RejectedText as exc:
-        raise UserError(f"{exc.field} breaks {exc.rule}") from None
+        raise UserError(rejection(exc)) from None
     ctx.print("this is how agents will see the edited lesson:")
     ctx.print(shown)
     ctx.print("press y to save it as your own text (trust human); any other key cancels")
@@ -165,12 +167,19 @@ def _source(db: sqlite3.Connection, lesson: Lesson) -> list[str]:
     if not found:
         return []
     o = found[-1]
-    return [f"  source:  `{o.failed_input}` failed, then `{o.passing_input}` passed"]
+    return [
+        "  source evidence, as recorded (agents never see it):",
+        f"    failed: {shown(o.failed_input)}",
+        f"    error:  {shown(o.error_signature)}",
+        f"    passed: {shown(o.passing_input)}",
+    ]
 
 
 def cmd_inbox(_: argparse.Namespace, ctx: Context) -> int:
     counts: Counter[str] = Counter()
     with lessons_db() as db:
+        if (hidden := review.hidden_line(review.waiting(db))) is not None:
+            ctx.print(hidden)
         queue = rank(db, ctx.clock())
         page = queue[:PAGE]
         if not page:
@@ -199,10 +208,6 @@ def cmd_inbox(_: argparse.Namespace, ctx: Context) -> int:
             require_human(ctx)
             try:
                 if key is Key.APPROVE:
-                    if isinstance(lesson.scope, SessionScope):
-                        raise UserError(
-                            f"{lesson.id} is session-scoped; run scars promote {lesson.id} --repo <repo-id>"
-                        )
                     promote(db, ctx, lesson, lesson.scope)
                     counts["approved"] += 1
                 elif key is Key.MUTE:

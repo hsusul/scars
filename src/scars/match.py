@@ -493,60 +493,33 @@ def matches(trigger: Trigger, event: HookEvent, context: MatchContext | None = N
 
 @dataclass(frozen=True)
 class StageRule:
-    """Which lessons one hook event may deliver. Character caps belong to rendering."""
+    """Which promoted lessons one hook event may deliver. Character caps belong to rendering. Only a
+    promoted lesson ever reaches an agent: every other status is waiting for a human."""
 
     stage: Stage
-    statuses: frozenset[Status]
     pinned_only: bool
     level: Level | None
     trigger_kinds: frozenset[TriggerKind] | None
     """Kinds that can fire at this stage. None means no matching: every eligible lesson is selected."""
     cap: int | None
-    session_candidates: bool
-    """Also admit candidates scoped to this session."""
     scope_kinds: frozenset[str] = frozenset({"machine", "repo", "path", "session"})
     dedupe: bool = True
     """Skip (lesson, trigger) pairs already shown. The gate never dedupes: every matching call is denied."""
 
 
-_PLAN_START = StageRule(
-    Stage.PLAN, frozenset({Status.PROMOTED}), True, None, None, None, False, frozenset({"machine", "repo"})
-)
+_PLAN_START = StageRule(Stage.PLAN, True, None, None, None, frozenset({"machine", "repo"}))
 
 STAGE_RULES: dict[HookEventKind, StageRule] = {
     HookEventKind.SESSION_START: _PLAN_START,
     HookEventKind.COMPACT: _PLAN_START,
     HookEventKind.PROMPT: StageRule(
-        Stage.PLAN,
-        frozenset({Status.PROMOTED}),
-        True,
-        None,
-        frozenset({TriggerKind.PROMPT, TriggerKind.PATH}),
-        2,
-        False,
+        Stage.PLAN, True, None, frozenset({TriggerKind.PROMPT, TriggerKind.PATH}), 2
     ),
     HookEventKind.PRE_TOOL: StageRule(
-        Stage.GATE,
-        frozenset({Status.PROMOTED}),
-        False,
-        Level.BLOCK,
-        frozenset({TriggerKind.COMMAND, TriggerKind.PATH}),
-        1,
-        False,
-        dedupe=False,
+        Stage.GATE, False, Level.BLOCK, frozenset({TriggerKind.COMMAND, TriggerKind.PATH}), 1, dedupe=False
     ),
-    HookEventKind.TOOL_FAILED: StageRule(
-        Stage.REPAIR,
-        frozenset({Status.PROMOTED, Status.PROVISIONAL}),
-        False,
-        None,
-        frozenset({TriggerKind.ERROR}),
-        2,
-        True,
-    ),
+    HookEventKind.TOOL_FAILED: StageRule(Stage.REPAIR, False, None, frozenset({TriggerKind.ERROR}), 2),
 }
-
-_STATUS_RANK = {Status.PROMOTED: 0, Status.PROVISIONAL: 1, Status.CANDIDATE: 2}
 
 
 PLAN_START_KEY = "start:plan"
@@ -589,7 +562,7 @@ def select(
 ) -> Selection:
     """Eligible lessons for the event's stage, best first, capped by count, under a wall-clock deadline.
 
-    Order: higher score first, then promoted before provisional before candidate, then lesson id. With a
+    Order: higher score first, then lesson id. With a
     `scores` mapping, a lesson's score is its entry, or 0 when it has none; without one, it is
     `sessions_seen`. A path-scoped lesson is admitted only where its glob applies, as `_located` says.
     Only triggers whose `stage` equals the event's stage are evaluated. A trigger with a malformed spec
@@ -607,9 +580,9 @@ def select(
     limit = clock() + deadline_ms / 1000
     chosen: list[Selected] = []
 
-    def rank(le: Lesson) -> tuple[float, int, str]:
+    def rank(le: Lesson) -> tuple[float, str]:
         score = float(le.sessions_seen) if scores is None else scores.get(le.id, 0.0)
-        return (-score, _STATUS_RANK.get(le.status, 3), le.id)
+        return (-score, le.id)
 
     for lesson in sorted(lessons, key=rank):
         if _eligible(rule, lesson, event, ctx):
@@ -673,10 +646,8 @@ def _located(
 
 
 def _eligible(rule: StageRule, lesson: Lesson, event: HookEvent, ctx: MatchContext) -> bool:
-    session_candidate = rule.session_candidates and lesson.status is Status.CANDIDATE
-    session_candidate = session_candidate and isinstance(lesson.scope, SessionScope)
     return (
-        (lesson.status in rule.statuses or session_candidate)
+        lesson.status is Status.PROMOTED
         and (not rule.pinned_only or lesson.pinned)
         and (rule.level is None or lesson.level is rule.level)
         and lesson.scope.kind in rule.scope_kinds
@@ -761,7 +732,7 @@ class Precision:
 
     @property
     def keeps_pre_trigger(self) -> bool:
-        """The miner keeps a provisional lesson's pre-trigger: at most 4 passing matches per failing one."""
+        """The miner keeps a mined lesson's pre-trigger: at most 4 passing matches per failing one."""
         return self.matched_passing <= 4 * self.matched_failing
 
     @property

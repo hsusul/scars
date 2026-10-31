@@ -3,8 +3,10 @@
 Assistant records carry `tool_use` blocks (`id`, `name`, `input`) in `message.content`, with the model in
 `message.model`. User records carry the matching `tool_result` blocks (`tool_use_id`, `is_error`,
 `content`), with `timestamp` and `cwd` on the record. A call is complete when its result is read; its
-time is the result's time. Calls are emitted in the order they were invoked, not the order their
-results arrived, and an edit is emitted at its invocation even before its result (see `calls.settle`).
+time is the result's time, and its directory is the cwd of the record that invoked it: the result
+record's cwd can already show a later `cd`. Calls are emitted in the order they were invoked, not the
+order their results arrived, and an edit is emitted at its invocation even before its result (see
+`calls.settle`).
 The session id is the file name, as in hook stdin.
 """
 
@@ -122,7 +124,7 @@ def parse(lines: Iterable[Line], session_id: str, context: Context | None = None
                     CallStatus.FAILED if failed else CallStatus.OK,
                     _text(block.get("content")) if failed else "",
                     at,
-                    str(cwd) or use.cwd,
+                    use.cwd,
                 )
     calls, resume = settle(order.values(), newest, now)
     return Parsed(tuple(calls), resume)

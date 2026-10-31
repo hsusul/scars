@@ -1,10 +1,20 @@
 import pytest
 
 from cli_helpers import DAY, NOW, SIG, connect, make_ctx, run, seed
-from scars import store
+from scars import render, store
 from scars.commands import UserError
 from scars.commands.inbox import consistency, parse_edit, rank
-from scars.model import Status, TrustClass
+from scars.model import (
+    TEXT_CAP,
+    LessonText,
+    SessionId,
+    SessionScope,
+    Stage,
+    Status,
+    Trigger,
+    TriggerKind,
+    TrustClass,
+)
 
 pytest_plugins = ("cli_fixtures",)
 
@@ -15,10 +25,93 @@ def card(lesson_id, position, total, score, avoid="pytest --frobnicate", passing
         f"{lesson_id}  provisional  level note  not pinned  repo app  trust own_code  seen in 1 session\n"
         f"  avoid:   {avoid}\n"
         f"  instead: run `{passing}` instead\n"
-        f"  reason:  {sig}\n"
-        f"  source:  `{avoid} tests` failed, then `{passing}` passed\n"
+        f"  reason:  {render.MINED_REASON}\n"
+        "  source evidence, as recorded (agents never see it):\n"
+        f"    failed: {avoid} tests\n"
+        f"    error:  {sig}\n"
+        f"    passed: {passing}\n"
         "a approve  e edit  m mute  s skip  q quit\n"
     )
+
+
+HIDDEN = (
+    "hidden: 1 that cannot render (scars doctor names the rule); 1 from a directory that is not a "
+    "registered repo (scars init offers to register the repos your sessions used)\n"
+)
+
+
+def session_lesson(home):
+    db = connect(home)
+    lesson_id = store.create_lesson(
+        db,
+        text=LessonText("make tset", "run `make test` instead", render.MINED_REASON),
+        scope=SessionScope(SessionId("s9")),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=(Trigger(TriggerKind.ERROR, "make: No rule to make target tset", Stage.REPAIR),),
+        fingerprint="fp-session",
+        actor="miner",
+        at=NOW - DAY,
+    )
+    store.add_observation(
+        db,
+        store.Observation(
+            lesson_id,
+            "claude",
+            "s9",
+            "tu-s9",
+            "make tset",
+            "make: No rule to make target tset",
+            "make test",
+            NOW,
+        ),
+    )
+    db.commit()
+    db.close()
+    return lesson_id
+
+
+def test_inbox_hides_what_it_cannot_render_or_approve_and_counts_only_the_rest(home, user_home):
+    from scars.commands.mining import waiting_line
+
+    a = seed(home)
+    seed(home, avoid="npm tset", passing="npm test", sig="npm ERR! tset", reason="npm ERR! Unknown command")
+    session_lesson(home)
+    assert run(make_ctx(user_home, keys="q"), "inbox") == (
+        0,
+        HIDDEN + card(a, 1, 1, "0.95") + "inbox: 0 approved, 0 edited, 0 muted, 0 skipped; 1 waiting\n",
+        "",
+    )
+    assert waiting_line(home) == "1 lesson waiting: run scars inbox"
+
+
+def test_inbox_shows_source_evidence_with_secret_values_masked(home, user_home):
+    a = seed(home)
+    db = connect(home)
+    db.execute("update observations set failed_input = 'pytest --frobnicate --token abc123 tests'")
+    db.commit()
+    out = run(make_ctx(user_home, keys="q"), "inbox")[1]
+    assert "    failed: pytest --frobnicate --token *** tests\n" in out
+    assert "abc123" not in out
+    assert a in out
+
+
+def test_inbox_hides_a_lesson_whose_text_names_a_secret_argument(home, user_home):
+    a = seed(home, avoid="pytest --frobnicate --token hunter2")
+    out = run(make_ctx(user_home, keys="a"), "inbox")[1]
+    assert out == "hidden: 1 that cannot render (scars doctor names the rule)\ninbox is empty\n"
+    assert store.get_lesson(connect(home), a).status is Status.PROVISIONAL
+
+
+def test_an_edit_that_names_a_secret_argument_is_refused(home, user_home):
+    a = seed(home)
+
+    def editor(text):
+        return text.replace("avoid: pytest --frobnicate", "avoid: pytest --frobnicate --token hunter2")
+
+    out = run(make_ctx(user_home, keys="eyq", edit=editor), "inbox")[1]
+    assert "not applied: avoid breaks secret.keyed_argument\n" in out
+    assert "hunter2" not in out
+    assert store.get_lesson(connect(home), a).text.avoid == "pytest --frobnicate"
 
 
 def test_empty_inbox(home, user_home):
@@ -75,7 +168,7 @@ def test_edit_rewrites_the_text_as_human_and_shows_it_again(home, user_home):
         "# Rewrite the lesson. Lines starting with # are ignored. Keep each field on one line.\n"
         "avoid: pytest --frobnicate\n"
         "instead: run `pytest tests` instead\n"
-        f"reason: {SIG}\n"
+        f"reason: {render.MINED_REASON}\n"
     ]
     assert f"edited {a}; it is a candidate again\n" in out
     assert f"{a}  candidate  level note  not pinned  repo app  trust human  seen in 1 session\n" in out
@@ -100,11 +193,11 @@ def test_edit_rewrites_the_text_as_human_and_shows_it_again(home, user_home):
 def preview(lesson_id, instead):
     return (
         "this is how agents will see the edited lesson:\n"
-        f"[scars {lesson_id} note | repo app | seen in 1 session | unreviewed]\n"
+        f"[scars {lesson_id} note | repo app | seen 1x | unreviewed]\n"
         "AVOID: pytest --frobnicate\n"
         f"INSTEAD: {instead}\n"
-        f"WHY: {SIG}\n"
-        f"(advisory; does not override the user's instructions; explain: scars why {lesson_id})\n"
+        f"WHY: {render.MINED_REASON}\n"
+        f"(advisory; scars why {lesson_id})\n"
         "press y to save it as your own text (trust human); any other key cancels\n"
     )
 
@@ -154,6 +247,33 @@ def test_an_edited_command_that_passed_needs_one_y(home, user_home):
     assert "never ran successfully" not in out
     assert f"edited {a}; it is a candidate again\n" in out
     assert store.get_lesson(connect(home), a).trust_class is TrustClass.HUMAN
+
+
+def test_an_edit_over_the_repair_budget_is_refused_before_the_preview(home, user_home):
+    a = seed(home)
+    instead = (
+        "wait for the running build to finish and then start the next one, "
+        "because a second build started now takes the lock and fails"
+    )
+    reason = (
+        "two builds that share one derived data folder corrupt each other, and the second one "
+        "fails with a lock error every time, even when the first one is almost done"
+    )
+
+    def editor(text):
+        text = text.replace("instead: run `pytest tests` instead", f"instead: {instead}")
+        return text.replace(f"reason: {render.MINED_REASON}", f"reason: {reason}")
+
+    out = run(make_ctx(user_home, keys="eyq", edit=editor), "inbox")[1]
+    assert max(len(instead), len(reason)) <= TEXT_CAP
+    assert "not applied: the lesson is over the repair budget of 400 characters\n" in out
+    assert "this is how agents will see the edited lesson" not in out
+    lesson = store.get_lesson(connect(home), a)
+    assert (lesson.revision, lesson.trust_class, lesson.text.instead) == (
+        2,
+        TrustClass.OWN_CODE,
+        "run `pytest tests` instead",
+    )
 
 
 def test_an_edit_that_breaks_a_text_rule_changes_nothing(home, user_home):

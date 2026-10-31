@@ -397,7 +397,6 @@ def _decide_with(
         lessons = store.active_for_stage(
             db,
             repo_id,
-            event.session_id,
             stage=query.stage,
             pinned_only=query.pinned_only,
             trigger_kinds=query.trigger_kinds,
@@ -405,7 +404,9 @@ def _decide_with(
         )
     notice = None
     if event.event is HookEventKind.SESSION_START:
-        waiting = store.candidate_count(db)
+        from scars import review
+
+        waiting = len(review.waiting(db).lessons)
         if waiting:
             notice = f"{waiting} scars lesson{'s' if waiting != 1 else ''} waiting: run scars inbox"
     if not lessons:

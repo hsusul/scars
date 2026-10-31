@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TextIO
 
 from scars import paths, render, store, telemetry
-from scars.model import Lesson, LessonId
+from scars.model import ACTIVE_STATUSES, Lesson, LessonId
 
 
 class UserError(Exception):
@@ -318,6 +318,34 @@ def get_lesson(db: sqlite3.Connection, lesson_id: str) -> Lesson:
     return lesson
 
 
+_BUDGET_CHARS = {f"budget.{stage}": b.chars for stage, b in render.STAGE_BUDGETS.items()} | {
+    "budget.session_start": render.SESSION_START_BUDGET.chars
+}
+
+
+def rejection(exc: render.RejectedText) -> str:
+    """Why `render` refused a lesson, in words for the person who wrote it."""
+    chars = _BUDGET_CHARS.get(exc.rule)
+    if chars is None:
+        return f"{exc.field} breaks {exc.rule}"
+    stage = exc.rule.removeprefix("budget.").replace("_", " ")
+    return f"the lesson is over the {stage} budget of {chars} characters"
+
+
+def unrenderable(db: sqlite3.Connection, lessons: list[Lesson]) -> list[tuple[LessonId, render.RejectedText]]:
+    """Each active lesson in `lessons` that `render` refuses, with the rule it breaks, so no lesson
+    drops out of delivery without a word."""
+    active = [le for le in lessons if le.status in ACTIVE_STATUSES]
+    known = store.passing_inputs(db, [le.id for le in active])
+    repos = store.repo_names(db)
+    found = []
+    for lesson in active:
+        problem = render.render_problem(lesson, known_commands=known[lesson.id], registered_repos=repos)
+        if problem is not None:
+            found.append((lesson.id, problem))
+    return found
+
+
 def telemetry_db() -> sqlite3.Connection | None:
     """telemetry.db read-only, or None when it is missing or unreadable: telemetry is best-effort."""
     path = paths.home() / "telemetry.db"
@@ -338,7 +366,8 @@ LINE_RULES = (*(r for r in render.SANITIZER_RULES if r.name in _LINE_SANITIZER),
 
 
 def clean(line: str) -> str:
-    """`line`, or `[hidden: <rule>]` when it breaks one of `LINE_RULES`."""
+    """`line` with secret-named values masked, or `[hidden: <rule>]` when it breaks one of `LINE_RULES`."""
+    line = render.mask_secrets(line)
     for rule in LINE_RULES:
         if rule.hits(line):
             return f"[hidden: {rule.name}]"
@@ -389,8 +418,11 @@ def shown(value: str) -> str:
     Agents run the read commands too, so whatever they print is a way into an agent's context. Stored
     values (lesson text, trigger specs, mined inputs, observations, event payloads) came from transcripts
     and are held to the same rules as lesson text before they are printed. An empty value breaks the
-    sanitizer's empty rule too; a call site where empty is normal says so in words instead.
+    sanitizer's empty rule too; a call site where empty is normal says so in words instead. The value of
+    an option or key named as a secret (`--token X`, `DB_PASSWORD=X`) is masked, for rows stored before
+    the miner refused them.
     """
+    value = render.mask_secrets(value)
     for rule in DISPLAY_RULES:
         if rule.hits(value):
             return f"[hidden: {rule.name}]"

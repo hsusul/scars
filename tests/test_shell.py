@@ -784,6 +784,14 @@ ROUND_FOUR_FALSE_FIRES = [
     "unset PATH; git push --force",
     "PATH=/nowhere; git push --force",
     "PATH=/nowhere git push --force",
+    "export PATH=/nowhere; git push --force",
+    "export FOO=1 PATH=/nowhere; git push --force",
+    "export PATH; git push --force",
+    'export "PATH=/nowhere"; git push --force',
+    "declare -x PATH=/nowhere; git push --force",
+    "typeset PATH=/nowhere && git push --force",
+    "readonly PATH=/nowhere; git push --force",
+    "local PATH=/nowhere; git push --force",
     "builtin exit; git push --force",
 ]
 
@@ -814,6 +822,8 @@ def test_parse_rejects_round_four_false_fires(command):
         ("make || exit 1", (cmd("make"), cmd("exit", "1"))),
         ("make; set -n", (cmd("make"), cmd("set", "-n"))),
         ("PATH=/opt/bin:$PATH", ()),
+        ("export FOO=1; make", (cmd("export", "FOO=1"), cmd("make"))),
+        ("make; export PATH=/opt/bin", (cmd("make"), cmd("export", "PATH=/opt/bin"))),
     ],
 )
 def test_parse_keeps_round_four_neighbours_working(command, expected):
