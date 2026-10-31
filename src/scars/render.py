@@ -427,27 +427,40 @@ _SECRET_WORD = re.compile(
     r"(?:^|[-_.])(?:password|passwd|token|secret|auth|api[-_]?key|access[-_]key|private[-_]key)(?=$|[-_.])",
     re.IGNORECASE,
 )
-_SECRET_VALUE = r"(?=('[^']*'|\"[^\"]*\"|[^\s'\"]+))"
-_NAMED_OPTION = re.compile(
-    r"(?<![\w-])--([a-z0-9]++(?:[-_][a-z0-9]++)*+)(?:[=:](?=\S)|\s++(?!-))" + _SECRET_VALUE, re.IGNORECASE
+_SECRET_VALUE = re.compile(r"'[^']*'|\"[^\"]*\"|[^\s'\"]+")
+_NAMED_ARGUMENT = re.compile(
+    r"(?:(?<![\w-])--([a-z0-9]++(?:[-_.][a-z0-9]++)*+)(?:[=:]|\s++(?!-))"
+    r"|(?<![\w./-])([a-z0-9_][a-z0-9_.-]*+)=)(?=\S)",
+    re.IGNORECASE,
 )
-_NAMED_KEY = re.compile(r"(?<![\w./-])([a-z0-9_][a-z0-9_.-]*+)=" + _SECRET_VALUE, re.IGNORECASE)
 """An option (`--github-token X`, `--token=X`, `--token:X`) or a `NAME=value` key (`DB_PASSWORD=X`) has a
 secret name when one of its `-`, `_` or `.` separated parts is a secret word, so `--tokenizer` and
 `author=` do not. Any non-empty value counts, however plain: the name is the evidence. The value is
-matched in a lookahead, so a key in the value of another name (`FOO=TOKEN=x`) is still found. Names are
-matched possessively and checked for the word afterwards, which keeps the scan linear."""
+scanned separately, so a key in the value of another name (`FOO=TOKEN=x`) is still found. Names are
+matched possessively and each unquoted value's end is reused to keep the scan linear."""
 
 
 def _secret_values(text: str) -> list[tuple[int, int]]:
     """Spans of the values passed to secret-named options and keys, except the `***` that masking leaves."""
-    spans = [
-        m.span(2)
-        for pattern in (_NAMED_OPTION, _NAMED_KEY)
-        for m in pattern.finditer(text)
-        if _SECRET_WORD.search(m.group(1)) and m.group(2) != "***"
-    ]
-    return sorted(spans)
+    spans = []
+    unquoted_end = 0
+    for named in _NAMED_ARGUMENT.finditer(text):
+        if not _SECRET_WORD.search(named.group(1) or named.group(2)):
+            continue
+        start = named.end()
+        quoted = text[start] in "'\""
+        if quoted or start >= unquoted_end:
+            value = _SECRET_VALUE.match(text, start)
+            if value is None:
+                continue
+            stop = value.end()
+            if not quoted:
+                unquoted_end = stop
+        else:
+            stop = unquoted_end
+        if stop - start != 3 or not text.startswith("***", start):
+            spans.append((start, stop))
+    return spans
 
 
 def names_secret(text: str) -> bool:

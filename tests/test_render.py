@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import date
+from time import perf_counter
 
 import pytest
 
@@ -1184,6 +1185,8 @@ def test_a_human_lesson_keeps_free_wording():
         ("deploy --token=hunter2", True, "deploy --token=***"),
         ("deploy --token:hunter2", True, "deploy --token:***"),
         ("deploy --password:secret", True, "deploy --password:***"),
+        ("deploy --db.password hunter2", True, "deploy --db.password ***"),
+        ("deploy --db.password:x", True, "deploy --db.password:***"),
         ("deploy --secret-key hunter2", True, "deploy --secret-key ***"),
         ("aws configure --secret-access-key hunter2", True, "aws configure --secret-access-key ***"),
         ("gh run --github-token x", True, "gh run --github-token ***"),
@@ -1209,6 +1212,20 @@ def test_a_human_lesson_keeps_free_wording():
 )
 def test_secret_named_arguments_table(text, named, masked):
     assert (names_secret(text), mask_secrets(text)) == (named, masked)
+
+
+@pytest.mark.parametrize("scan", [names_secret, mask_secrets])
+@pytest.mark.parametrize(
+    "text",
+    ["a=" * 20000, "FOO=" * 30000 + "x"],
+    ids=["repeated-assignments", "uppercase-assignments"],
+)
+def test_secret_named_argument_scan_stays_fast_on_repeated_assignments(scan, text):
+    started = perf_counter()
+    result = scan(text)
+    elapsed = perf_counter() - started
+    assert result == (False if scan is names_secret else text)
+    assert elapsed < 0.25
 
 
 @pytest.mark.parametrize(
