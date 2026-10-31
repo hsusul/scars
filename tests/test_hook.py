@@ -514,7 +514,6 @@ def test_a_promoted_block_lesson_never_denies_in_phase_1(env):
         ("claude", "rm $SCARS_HOME/OFF", SHELL_HOME_REASON),
         ("claude", "rm -f ${SCARS_HOME}/OFF", SHELL_HOME_REASON),
         ("claude", 'touch ~/".scars"/OFF', SHELL_HOME_REASON),
-        ("claude", "cat ~/.scars/lessons.db > /tmp/copy", SHELL_HOME_REASON),
         ("claude", "find ~/.scars -name '*.db' -delete", SHELL_HOME_REASON),
         ("claude", "find ~/.scars -exec rm {} +", SHELL_HOME_REASON),
         ("claude", "cat $(echo ~/.scars/lessons.db)", SHELL_HOME_REASON),
@@ -554,6 +553,11 @@ def test_a_command_naming_the_absolute_scars_home_is_denied_unless_it_only_reads
         "rg -n retire ~/.scars/logs",
         'grep "a > b" ~/.scars/x',
         "find ~/.scars -name '*.db'",
+        "cat ~/.scars/lessons.db > /tmp/copy",
+        "printf '%s\\n' 'scars off'",
+        "git commit -m 'document scars off'",
+        "echo scars off is the kill switch",
+        "grep -rn 'scars off' docs/",
         "git log --grep scars",
         "npm run scarsify off",
     ],
@@ -562,13 +566,6 @@ def test_reading_scars_commands_and_mere_mentions_are_allowed(env, command):
     home, repo = env
     assert run_hook(home, "claude", "PreToolUse", pre_tool(repo, command)).stdout == ""
     assert [h[3:] for h in hits(home)] == [GATE_NO_MATCH]
-
-
-def test_quoted_text_that_reads_as_a_scars_invocation_is_denied(env):
-    # The rule is one regex over the raw text, so it cannot tell a commit message from a nested script.
-    home, repo = env
-    result = run_hook(home, "claude", "PreToolUse", pre_tool(repo, "git commit -m 'scars promote'"))
-    assert result.stdout == deny_json(run_reason("promote"))
 
 
 def test_agent_edits_under_the_scars_home_are_denied_for_both_harnesses(env):
@@ -1052,7 +1049,8 @@ def test_the_hook_entry_imports_only_what_the_path_needs(env):
     assert names & HEAVY == set()
 
     names, out = imported_modules(home, "claude", "PreToolUse", pre_tool(repo, "npm test"))
-    assert out == "" and names & (HEAVY | {"scars.store"}) == set()
+    assert out == "" and "scars.shell" in names
+    assert names & (HEAVY - {"scars.shell"} | {"scars.store"}) == set()
 
     names, out = imported_modules(home, "claude", "PostToolUseFailure", claude_failure(repo, "s3"))
     assert json.loads(out) == context("PostToolUseFailure", lesson_text(lesson_id))

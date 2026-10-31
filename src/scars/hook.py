@@ -40,7 +40,7 @@ import sys
 import time
 from dataclasses import dataclass, field, replace
 from types import ModuleType
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from scars import paths, telemetry
 from scars.adapters import Ignored, MalformedInput, claude, codex, context_output, deny_output, full_command
@@ -55,6 +55,11 @@ from scars.model import (
     ToolKind,
     TriggerKind,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from scars import shell
 
 MATCH_DEADLINE_MS = 50
 MATCH_CLOCK = time.monotonic
@@ -118,12 +123,14 @@ EDIT_REASON = (
     "commands a human runs at a terminal."
 )
 READ_ONLY_PROGRAMS = frozenset(
-    {"cat", "ls", "head", "tail", "less", "grep", "rg", "stat", "wc", "file", "find"}
+    {"cat", "ls", "head", "tail", "less", "grep", "rg", "stat", "wc", "file", "find", "echo", "printf"}
 )
 FIND_ACTIONS_THAT_WRITE = frozenset(
     {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
 )
+SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
 _QUOTING = re.compile(r"[\"'\\]")
+_KNOWN_VARIABLE = re.compile(r"\$(HOME|SCARS_HOME)(?![A-Za-z0-9_])")
 _invocation: re.Pattern[str] | None = None
 
 
@@ -136,11 +143,11 @@ def _invocation_pattern() -> re.Pattern[str]:
     return _invocation
 
 
-def _home_pattern(home: str) -> re.Pattern[str]:
-    roots = {home, os.path.realpath(home)}
-    spelled = [r"(?:~|\$HOME|\$\{HOME\})/\.scars", r"\$SCARS_HOME(?!\w)", r"\$\{SCARS_HOME\}"]
-    spelled += [re.escape(r.rstrip("/")) for r in sorted(roots) if r.rstrip("/")]
-    return re.compile(rf"(?:{'|'.join(spelled)})(?![\w.-])", re.IGNORECASE)
+def _home_mention(home: str) -> re.Pattern[str]:
+    """The scars home spelled in raw text: its directory name (`.scars` always) or `$SCARS_HOME`."""
+    names = {os.path.basename(h.rstrip("/")) for h in (home, os.path.realpath(home))} | {".scars"}
+    spelled = [r"\$SCARS_HOME(?!\w)", r"\$\{SCARS_HOME\}", *(re.escape(n) for n in sorted(names) if n)]
+    return re.compile(rf"(?<![\w.${{-])(?:{'|'.join(spelled)})(?![\w.-])", re.IGNORECASE)
 
 
 def agent_deny_reason(
@@ -148,34 +155,15 @@ def agent_deny_reason(
 ) -> str | None:
     """Why this PreToolUse call is denied, or None to stay silent.
 
-    `command` is the full shell command before the 4 KB cut; it defaults to `event.command`. A shell call
-    is denied when either holds:
-
-    - The text runs a protected scars command: the word `scars` (bare, after a path such as
-      `/usr/local/bin/scars`, or after `python -m` or `uv run`) followed by whitespace and `inbox` or a
-      privileged command. One fixed regex scans the raw text, so a call inside a nested quoted script
-      counts, and scans it again with quotes and backslashes removed, so `'sc''ars' off` counts too. The
-      same scan also denies quoted text that merely reads like such a call, such as a commit message.
-    - The text names the scars home (`~/.scars`, `$HOME/.scars`, `${HOME}/.scars`, `$SCARS_HOME`,
-      `${SCARS_HOME}`, or the absolute home path) and the command is not provably read-only.
-
-    Everything else fails open: a command the shell parser cannot model gets no deny just for mentioning
-    the word scars. Edit tools are denied for any path under the scars home.
+    `command` is the full shell command before the 4 KB cut; it defaults to `event.command`. Shell calls
+    follow `shell_deny_reason`. Edit tools are denied for any path under the scars home.
     """
     if event.event is not HookEventKind.PRE_TOOL:
         return None
     home = os.fspath(home)
     if event.tool_kind is ToolKind.SHELL:
         text = command if command is not None else event.command
-        if text is None:
-            return None
-        unquoted = _QUOTING.sub("", text)
-        for candidate in (text, unquoted):
-            if found := _invocation_pattern().search(candidate):
-                return RUN_REASON.format(found.group(1).lower())
-        names_home = _home_pattern(home)
-        if any(names_home.search(c) for c in (text, unquoted)) and not provably_read_only(text):
-            return SHELL_HOME_REASON
+        return None if text is None else shell_deny_reason(text, event.cwd, home)
     if event.tool_kind is ToolKind.EDIT:
         for path in event.paths:
             if _under(path, event.cwd, home):
@@ -183,52 +171,162 @@ def agent_deny_reason(
     return None
 
 
-def provably_read_only(command: str) -> bool:
-    """True only when the command parses and every program it runs just reads files.
+def shell_deny_reason(text: str, cwd: str, home: str) -> str | None:
+    """Why the shell command `text`, run in `cwd`, is denied, or None.
 
-    Every simple command must run a program from `READ_ONLY_PROGRAMS`, with no `>` outside quotes. `find`
-    may not use an action that deletes, runs or writes, and `rg` may not use `--pre`, which runs a
-    program. For those two an argument the shell expands into a word that starts with `$`, `*`, `?` or `[`
-    could become such an option, so it is not read-only either.
+    The command is parsed with `scars.shell`, and each simple command it runs is checked:
+
+    - Running scars (by any path, through the wrappers the parser removes, or as `python -m scars`) with
+      `inbox` or a privileged subcommand, or with a first operand the shell expands at run time, is denied.
+    - A command that is not `provably_read_only` is denied when one of its arguments may resolve under
+      the scars home or the default `~/.scars`. Arguments are paths relative to the command's directory
+      (the event cwd, after a leading `cd`, and both when the `cd` may have failed); the text after an `=`
+      counts too. A leading `~`, `$HOME` and `$SCARS_HOME` are expanded, a glob is denied when it could
+      match a path there, and an argument holding any other variable is denied when the raw text names
+      the home. Output redirection targets are checked the same way for every command.
+    - A shell program the parser did not unwrap (a second nested `-c`, or `zsh`) runs a script the parser
+      never saw, so its arguments are scanned as raw text, as below.
+
+    A command the parser cannot model is denied only when its raw text, as written or with quotes and
+    backslashes removed, holds `scars <inbox or privileged subcommand>` or names the scars home. Quoted
+    text in a command the parser models is never read as a call: `git commit -m 'scars off'` passes.
     """
-    if _redirects_output(command):
-        return False
     from scars import shell
 
     try:
-        commands = shell.parse(command)
+        commands = shell.parse(text)
     except shell.Unsupported:
-        return False
+        return _unparsed_reason(text, home)
+    roots = _roots(home)
     for c in commands:
-        if c.program not in READ_ONLY_PROGRAMS:
+        if c.program.lower() in SHELLS and (reason := _unparsed_reason(" ".join(c.args), home)):
+            return reason
+        if (subcommand := _scars_subcommand(c)) is not None:
+            return RUN_REASON.format(subcommand)
+        dirs = _directories(c, cwd)
+        words = c.writes if provably_read_only(c) else (*c.args, *c.writes)
+        for i, word in enumerate(words):
+            expands = i in c.uncertain and words is not c.writes
+            if _may_resolve_under(word, expands, dirs, roots, lambda: _names_home(text, home)):
+                return SHELL_HOME_REASON
+    return None
+
+
+def _unparsed_reason(text: str, home: str) -> str | None:
+    unquoted = _QUOTING.sub("", text)
+    for candidate in (text, unquoted):
+        if found := _invocation_pattern().search(candidate):
+            return RUN_REASON.format(found.group(1).lower())
+    return SHELL_HOME_REASON if _names_home(text, home) else None
+
+
+def _names_home(text: str, home: str) -> bool:
+    mention = _home_mention(home)
+    return any(mention.search(t) for t in (text, _QUOTING.sub("", text)))
+
+
+def _scars_subcommand(c: "shell.SimpleCommand") -> str | None:
+    """The protected subcommand this command runs scars with, or None."""
+    name = c.program.lower()
+    if name != "scars" and not name.startswith("scars."):
+        return None
+    for i, arg in enumerate(c.args):
+        if i in c.uncertain:
+            return arg
+        if not arg.startswith("-"):
+            return arg.lower() if arg.lower() in AGENT_DENIED_SUBCOMMANDS else None
+    return None
+
+
+def provably_read_only(c: "shell.SimpleCommand") -> bool:
+    """True only when the simple command runs a program that just reads its arguments.
+
+    The program must be one of `READ_ONLY_PROGRAMS`. `find` may not use an action that deletes, runs or
+    writes, and `rg` may not use `--pre`, which runs a program. For those two an argument the shell
+    expands into a word that starts with `$`, `*`, `?` or `[` could become such an option, so it is not
+    read-only either. Output redirections are checked separately.
+    """
+    if c.program not in READ_ONLY_PROGRAMS:
+        return False
+    if c.program in ("find", "rg"):
+        if any(c.args[i][:1] in ("$", "*", "?", "[") for i in c.uncertain):
             return False
-        if c.program in ("find", "rg"):
-            if any(c.args[i][:1] in ("$", "*", "?", "[") for i in c.uncertain):
-                return False
-            if c.program == "find" and FIND_ACTIONS_THAT_WRITE.intersection(c.args):
-                return False
-            if c.program == "rg" and any(a.startswith("--pre") for a in c.args):
-                return False
+        if c.program == "find" and FIND_ACTIONS_THAT_WRITE.intersection(c.args):
+            return False
+        if c.program == "rg" and any(a.startswith("--pre") for a in c.args):
+            return False
     return True
 
 
-def _redirects_output(command: str) -> bool:
-    quote: str | None = None
-    escaped = False
-    for ch in command:
-        if escaped:
-            escaped = False
-        elif quote == "'":
-            quote = None if ch == "'" else quote
-        elif ch == "\\":
-            escaped = True
-        elif quote == '"':
-            quote = None if ch == '"' else quote
-        elif ch in "'\"":
-            quote = ch
-        elif ch == ">":
-            return True
+def _roots(home: str) -> tuple[str, ...]:
+    """The scars home and the default `~/.scars`, as spelled and resolved, compared without case because
+    the default macOS file system ignores it."""
+    found = []
+    for h in (home, os.path.join(os.path.expanduser("~"), ".scars")):
+        found += [os.path.abspath(h), os.path.realpath(h)]
+    return tuple(dict.fromkeys(r.rstrip("/").casefold() for r in found))
+
+
+def _directories(c: "shell.SimpleCommand", cwd: str) -> tuple[str, ...]:
+    if c.cwd is None:
+        return (cwd,)
+    moved = os.path.join(cwd, c.cwd)
+    return (moved,) if c.cwd_known else (moved, cwd)
+
+
+def _may_resolve_under(
+    word: str, expands: bool, dirs: tuple[str, ...], roots: tuple[str, ...], names_home: "Callable[[], bool]"
+) -> bool:
+    for candidate in (word, word.partition("=")[2]) if "=" in word else (word,):
+        if expands:
+            expanded = _expand(candidate)
+            if expanded is None:
+                if names_home():
+                    return True
+                continue
+            candidate = expanded
+        for d in dirs:
+            path = os.path.join(d, candidate)
+            if expands and any(ch in path for ch in "*?["):
+                if any(_glob_may_reach(path, r) for r in roots):
+                    return True
+            elif any(_inside(p, r) for p in (os.path.abspath(path), os.path.realpath(path)) for r in roots):
+                return True
     return False
+
+
+def _expand(word: str) -> str | None:
+    """`word` with a leading `~`, `$HOME` and `$SCARS_HOME` expanded, or None when another expansion
+    (`~user`, any other variable) leaves its value unknown."""
+    if word.startswith("~"):
+        user, slash, rest = word[1:].partition("/")
+        if user:
+            return None
+        word = os.path.expanduser("~") + slash + rest
+    word = _KNOWN_VARIABLE.sub(
+        lambda m: os.environ.get("HOME", "") if m.group(1) == "HOME" else paths.home_path(), word
+    )
+    return None if "$" in word else word
+
+
+def _inside(path: str, root: str) -> bool:
+    path = path.casefold()
+    return path == root or path.startswith(root + "/")
+
+
+def _glob_may_reach(pattern: str, root: str) -> bool:
+    """Whether the glob `pattern` could match `root` or a path inside it."""
+    from fnmatch import fnmatchcase
+
+    parts = os.path.normpath(pattern).casefold().split("/")
+    for i, name in enumerate(root.split("/")):
+        if i >= len(parts):
+            return False
+        if "**" in parts[i]:
+            return True
+        if not fnmatchcase(name, parts[i]):
+            return False
+    return True
 
 
 def _under(path: str, cwd: str, home: str) -> bool:

@@ -13,8 +13,8 @@ import pytest
 from scars.shell import SimpleCommand, Unsupported, parse
 
 
-def cmd(program, *args, cwd=None, uncertain=(), cwd_known=True):
-    return SimpleCommand(program, tuple(args), cwd, frozenset(uncertain), cwd_known)
+def cmd(program, *args, cwd=None, uncertain=(), cwd_known=True, writes=()):
+    return SimpleCommand(program, tuple(args), cwd, frozenset(uncertain), cwd_known, tuple(writes))
 
 
 @pytest.mark.parametrize(
@@ -28,10 +28,10 @@ def cmd(program, *args, cwd=None, uncertain=(), cwd_known=True):
         ("cd apps/web && npm test", (cmd("npm", "test", cwd="apps/web"),)),
         ("env -u FOO TZ=UTC python3 -m pytest", (cmd("pytest"),)),
         ("/usr/bin/xcodebuild -showsdks", (cmd("xcodebuild", "-showsdks"),)),
-        ("make > log 2>&1", (cmd("make"),)),
+        ("make > log 2>&1", (cmd("make", writes=["log"]),)),
         ("a || b; c | d & e", (cmd("a"), cmd("b"), cmd("c"), cmd("d"), cmd("e"))),
         ("a&&b", (cmd("a"), cmd("b"))),
-        ("sort < in.txt >> out.txt", (cmd("sort"),)),
+        ("sort < in.txt >> out.txt", (cmd("sort", writes=["out.txt"]),)),
         ("FOO=1 BAR=2 make all", (cmd("make", "all"),)),
         ("env -i PATH=/bin make", (cmd("make"),)),
         ("time nohup make", (cmd("make"),)),
@@ -105,13 +105,13 @@ def test_parse_keeps_quoted_and_escaped_operators_as_words(command, expected):
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
-        ("123 > out xcodebuild", (cmd("123", "xcodebuild"),)),
-        ("echo 2 > f", (cmd("echo", "2"),)),
-        ('echo "2">f', (cmd("echo", "2"),)),
+        ("123 > out xcodebuild", (cmd("123", "xcodebuild", writes=["out"]),)),
+        ("echo 2 > f", (cmd("echo", "2", writes=["f"]),)),
+        ('echo "2">f', (cmd("echo", "2", writes=["f"]),)),
         ("make 2>&1", (cmd("make"),)),
-        ("make 2>err 1>>out", (cmd("make"),)),
-        ("2>err make", (cmd("make"),)),
-        ("2&>f xcodebuild", (cmd("2", "xcodebuild"),)),
+        ("make 2>err 1>>out", (cmd("make", writes=["err", "out"]),)),
+        ("2>err make", (cmd("make", writes=["err"]),)),
+        ("2&>f xcodebuild", (cmd("2", "xcodebuild", writes=["f"]),)),
     ],
 )
 def test_parse_treats_digits_as_a_file_descriptor_only_when_attached(command, expected):
@@ -155,7 +155,7 @@ def test_parse_rejects_compound_syntax_it_does_not_model(command):
     ("command", "expected"),
     [
         ("( a; b ) && c", (cmd("a"), cmd("b"), cmd("c"))),
-        ("(a;) > log", (cmd("a"),)),
+        ("(a;) > log", (cmd("a", writes=["log"]),)),
         ("cd a && make && (b)", (cmd("make", cwd="a"), cmd("b", cwd="a"))),
         ("(cd x && make) | cat", (cmd("make", cwd="x"), cmd("cat"))),
         ("cd a && (cd b && make) && make", (cmd("make", cwd="a/b"), cmd("make", cwd="a"))),
@@ -385,7 +385,10 @@ def test_parse_returns_commands_or_raises_unsupported_for_random_input():
         ("python3 -u -m pytest -q", (cmd("pytest", "-q"),)),
         ("python3 -c 'print(1)'", (cmd("python3", "-c", "print(1)"),)),
         ("nohup time make", (cmd("make"),)),
-        ("echo x &> log; xcodebuild >| out 2>&1 <> f", (cmd("echo", "x"), cmd("xcodebuild"))),
+        (
+            "echo x &> log; xcodebuild >| out 2>&1 <> f",
+            (cmd("echo", "x", writes=["log"]), cmd("xcodebuild", writes=["out", "f"])),
+        ),
     ],
 )
 def test_parse_unwraps_only_modelled_wrapper_options(command, expected):
@@ -700,13 +703,15 @@ def test_parse_rejects_redirections_bash_would_refuse_or_could_refuse(command):
         ("make 2>&-", (cmd("make"),)),
         ("make 2<&-", (cmd("make"),)),
         ("make <&0", (cmd("make"),)),
-        ("make 3>x 1>&3", (cmd("make"),)),
-        ("make 2>&- 2>err 1>&2", (cmd("make"),)),
-        ("make &>log", (cmd("make"),)),
-        ("make >&log", (cmd("make"),)),
-        ("make >|log", (cmd("make"),)),
-        ("make 2>>err <in", (cmd("make"),)),
-        ("make 0<>f", (cmd("make"),)),
+        ("make 3>x 1>&3", (cmd("make", writes=["x"]),)),
+        ("make 2>&- 2>err 1>&2", (cmd("make", writes=["err"]),)),
+        ("make &>log", (cmd("make", writes=["log"]),)),
+        ("make >&log", (cmd("make", writes=["log"]),)),
+        ("make >|log", (cmd("make", writes=["log"]),)),
+        ("make 2>>err <in", (cmd("make", writes=["err"]),)),
+        ("make 0<>f", (cmd("make", writes=["f"]),)),
+        ("(touch a; echo b) >> f", (cmd("touch", "a", writes=["f"]), cmd("echo", "b", writes=["f"]))),
+        ("bash -c 'echo x > y' &> z", (cmd("echo", "x", writes=["y", "z"]),)),
         ("make '>&xyz'", (cmd("make", ">&xyz"),)),
         ("(make) 2>&1 | cat", (cmd("make"), cmd("cat"))),
         ("make # && rm -rf x", (cmd("make"),)),
@@ -812,7 +817,7 @@ def test_parse_rejects_round_four_false_fires(command):
         ("cd ios && make", (cmd("make", cwd="ios"),)),
         ("cd 'my dir' && make", (cmd("make", cwd="my dir"),)),
         ("cd ./-L && make", (cmd("make", cwd="./-L"),)),
-        ("cd /tmp && make > out/log", (cmd("make", cwd="/tmp"),)),
+        ("cd /tmp && make > out/log", (cmd("make", cwd="/tmp", writes=["out/log"]),)),
         ("sudo -u ci make", (cmd("make"),)),
         ("env -u FOO make", (cmd("make"),)),
         ("uv run --with x -p 3.12 make", (cmd("make"),)),
