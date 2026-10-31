@@ -570,7 +570,7 @@ def test_a_command_naming_the_absolute_scars_home_is_denied_unless_it_only_reads
         "printf '%s\\n' 'scars off'",
         "git commit -m 'document scars off'",
         "echo scars off is the kill switch",
-        "grep -rn 'scars off' docs/",
+        "grep -rn 'scars off' guide/",
         "git log --grep scars",
         "npm run scarsify off",
     ],

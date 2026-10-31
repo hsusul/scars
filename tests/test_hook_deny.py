@@ -45,7 +45,7 @@ ALLOWED = [
     "git commit -m 'document scars off'",
     "git commit -m 'scars promote'",
     "echo scars off is the kill switch",
-    "grep -rn 'scars off' docs/",
+    "grep -rn 'scars off' guide/",
     "printf '%s\\n' 'see ~/.scars/OFF'",
     "echo ~/.scars/OFF",
     "scars ls",
