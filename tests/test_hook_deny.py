@@ -65,6 +65,11 @@ ALLOWED = [
     "touch ~/.scarsrc",
     "rm -rf ../build",
     "cd /tmp && rm -rf x",
+    "git commit -m 'scars off'",
+    "sort < ~/.scars/lessons.db",
+    "sort < ../.scars/lessons.db",
+    "touch ~/.scarsrc/x",
+    "which scars",
 ]
 
 
@@ -118,6 +123,27 @@ DENIED = [
     ("rg --pre cat x ~/.scars/logs", HOME_REASON),
     ("rg x * ~/.scars/logs", HOME_REASON),
     ("find ~/.scars $ACTION", HOME_REASON),
+    ("command scars off", run("off")),
+    ("timeout 5 scars off", run("off")),
+    ("nice scars off", run("off")),
+    ("setsid scars off", run("off")),
+    ("xargs scars off", run("off")),
+    ("xargs -t scars -v promote L-1", run("promote")),
+    ("echo off | xargs scars", run("...")),
+    ("find . -exec scars off \\;", run("off")),
+    ("nice /usr/local/bin/scars $WHAT", run("$WHAT")),
+    ("python3 -c \"import os;os.remove(os.path.expanduser('~/.scars/lessons.db'))\"", HOME_REASON),
+    ("node -e 'fs.rmSync(`${HOME}/.scars/OFF`)'", HOME_REASON),
+    ("perl -e 'unlink \"$HOME/.scars/OFF\"'", HOME_REASON),
+    ("git commit -m '~/.scars/OFF'", HOME_REASON),
+    ("> ~/.scars/OFF", HOME_REASON),
+    ("X=1 > ~/.scars/OFF", HOME_REASON),
+    ("cd /tmp > ~/.scars/OFF && true", HOME_REASON),
+    ("> ../.scars/OFF", HOME_REASON),
+    ("X=1 > ../.scars/OFF", HOME_REASON),
+    ("cd /tmp > ../.scars/OFF && true", HOME_REASON),
+    ("sort <> ~/.scars/lessons.db", HOME_REASON),
+    ("sort <> ../.scars/lessons.db", HOME_REASON),
 ]
 
 
@@ -160,6 +186,8 @@ def test_a_custom_scars_home_is_protected_along_with_the_default(user, tmp_path,
     assert deny("rm $SCARS_HOME/OFF") == HOME_REASON
     assert deny("touch ~/.scars/OFF") == HOME_REASON
     assert deny(f"ls {custom}") is None
+    assert deny(f"git commit -m '{custom}/OFF'") == HOME_REASON
+    assert deny(f"git commit -m '{custom}2/OFF'") is None
     assert deny(f"touch {custom}2/OFF") is None
 
 

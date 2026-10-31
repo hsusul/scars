@@ -180,12 +180,18 @@ def shell_deny_reason(text: str, cwd: str, home: str) -> str | None:
 
     - Running scars (by any path, through the wrappers the parser removes, or as `python -m scars`) with
       `inbox` or a privileged subcommand, or with a first operand the shell expands at run time, is denied.
+      So is a command that is not `provably_read_only` and has an argument word naming the `scars`
+      program followed by such a subcommand, because runners the parser does not model (`timeout`,
+      `xargs`, `find -exec`) pass it on; `xargs` with no subcommand after `scars` takes it from input.
+    - A command that is not `provably_read_only` is denied when an argument spells the scars home, the
+      default `~/.scars`, `$HOME/.scars` or `${HOME}/.scars` anywhere in it, even inside a quoted script.
     - A command that is not `provably_read_only` is denied when one of its arguments may resolve under
       the scars home or the default `~/.scars`. Arguments are paths relative to the command's directory
       (the event cwd, after a leading `cd`, and both when the `cd` may have failed); the text after an `=`
       counts too. A leading `~`, `$HOME` and `$SCARS_HOME` are expanded, a glob is denied when it could
       match a path there, and an argument holding any other variable is denied when the raw text names
-      the home. Output redirection targets are checked the same way for every command.
+      the home. Redirection targets that open a file for writing are checked the same way for every
+      command, including one that is only a redirection.
     - A shell program the parser did not unwrap (a second nested `-c`, or `zsh`) runs a script the parser
       never saw, so its arguments are scanned as raw text, as below.
 
@@ -200,18 +206,32 @@ def shell_deny_reason(text: str, cwd: str, home: str) -> str | None:
     except shell.Unsupported:
         return _unparsed_reason(text, home)
     roots = _roots(home)
+    spelled = _home_spellings(roots)
+
+    def names_home() -> bool:
+        return _names_home(text, home)
+
     for c in commands:
         if c.program.lower() in SHELLS and (reason := _unparsed_reason(" ".join(c.args), home)):
             return reason
-        if (subcommand := _scars_subcommand(c)) is not None:
+        read_only = provably_read_only(c)
+        if (subcommand := _scars_subcommand(c, read_only)) is not None:
             return RUN_REASON.format(subcommand)
         dirs = _directories(c, cwd)
-        words = c.writes if provably_read_only(c) else (*c.args, *c.writes)
-        for i, word in enumerate(words):
-            expands = i in c.uncertain and words is not c.writes
-            if _may_resolve_under(word, expands, dirs, roots, lambda: _names_home(text, home)):
+        for target in c.writes:
+            if _may_resolve_under(target, target.startswith("~"), dirs, roots, names_home):
+                return SHELL_HOME_REASON
+        if read_only:
+            continue
+        for i, word in enumerate(c.args):
+            if spelled.search(word) or _may_resolve_under(word, i in c.uncertain, dirs, roots, names_home):
                 return SHELL_HOME_REASON
     return None
+
+
+def _home_spellings(roots: tuple[str, ...]) -> re.Pattern[str]:
+    spelled = [*(re.escape(r) for r in roots), r"~/\.scars", r"\$HOME/\.scars", r"\$\{HOME\}/\.scars"]
+    return re.compile(rf"(?:{'|'.join(spelled)})(?![\w.-])", re.IGNORECASE)
 
 
 def _unparsed_reason(text: str, home: str) -> str | None:
@@ -227,12 +247,27 @@ def _names_home(text: str, home: str) -> bool:
     return any(mention.search(t) for t in (text, _QUOTING.sub("", text)))
 
 
-def _scars_subcommand(c: "shell.SimpleCommand") -> str | None:
+def _scars_subcommand(c: "shell.SimpleCommand", read_only: bool) -> str | None:
     """The protected subcommand this command runs scars with, or None."""
     name = c.program.lower()
-    if name != "scars" and not name.startswith("scars."):
+    if name == "scars" or name.startswith("scars."):
+        return _protected_operand(c, 0)
+    if read_only:
         return None
     for i, arg in enumerate(c.args):
+        if i in c.uncertain or arg.rsplit("/", 1)[-1].lower() != "scars":
+            continue
+        if (found := _protected_operand(c, i + 1)) is not None:
+            return found
+        if name == "xargs" and all(a.startswith("-") for a in c.args[i + 1 :]):
+            return "..."
+    return None
+
+
+def _protected_operand(c: "shell.SimpleCommand", start: int) -> str | None:
+    """The first non-option argument from `start` when it is protected or unknown, else None."""
+    for i in range(start, len(c.args)):
+        arg = c.args[i]
         if i in c.uncertain:
             return arg
         if not arg.startswith("-"):

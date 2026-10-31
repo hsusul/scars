@@ -305,7 +305,8 @@ _PIECES = (
     "\ud800",
     "\U0001f600",
 )
-_PROGRAM_NAME = re.compile(r"[A-Za-z0-9._+-]+")
+# `:` is the null command reported for a redirection with no program.
+_PROGRAM_NAME = re.compile(r"[A-Za-z0-9._+-]+|:")
 PROPERTY_CASES = 5000
 
 
@@ -675,7 +676,8 @@ def test_parse_marks_a_directory_that_depends_on_an_earlier_cd_succeeding(comman
         "xcodebuild > $F",
         'xcodebuild > "$F"',
         "xcodebuild > *.log",
-        "xcodebuild > ~/log",
+        "xcodebuild > ~root/log",
+        "xcodebuild > ~*/log",
         "xcodebuild {fd}>x",
         "(xcodebuild) 2>&-",
         "exec 2>&-; xcodebuild >&2",
@@ -716,6 +718,13 @@ def test_parse_rejects_redirections_bash_would_refuse_or_could_refuse(command):
         ("(make) 2>&1 | cat", (cmd("make"), cmd("cat"))),
         ("make # && rm -rf x", (cmd("make"),)),
         ("make;# x", (cmd("make"),)),
+        ("xcodebuild > ~/log", (cmd("xcodebuild", writes=["~/log"]),)),
+        ("sort < ~/in", (cmd("sort"),)),
+        ("> f", (cmd(":", writes=["f"]),)),
+        ("X=1 > f", (cmd(":", writes=["f"]),)),
+        ("cd /tmp > f && true", (cmd(":", writes=["f"]), cmd("true", cwd="/tmp"))),
+        ("cd a && > f", (cmd(":", cwd="a", writes=["f"]),)),
+        ("< f", ()),
     ],
 )
 def test_parse_accepts_valid_redirections_and_operators(command, expected):

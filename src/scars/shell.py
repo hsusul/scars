@@ -95,7 +95,9 @@ class SimpleCommand:
     cwd_known: bool = True
     """False when the directory depends on whether an earlier `cd` succeeded."""
     writes: tuple[str, ...] = ()
-    """Files its output redirections open for writing, including those on an enclosing group."""
+    """Files its redirections open for writing (`<>` included), including those on an enclosing group, as
+    written: a leading `~` is not expanded. A command with no program, such as `> f`, `X=1 > f` or the
+    redirection on a leading `cd`, is reported as the null command `:` so its targets are kept."""
 
 
 class Unsupported(Exception):
@@ -537,7 +539,7 @@ class _Grouper:
 
         True when it opens its target as a file for writing.
         """
-        if not target.literal:
+        if not target.literal and not _home_relative(target):
             raise Unsupported(f"redirection target {target.text!r} expands at run time")
         if target.text == "":
             raise Unsupported("bash cannot open an empty redirection target")
@@ -578,6 +580,8 @@ class _Grouper:
             self.needs_follower = False
         if words:
             self._emit(words, frame, separator, writes)
+        elif writes:
+            self._emit_null(frame, writes)
         if frame.moved and separator is not None and separator not in _KEEPS_CWD:
             frame.cwd_known = False
 
@@ -590,6 +594,8 @@ class _Grouper:
             if len(words) != 2 or not _plain_directory(words[1]):
                 raise Unsupported("a leading cd needs exactly one plain directory operand")
             if separator == "&&":
+                if writes:
+                    self._emit_null(frame, writes)
                 target = words[1].text
                 frame.cwd = target if frame.cwd is None else posixpath.join(frame.cwd, target)
                 frame.moved = True
@@ -607,15 +613,25 @@ class _Grouper:
             self.altered = True
         if not frame.cwd_known:
             emitted = [replace(c, cwd_known=False) for c in emitted]
-        if writes:
-            emitted = [replace(c, writes=(*c.writes, *writes)) for c in emitted]
+        if writes and not emitted:
+            self._emit_null(frame, writes)
+        emitted = [replace(c, writes=(*c.writes, *writes)) for c in emitted]
         self.commands.extend(emitted)
         if any(c.program in _DIRECTORY_CHANGERS for c in emitted):
             frame.cwd_known = False
 
+    def _emit_null(self, frame: _Frame, writes: tuple[str, ...]) -> None:
+        self.commands.append(SimpleCommand(":", (), frame.cwd, cwd_known=frame.cwd_known, writes=writes))
+
+
+def _home_relative(word: _Word) -> bool:
+    """`~` or `~/rest` with nothing else the shell expands: bash and zsh both open the home path."""
+    tail = _Word(word.text[1:], None, word.bare[1:], word.expanded)
+    return word.text[:1] == "~" and word.bare[0] and word.text[1:2] in ("", "/") and tail.literal
+
 
 def _check_file_target(text: str) -> None:
-    if text.endswith("/") or text.rsplit("/", 1)[-1] in (".", ".."):
+    if text.endswith("/") or text == "~" or text.rsplit("/", 1)[-1] in (".", ".."):
         raise Unsupported(f"redirection target {text!r} is a directory")
 
 
