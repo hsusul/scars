@@ -903,7 +903,7 @@ def test_secret_in_the_error_signature_writes_no_observation(env):
     t = (
         Claude(env["repo"])
         .bash("t1", "git push origin main", f"fatal: {TOKEN}")
-        .bash("t2", "git push origin")
+        .bash("t2", "git push --force origin main")
     )
     write(env, "s1", t.text())
     summary = mine_now(env)
@@ -1377,7 +1377,7 @@ def test_a_mined_why_is_the_fixed_template_never_the_error_text(env):
     [
         ("pytest tests && rm -rf build", "compound_command"),
         ("pytest tests 2>&1", "not_plain_command"),
-        ("pytest $TESTS", "not_plain_command"),
+        ("pytest tests -k $TESTS", "not_plain_command"),
         ("pytest tests -k '[scars L-1a2b note]'", "scars_header"),
     ],
 )
@@ -1393,3 +1393,76 @@ def test_a_failure_whose_output_carries_a_scars_header_never_opens(env):
     t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", output).bash("t2", "pytest tests")
     write(env, "s1", t.text())
     assert mine_now(env) == Summary(sessions_read=1, calls=2, failures=1)
+
+
+@pytest.mark.parametrize(
+    ("failed", "passing"),
+    [
+        ("sed -n 1,240p a", "sed -n 1,180p b"),
+        ("gh pr diff 1801", "gh pr diff 1798"),
+        ("make test", "make build"),
+        ("make -C app test", "make -C app lint"),
+        ("xcodebuild -scheme App build", "xcodebuild -scheme App test"),
+        ("cat notes/a.md", "cat notes/b.md"),
+        (
+            "git worktree add -b fix/a /tmp/wt-a upstream/master",
+            "git worktree add -b fix/b /tmp/wt-b upstream/master",
+        ),
+        ("gh search commits on_connect --limit 100", "gh search issues on_connect --limit 100"),
+        ("MIX_ENV=test mix compile --warnings-as-errors", "MIX_ENV=test mix credo --strict"),
+        ("git stash pop", "git stash list"),
+        ("xcrun simctl boot 1111-AAAA", "xcrun simctl boot 2222-BBBB"),
+    ],
+)
+def test_a_pass_on_another_target_of_the_same_program_is_no_pair(env, failed, passing):
+    t = Claude(env["repo"]).bash("t1", failed, FAIL_TEXT).bash("t2", passing)
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert summary == Summary(sessions_read=1, calls=2, failures=1, skipped={"operand_mismatch": 1})
+    db = lessons_db(env)
+    assert db.execute("select tool_use_id, calls_since from pending_failures").fetchall() == [("t1", 1)]
+
+
+@pytest.mark.parametrize(
+    ("failed", "passing"),
+    [
+        ("gh search issues 'x' --limit 100", "gh search issues 'x' --limit 20"),
+        ("git worktree add -b B upstream/master /p", "git worktree add -b B /p upstream/master"),
+        ("git push origin main", "git push --force origin main"),
+        ("gh pr view 5", "gh pr view 5 --json title"),
+        ("tail -4 build.log", "tail -n 5 build.log"),
+        ("npm --prefix a test", "npm --prefix b test"),
+    ],
+)
+def test_a_pass_that_changes_only_options_pairs(env, failed, passing):
+    t = Claude(env["repo"]).bash("t1", failed, FAIL_TEXT).bash("t2", passing)
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 1, {})
+
+
+@pytest.mark.parametrize(
+    ("failed", "passing", "pairs", "skipped"),
+    [
+        ("cat notes/a.md", "cat $NOTE", 0, {"operand_mismatch": 1}),
+        ("gh api repos/o/r?ref=x", "gh api 'repos/o/r?ref=x' --jq .name", 1, {"not_plain_command": 1}),
+    ],
+)
+def test_an_argument_the_shell_expands_matches_only_the_same_text(env, failed, passing, pairs, skipped):
+    t = Claude(env["repo"]).bash("t1", failed, FAIL_TEXT).bash("t2", passing)
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.skipped) == (pairs, skipped)
+
+
+def test_a_failure_skips_a_pass_on_another_target_and_pairs_with_the_later_fix(env):
+    t = (
+        Claude(env["repo"])
+        .bash("t1", "sed -n 1,240p a", FAIL_TEXT)
+        .bash("t2", "sed -n 1,180p b")
+        .bash("t3", "sed -n 1,200p a")
+    )
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 1, {"operand_mismatch": 1})
+    assert the_lesson(env).text.instead == "run `sed -n 1,200p a` instead"

@@ -1,5 +1,9 @@
+from collections import Counter
+
+import pytest
+
 from scars.mine.calls import CallStatus, make_call
-from scars.mine.pairs import IDLE_SECONDS, pair_session
+from scars.mine.pairs import IDLE_SECONDS, Target, pair_session, target
 from scars.model import Harness
 
 START = 1_800_000_000.0
@@ -38,7 +42,9 @@ def outcome(result):
 
 
 def test_a_failure_pairs_with_the_next_pass_of_the_same_program():
-    result = pair_session((), [failed("f", START, command="pytest --x"), call("p", START + 1)], START + 2)
+    result = pair_session(
+        (), [failed("f", START, command="pytest --x tests"), call("p", START + 1)], START + 2
+    )
     assert outcome(result) == ([("f", "p")], [], 1, 0, 0)
 
 
@@ -69,7 +75,44 @@ def test_a_failure_idle_for_a_day_is_dropped_by_the_next_call():
     assert outcome(result) == ([], [], 1, 0, 1)
 
 
+def test_a_pass_on_another_operand_is_skipped_and_the_failure_keeps_waiting():
+    stream = [
+        failed("f", START, command="git push origin feature"),
+        call("other", START + 1, command="git push origin main"),
+        call("fix", START + 2, command="git push --set-upstream origin feature"),
+    ]
+    result = pair_session((), stream, START + 3)
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 1)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            "git -C app push --force origin main",
+            Target(("push",), Counter(["main"]), Counter(["app", "origin"])),
+        ),
+        (
+            "git worktree add -b B upstream/master /p",
+            Target(("worktree", "add"), Counter(["upstream/master", "/p"]), Counter(["B"])),
+        ),
+        ("gh pr diff 1801 --repo o/r", Target(("pr", "diff"), Counter(["1801"]), Counter(["o/r"]))),
+        ("npm run build", Target(("run",), Counter(["build"]), Counter())),
+        ("xcrun simctl boot 1111-AAAA", Target(("simctl", "boot"), Counter(["1111-AAAA"]), Counter())),
+        ("xcodebuild -scheme App build", Target((), Counter(["build"]), Counter(["App"]))),
+        ("make -C app test", Target((), Counter(["test"]), Counter(["app"]))),
+        ("cat --number -- -notes.md", Target((), Counter(["-notes.md"]), Counter())),
+        ("gh api repos/o/r?ref=x", Target(("api", "repos/o/r?ref=x"), Counter(), Counter())),
+        ("cat $NOTE", Target((), Counter(["$NOTE"]), Counter())),
+    ],
+)
+def test_the_target_is_the_subcommand_and_positional_operands(command, expected):
+    assert target(command) == expected
+
+
 def test_a_failure_one_second_short_of_a_day_still_pairs():
     late = call("p", START + IDLE_SECONDS - 1)
-    result = pair_session((), [failed("f", START, command="pytest --x"), late], START + IDLE_SECONDS - 1)
+    result = pair_session(
+        (), [failed("f", START, command="pytest --x tests"), late], START + IDLE_SECONDS - 1
+    )
     assert outcome(result) == ([("f", "p")], [], 1, 0, 0)
