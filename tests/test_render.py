@@ -477,6 +477,10 @@ def test_hex_tops_out_at_four_bits_so_a_full_sha_never_trips_entropy():
         ("reason", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig", "secret.jwt"),
         ("reason", "clone //alice:hunter2@host", "secret.url_userinfo"),
         ("reason", "-----BEGIN CERTIFICATE-----", "secret.pem_header"),
+        ("reason", "key AIza" + "SyA1b2C3d4E5f6G7h8I9j0", "secret.google_api_key"),
+        ("reason", "npm" + "_" + "abcdefghij0123456789", "secret.npm_token"),
+        ("reason", "sk" + "_live_" + "abc", "secret.stripe_key"),
+        ("reason", "rk" + "_test_" + "abc", "secret.stripe_key"),
         ("reason", "value " + RANDOM_24, "secret.high_entropy"),
     ],
 )
