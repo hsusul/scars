@@ -10,12 +10,16 @@
 4. Build each pair's candidate (see `build`), in order of the fixing call's time. A new fingerprint
    creates a candidate, which waits in the inbox for a human; an existing one gets an `observed` event
    the first time a session sights it, so `sessions_seen` counts sessions, not repeats within one.
-   An existing lesson that is not `human` and no longer passes the render rules (text mined before a
-   rule change) is retired with the rule it breaks, and the pair creates a fresh candidate instead.
    Each pair adds one observation. A pair's lesson write, precision run and observation commit in one
    transaction, and the observation, unique per failed tool use id, marks the pair processed, so a crash
    never counts a sighting twice.
 5. Commit offsets, processed ids, the open failures and the new mined calls in one transaction.
+
+Before step 3, every candidate or provisional lesson that is not `human`, not pinned and no longer passes
+the render rules (text mined before a rule change) is retired with the rule it breaks, so the inbox never
+holds it and a pair that sights it again creates a fresh candidate rather than a twin. The miner never
+changes a promoted lesson: one that stops rendering stays as a person approved it, and `scars ls` and
+`scars doctor` name it.
 6. Expire lessons not sighted for 14 days, then write delayed hit outcomes.
 
 Every transcript-derived text is secret-scanned before it is stored anywhere: a command, error
@@ -43,7 +47,7 @@ from scars import hook, policy, render, store
 from scars.match import InvalidTrigger, Precision, RecordedCall
 from scars.mine import build, calls, claude, codex, outcomes, pairs
 from scars.mine.replay import CallIndex
-from scars.model import ErrorSignature, EventType, Harness, RepoId, Trigger, TrustClass
+from scars.model import ErrorSignature, EventType, Harness, RepoId, Status, Trigger, TrustClass
 
 DAY = 86400.0
 
@@ -71,8 +75,8 @@ class Summary:
     pairs: int = 0
     candidates_created: int = 0
     observations: int = 0
-    retired_unrenderable: int = 0
-    """Mined lessons retired because their stored text no longer renders; fresh candidates replace them."""
+    retired_unrenderable: dict[str, int] = field(default_factory=dict)
+    """Mined lessons waiting for review that were retired because their text no longer renders, by rule."""
     pre_triggers_dropped: int = 0
     expired: int = 0
     outcomes_written: int = 0
@@ -291,24 +295,6 @@ def _write_pair(
 ) -> None:
     at = pair.passing.at
     existing = store.get_lesson_by_fingerprint(db, candidate.fingerprint)
-    if existing is not None and existing.trust_class is not TrustClass.HUMAN:
-        problem = render.render_problem(
-            existing,
-            known_commands=store.passing_inputs(db, [existing.id])[existing.id],
-            registered_repos=store.repo_names(db),
-        )
-        if problem is not None:
-            store.apply_event(
-                db,
-                lesson_id=existing.id,
-                event=EventType.RETIRED,
-                expected_revision=existing.revision,
-                actor=policy.ACTOR,
-                payload={"reason": f"cannot render: {problem.rule}"},
-                at=at,
-            )
-            counts["retired_unrenderable"] += 1
-            existing = None
     if existing is not None:
         lesson_id, revision = existing.id, existing.revision
         if not store.observed_in_session(db, lesson_id, pair.failed.harness, pair.failed.session_id):
@@ -369,6 +355,34 @@ def _write_pair(
     counts["observations"] += int(added)
 
 
+def _retire_unrenderable(db: sqlite3.Connection, now: float) -> dict[str, int]:
+    """Retire each mined lesson waiting for review whose text no longer renders; counts by rule."""
+    pending = store.list_lessons(db, statuses=(Status.CANDIDATE, Status.PROVISIONAL))
+    mined = [le for le in pending if le.trust_class is not TrustClass.HUMAN and not le.pinned]
+    known = store.passing_inputs(db, [le.id for le in mined])
+    repos = store.repo_names(db)
+    retired: Counter[str] = Counter()
+    for lesson in mined:
+        problem = render.render_problem(lesson, known_commands=known[lesson.id], registered_repos=repos)
+        if problem is None:
+            continue
+        try:
+            with store.transaction(db):
+                store.apply_event(
+                    db,
+                    lesson_id=lesson.id,
+                    event=EventType.RETIRED,
+                    expected_revision=lesson.revision,
+                    actor=policy.ACTOR,
+                    payload={"reason": f"cannot render: {problem.rule}"},
+                    at=now,
+                )
+        except (store.Conflict, store.Rejected):
+            continue
+        retired[problem.rule] += 1
+    return dict(sorted(retired.items()))
+
+
 def run(
     home: Path,
     sources: Iterable[Source],
@@ -407,6 +421,7 @@ def _run(
     counts: Counter[str] = Counter()
     rejected: Counter[str] = Counter()
     skipped: Counter[str] = Counter()
+    retired = _retire_unrenderable(db, now)
     read = _read(sources, store.miner_offsets(db), store.miner_file_contexts(db), now)
     all_ids = [c.tool_use_id for stream in read.streams.values() for c in stream]
     seen = set(store.seen_tool_uses(db, all_ids))
@@ -473,7 +488,7 @@ def _run(
         pairs=len(found),
         candidates_created=counts["candidates_created"],
         observations=counts["observations"],
-        retired_unrenderable=counts["retired_unrenderable"],
+        retired_unrenderable=retired,
         pre_triggers_dropped=counts["pre_triggers_dropped"],
         expired=expired,
         outcomes_written=result.outcomes,

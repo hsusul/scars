@@ -433,7 +433,7 @@ def test_a_mined_lesson_that_no_longer_renders_is_retired_and_mined_afresh(env):
     db.commit()
     write(env, "s1", basic_pair(env["repo"]).text())
     summary = mine_now(env)
-    assert (summary.candidates_created, summary.retired_unrenderable) == (1, 1)
+    assert (summary.candidates_created, summary.retired_unrenderable) == (1, {"mined.reason_template": 1})
     assert db.execute(
         "select type, payload from events where lesson_id = ? order by seq", (legacy,)
     ).fetchall() == [
@@ -452,6 +452,86 @@ def test_a_mined_lesson_that_no_longer_renders_is_retired_and_mined_afresh(env):
         1,
     )
     assert store.verify(db) == []
+
+
+def legacy_lesson(env, fingerprint="fp-legacy", reason=FAIL_TEXT):
+    from scars.model import LessonText
+
+    db = lessons_db(env)
+    legacy = store.create_lesson(
+        db,
+        text=LessonText("pytest --frobnicate tests", "run `pytest tests` instead", reason),
+        scope=RepoScope(RepoId("own-app")),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=(Trigger(TriggerKind.ERROR, "pytest: error: old signature", Stage.REPAIR),),
+        fingerprint=fingerprint,
+        actor="miner",
+        at=START,
+    )
+    store.add_observation(
+        db,
+        store.Observation(
+            legacy, "claude", "s0", "old1", "pytest --frobnicate tests", SIG, "pytest tests", START
+        ),
+    )
+    db.commit()
+    return db, legacy
+
+
+def test_a_legacy_lesson_is_retired_on_any_run_once_and_never_beside_its_re_mined_twin(env):
+    db, legacy = legacy_lesson(env)
+    write(env, "s1", basic_pair(env["repo"]).text())
+    first = mine_now(env)
+    assert (first.retired_unrenderable, first.candidates_created) == ({"mined.reason_template": 1}, 1)
+    second = mine_now(env, now=START + 2 * DAY)
+    assert (second.retired_unrenderable, second.candidates_created) == ({}, 0)
+    assert db.execute("select type from events where lesson_id = ? order by seq", (legacy,)).fetchall() == [
+        ("proposed",),
+        ("retired",),
+    ]
+    assert db.execute("select avoid, status from lessons where status != 'retired'").fetchall() == [
+        ("pytest --frobnicate tests", "candidate")
+    ]
+
+
+def test_a_legacy_lesson_is_retired_even_when_no_transcript_sights_it(env):
+    db, legacy = legacy_lesson(env)
+    assert mine_now(env).retired_unrenderable == {"mined.reason_template": 1}
+    assert store.get_lesson(db, legacy).status is Status.RETIRED
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_the_miner_never_retires_a_promoted_lesson_that_no_longer_renders(env, pinned):
+    from scars.mine.build import fingerprint
+    from scars.model import EventType
+
+    db, legacy = legacy_lesson(env, fingerprint=fingerprint(RepoScope(RepoId("own-app")), SIG))
+    store.apply_event(
+        db,
+        lesson_id=legacy,
+        event=EventType.PROMOTED,
+        expected_revision=1,
+        actor="human",
+        payload={},
+        at=START,
+    )
+    if pinned:
+        store.apply_event(
+            db,
+            lesson_id=legacy,
+            event=EventType.PINNED,
+            expected_revision=2,
+            actor="human",
+            payload={},
+            at=START,
+        )
+    db.commit()
+    write(env, "s1", basic_pair(env["repo"]).text())
+    summary = mine_now(env)
+    assert (summary.retired_unrenderable, summary.candidates_created) == ({}, 0)
+    lesson = store.get_lesson(db, legacy)
+    assert (lesson.status, lesson.pinned, lesson.text.reason) == (Status.PROMOTED, pinned, FAIL_TEXT)
+    assert db.execute("select count(*) from lessons").fetchone() == (1,)
 
 
 def test_seen_counts_distinct_sessions_not_observations(env):
