@@ -379,7 +379,7 @@ def test_a_secret_in_the_failed_command_drops_the_candidate(env):
     token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
     t = (
         Claude(env["repo"])
-        .bash("t1", f"pytest --frobnicate tests --auth {token}", FAIL_TEXT)
+        .bash("t1", f"pytest --frobnicate tests --auth={token}", FAIL_TEXT)
         .bash("t2", "pytest tests")
     )
     write(env, "s1", t.text())
@@ -1412,6 +1412,25 @@ def test_a_failure_whose_output_carries_a_scars_header_never_opens(env):
         ("MIX_ENV=test mix compile --warnings-as-errors", "MIX_ENV=test mix credo --strict"),
         ("git stash pop", "git stash list"),
         ("xcrun simctl boot 1111-AAAA", "xcrun simctl boot 2222-BBBB"),
+        ("kubectl -n a get pods", "kubectl -n b get pods"),
+        ("kubectl get pods --namespace=a", "kubectl get pods --namespace b"),
+        ("gh -R owner/a pr view 5", "gh -R owner/b pr view 5"),
+        ("gh pr view 5 --repo owner/a", "gh pr view 5 --repo=owner/b"),
+        ("npm --prefix a test", "npm --prefix b test"),
+        ("git -C a status", "git -C b status"),
+        ("make -C a test", "make -C b test"),
+        ("make --directory=a test", "make -C b test"),
+        ("cargo --manifest-path a/Cargo.toml test", "cargo --manifest-path b/Cargo.toml test"),
+        ("docker -H x ps", "docker -H y ps"),
+        ("docker --context x ps", "docker --context=y ps"),
+        ("rm -f a", "rm -f b"),
+        ("rg --files a", "rg --files b"),
+        ("git checkout -b x", "git checkout -b y"),
+        ("git branch -D x", "git branch -D y"),
+        ("cp a b", "cp b a"),
+        ("mv a b", "mv b a"),
+        ("ln -s a b", "ln -s b a"),
+        ("git diff a b", "git diff b a"),
     ],
 )
 def test_a_pass_on_another_target_of_the_same_program_is_no_pair(env, failed, passing):
@@ -1431,7 +1450,9 @@ def test_a_pass_on_another_target_of_the_same_program_is_no_pair(env, failed, pa
         ("git push origin main", "git push --force origin main"),
         ("gh pr view 5", "gh pr view 5 --json title"),
         ("tail -4 build.log", "tail -n 5 build.log"),
-        ("npm --prefix a test", "npm --prefix b test"),
+        ("npm test", "npm --prefix app test"),
+        ("git log -n 5 --grep fix", "git log -n 20 --grep bug"),
+        ("pytest tests -k a", "pytest tests -k b"),
     ],
 )
 def test_a_pass_that_changes_only_options_pairs(env, failed, passing):
@@ -1460,9 +1481,9 @@ def test_a_failure_skips_a_pass_on_another_target_and_pairs_with_the_later_fix(e
         Claude(env["repo"])
         .bash("t1", "sed -n 1,240p a", FAIL_TEXT)
         .bash("t2", "sed -n 1,180p b")
-        .bash("t3", "sed -n 1,200p a")
+        .bash("t3", "sed -n -e 1,240p a")
     )
     write(env, "s1", t.text())
     summary = mine_now(env)
     assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 1, {"operand_mismatch": 1})
-    assert the_lesson(env).text.instead == "run `sed -n 1,200p a` instead"
+    assert the_lesson(env).text.instead == "run `sed -n -e 1,240p a` instead"
