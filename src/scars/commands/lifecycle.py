@@ -54,6 +54,7 @@ def promotion_scope(db: sqlite3.Connection, lesson: Lesson, *, machine: bool, re
                 known_commands=store.passing_inputs(db, [lesson.id])[lesson.id],
                 trust_class=lesson.trust_class,
                 registered_repos=store.repo_names(db),
+                writing=True,
             )
         except render.RejectedText as exc:
             raise UserError(f"{lesson.id} cannot have machine scope: {rejection(exc)}") from None

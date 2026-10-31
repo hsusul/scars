@@ -561,19 +561,39 @@ def test_within_one_field_rule_order_decides():
         ("copy /tmp/x=/Users/henry/y", "machine.absolute_path"),
         ('cd "/tmp/x -I/Users/henry"', "machine.absolute_path"),
         ("-I/tmp/../Users/henry", "machine.dotdot_path"),
-        ("see apps/web/src for the config", "machine.relative_path"),
-        ("hsusul/widgets/tree/main has it", "machine.relative_path"),
-        ("./apps/web/src holds it", "machine.relative_path"),
-        ("start the server on localhost:8080 first", "machine.host"),
-        ("connect to db.internal:5432", "machine.host"),
-        ("check 10.0.0.1 is up", "machine.host"),
-        ("open 192.168.1.5/admin", "machine.host"),
     ],
 )
 def test_machine_scope_lint(value, rule):
     assert reject("reason", value, MACHINE) == rule
     text = replace(CLEAN, reason=value)
     assert body(text, scope=REPO)[2] == f"WHY: {value}"
+
+
+WRITE_TIME_MACHINE_LINT = [
+    ("see apps/web/src for the config", "machine.relative_path"),
+    ("hsusul/widgets/tree/main has it", "machine.relative_path"),
+    ("./apps/web/src holds it", "machine.relative_path"),
+    ("start the server on localhost:8080 first", "machine.host"),
+    ("connect to db.internal:5432", "machine.host"),
+    ("check 10.0.0.1 is up", "machine.host"),
+    ("open 192.168.1.5/admin", "machine.host"),
+]
+
+
+@pytest.mark.parametrize(("value", "rule"), WRITE_TIME_MACHINE_LINT)
+def test_a_human_writing_a_machine_lesson_may_not_name_a_relative_path_or_host(value, rule):
+    with pytest.raises(RejectedText) as caught:
+        check_fields(CLEAN.avoid, CLEAN.instead, value, MACHINE, known_commands=KNOWN, trust_class=HUMAN)
+    assert (caught.value.rule, caught.value.field) == (rule, "reason")
+    stored = lesson(scope=MACHINE, text=replace(CLEAN, reason=value), trust_class=HUMAN)
+    with pytest.raises(RejectedText) as caught:
+        check_budgets(stored, known_commands=KNOWN, registered_repos=REPOS)
+    assert (caught.value.rule, caught.value.field) == (rule, "reason")
+
+
+@pytest.mark.parametrize(("value", "rule"), WRITE_TIME_MACHINE_LINT)
+def test_an_existing_human_machine_lesson_naming_a_relative_path_or_host_still_renders(value, rule):
+    assert body(replace(CLEAN, reason=value))[2] == f"WHY: {value}"
 
 
 # ---------------------------------------------------------------- check_fields

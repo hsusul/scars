@@ -537,7 +537,9 @@ def _names_repo(text: str, registered_repos: Iterable[str]) -> bool:
     )
 
 
-def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[str]) -> None:
+def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[str], writing: bool) -> None:
+    """`writing` adds the relative-path and host rules. They came after human machine lessons were
+    already stored, so they hold only when a person writes one; a stored lesson keeps rendering."""
     for field in FIELDS:
         value = values[field]
         if _names_repo(value, registered_repos):
@@ -557,9 +559,9 @@ def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[s
         rest = "".join(masked)
         if any(m.group(1).lower() not in _GIT_REMOTES for m in _OWNER_NAME.finditer(rest)):
             raise RejectedText("machine.github_repo", field)
-        if _RELATIVE_PATH.search(rest):
+        if writing and _RELATIVE_PATH.search(rest):
             raise RejectedText("machine.relative_path", field)
-        if _HOST.search(value):
+        if writing and _HOST.search(value):
             raise RejectedText("machine.host", field)
 
 
@@ -627,13 +629,14 @@ def _check_values(
     known_commands: frozenset[str],
     trust_class: TrustClass,
     registered_repos: Sequence[str],
+    writing: bool,
 ) -> None:
     _run(SANITIZER_RULES, values)
     _run(IMPERATIVE_RULES, values)
     _check_shape(values, known_commands, trust_class)
     _run(SECRET_RULES, values)
     if isinstance(scope, MachineScope):
-        _check_machine_scope(values, registered_repos)
+        _check_machine_scope(values, registered_repos, writing and trust_class is TrustClass.HUMAN)
     if trust_class is not TrustClass.HUMAN:
         _check_mined(values)
 
@@ -645,6 +648,7 @@ def check(
     known_commands: frozenset[str],
     trust_class: TrustClass,
     registered_repos: Sequence[str] = (),
+    writing: bool = False,
 ) -> None:
     """Raise `RejectedText` unless every field passes every stage.
 
@@ -653,10 +657,11 @@ def check(
     default, so no caller can skip the observed-command rule by accident. `trust_class` is the lesson's;
     only `human` exempts a lesson from that rule and from the fixed shape (`INSTEAD_TEMPLATES` for
     `instead`, no code span in `avoid` or `reason`). `registered_repos` holds the display names
-    of every registered repo.
+    of every registered repo. `writing` is for a path that stores text or scope: it adds the rules that
+    hold only for new human machine lessons (see `_check_machine_scope`).
     """
     values = {field: getattr(text, field) for field in FIELDS}
-    _check_values(values, scope, known_commands, trust_class, registered_repos)
+    _check_values(values, scope, known_commands, trust_class, registered_repos, writing)
 
 
 def check_fields(
@@ -676,7 +681,7 @@ def check_fields(
     same way it drops any other rejection.
     """
     values = {"avoid": avoid, "instead": instead, "reason": reason}
-    _check_values(values, scope, known_commands, trust_class, registered_repos)
+    _check_values(values, scope, known_commands, trust_class, registered_repos, True)
     return LessonText(avoid=avoid, instead=instead, reason=reason)
 
 
@@ -840,8 +845,16 @@ def check_budgets(
     The lesson renders with the longest header it can reach (promoted with a review date, the longest
     level, a session count shown as `999+`), so a lesson that fits when written never stops rendering
     after a later promotion or sighting. Call it on every path that writes lesson text or triggers. Every
-    `check` rule runs too, and its own `RejectedText` propagates.
+    `check` rule runs too, with `writing`, and its own `RejectedText` propagates.
     """
+    check(
+        lesson.text,
+        lesson.scope,
+        known_commands=known_commands,
+        trust_class=lesson.trust_class,
+        registered_repos=registered_repos,
+        writing=True,
+    )
     longest = replace(
         lesson, status=Status.PROMOTED, level=_LONGEST_LEVEL, sessions_seen=MAX_SHOWN_SESSIONS + 1
     )
