@@ -38,7 +38,7 @@ def outcome(result):
 
 
 def test_a_failure_pairs_with_the_next_pass_of_the_same_program():
-    result = pair_session((), [failed("f", START, command="pytest --x"), call("p", START + 1)], START + 2)
+    result = pair_session((), [failed("f", START, command="pytest --x tests"), call("p", START + 1)], START + 2)
     assert outcome(result) == ([("f", "p")], [], 1, 0, 0)
 
 
@@ -71,5 +71,5 @@ def test_a_failure_idle_for_a_day_is_dropped_by_the_next_call():
 
 def test_a_failure_one_second_short_of_a_day_still_pairs():
     late = call("p", START + IDLE_SECONDS - 1)
-    result = pair_session((), [failed("f", START, command="pytest --x"), late], START + IDLE_SECONDS - 1)
+    result = pair_session((), [failed("f", START, command="pytest --x tests"), late], START + IDLE_SECONDS - 1)
     assert outcome(result) == ([("f", "p")], [], 1, 0, 0)

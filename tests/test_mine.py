@@ -903,7 +903,7 @@ def test_secret_in_the_error_signature_writes_no_observation(env):
     t = (
         Claude(env["repo"])
         .bash("t1", "git push origin main", f"fatal: {TOKEN}")
-        .bash("t2", "git push origin")
+        .bash("t2", "git push --force origin main")
     )
     write(env, "s1", t.text())
     summary = mine_now(env)
