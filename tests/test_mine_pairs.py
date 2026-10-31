@@ -67,6 +67,23 @@ def test_a_failure_with_no_lessonable_signature_never_opens():
     assert outcome(result) == ([], [], 1, 1, 0)
 
 
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        ("cat CONTRIBUTING.md; rg missing .github", "# Contributing..."),
+        ("cat AGENTS.md; rg missing src", "# Useful Commands"),
+        ("sed -n '1,5p' config.py | rg missing", "import asyncio"),
+        ("tail -n 100 audit.md && git status --short", "# Contribution chain run 2"),
+        ("cat README.md || rg missing src", "# Individual Contributor License Agreement"),
+    ],
+)
+def test_compound_stdout_without_an_error_never_opens_a_failure(command, output):
+    result = pair_session(
+        (), [call("f", START, command=command, status=CallStatus.FAILED, output=output)], START + 1
+    )
+    assert outcome(result) == ([], [], 1, 1, 0)
+
+
 def test_a_failure_idle_for_a_day_is_dropped_by_the_next_call():
     late = call("p", START + IDLE_SECONDS)
     result = pair_session((), [failed("f", START, command="pytest --x"), late], START + IDLE_SECONDS)
