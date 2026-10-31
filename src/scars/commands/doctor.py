@@ -304,7 +304,7 @@ def doctor(
             )
     if not any(state == "installed" for state in plugins.values()):
         out.append(Check("hooks", False, "no harness has scars hooks installed"))
-    off = paths.is_off() or bool(ctx.env.get("SCARS_OFF"))
+    off = paths.is_off() or paths.off_value(ctx.env.get("SCARS_OFF"))
     out.append(Check("kill switch", not off, "on: hooks do nothing (scars on)" if off else "off"))
     out.extend(_store_checks(ctx, scars_home, location))
     out.append(canary())

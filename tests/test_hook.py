@@ -2,6 +2,7 @@ import io
 import itertools
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -1073,6 +1074,97 @@ def test_the_common_dir_read_from_files_matches_git(tmp_path, monkeypatch):
     found = [hook.git_common_dir(str(c)) for c in cwds]
     assert found == [str(main.resolve() / ".git")] * 6 + [None]
     assert found == [git_answer(c) for c in cwds]
+
+
+def test_a_lesson_render_rejects_is_skipped_and_the_others_still_arrive(env):
+    home, repo = env
+    db = seed_store(home, repo)
+    good = add_lesson(db, fingerprint="fp-good", triggers=REPAIR)
+    bad = add_lesson(db, fingerprint="fp-bad", triggers=REPAIR, avoid="npm t\u00e9st")
+    db.execute("update lessons set sessions_seen = 9 where id = ?", (bad,))
+    db.close()
+    result = run_hook(home, "claude", "PostToolUseFailure", claude_failure(repo))
+    assert json.loads(result.stdout) == context("PostToolUseFailure", lesson_text(good))
+    assert [(h[5], h[8], h[10]) for h in hits(home)] == [(good, "shown", "render_rejected")]
+
+
+@pytest.mark.parametrize("damage", ["garbage", "truncated", "garbage wal"])
+def test_a_corrupt_telemetry_db_still_delivers_and_is_left_as_it_was(env, damage):
+    home, repo = env
+    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
+    path = home / "telemetry.db"
+    match damage:
+        case "garbage":
+            path.write_bytes(b"this is not a database at all\n" * 200)
+        case "truncated":
+            path.write_bytes(path.read_bytes()[:4096])
+        case "garbage wal":
+            (home / "telemetry.db-wal").write_bytes(b"\xff" * 8192)
+    before = path.read_bytes()
+    result = run_hook(home, "claude", "PostToolUseFailure", claude_failure(repo))
+    assert json.loads(result.stdout) == context("PostToolUseFailure", lesson_text(lesson_id))
+    if damage != "garbage wal":
+        assert path.read_bytes() == before
+
+
+def test_the_scars_hook_command_honors_the_kill_switch_itself(env):
+    home, repo = env
+    (home / "OFF").touch()
+    command = [sys.executable, "-m", "scars", "hook"]
+    assert run_hook(home, "claude", "PreToolUse", pre_tool(repo, "scars off"), command=command).stdout == ""
+    assert hits(home) == []
+
+
+@pytest.mark.parametrize(
+    ("value", "off"),
+    [
+        ("1", True),
+        ("TRUE", True),
+        ("Yes", True),
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        ("off", False),
+    ],
+)
+def test_scars_off_accepts_only_1_true_or_yes(env, value, off):
+    home, repo = env
+    result = run_hook(home, "claude", "PreToolUse", pre_tool(repo, "scars off"), SCARS_OFF=value)
+    assert result.stdout == ("" if off else deny_json(run_reason("off")))
+
+
+def test_an_import_fault_in_the_package_exits_0_with_no_output(env, tmp_path):
+    home, repo = env
+    broken = tmp_path / "broken"
+    shutil.copytree(
+        Path(hook.__file__).parent, broken / "scars", ignore=shutil.ignore_patterns("__pycache__")
+    )
+    (broken / "scars" / "telemetry.py").write_text("raise RuntimeError('broken install')\n")
+    entry = f"import sys; sys.path.insert(0, {str(broken)!r}); from scars.hook_entry import main; main()"
+    result = run_hook(
+        home, "claude", "PreToolUse", pre_tool(repo, "scars off"), command=[sys.executable, "-c", entry]
+    )
+    assert result.stdout == ""
+
+
+def test_a_deny_to_a_closed_stdout_exits_0_quietly_and_is_recorded(env):
+    home, repo = env
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        result = subprocess.run(
+            [*HOOK, "claude", "PreToolUse"],
+            input=json.dumps(pre_tool(repo, "scars off")),
+            stdout=write_end,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=hook_env(home),
+            timeout=20,
+        )
+    finally:
+        os.close(write_end)
+    assert (result.returncode, result.stderr) == (0, "")
+    assert [h[3:] for h in hits(home)] == [GATE_DENY]
 
 
 # ---------------------------------------------------------------- entry points and latency

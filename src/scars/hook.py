@@ -806,8 +806,7 @@ def run(
             telemetry.write(tele, writes)
             raise
         if decision.output is not None:
-            stdout.write(json.dumps(decision.output))
-            stdout.flush()
+            _print(stdout, json.dumps(decision.output))
         dedupe = decision.outcome is HitOutcome.SHOWN
         telemetry.write(
             tele,
@@ -823,6 +822,19 @@ def run(
     finally:
         if tele is not None:
             tele.close()
+
+
+def _print(stdout: TextIO, text: str) -> None:
+    try:
+        stdout.write(text)
+        stdout.flush()
+    except BrokenPipeError:
+        # The harness stopped reading. Python flushes stdout again at exit and would then print a
+        # BrokenPipeError and exit 120; pointing the descriptor at /dev/null keeps that flush quiet.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), stdout.fileno())
+        except (OSError, ValueError):
+            return
 
 
 def main(harness: str, event_name: str, *, started: float | None = None) -> int:
