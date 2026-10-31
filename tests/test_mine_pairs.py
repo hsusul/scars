@@ -1,9 +1,7 @@
-from collections import Counter
-
 import pytest
 
 from scars.mine.calls import CallStatus, make_call
-from scars.mine.pairs import IDLE_SECONDS, Target, pair_session, target
+from scars.mine.pairs import IDLE_SECONDS, Target, pair_session, same_target, target
 from scars.model import Harness
 
 START = 1_800_000_000.0
@@ -90,24 +88,32 @@ def test_a_pass_on_another_operand_is_skipped_and_the_failure_keeps_waiting():
     [
         (
             "git -C app push --force origin main",
-            Target(("push",), Counter(["main"]), Counter(["app", "origin"])),
+            Target("git", ("push",), ("origin", "main"), {"-C": ("app",)}),
         ),
         (
             "git worktree add -b B upstream/master /p",
-            Target(("worktree", "add"), Counter(["upstream/master", "/p"]), Counter(["B"])),
+            Target("git", ("worktree", "add"), ("B", "upstream/master", "/p"), {}),
         ),
-        ("gh pr diff 1801 --repo o/r", Target(("pr", "diff"), Counter(["1801"]), Counter(["o/r"]))),
-        ("npm run build", Target(("run",), Counter(["build"]), Counter())),
-        ("xcrun simctl boot 1111-AAAA", Target(("simctl", "boot"), Counter(["1111-AAAA"]), Counter())),
-        ("xcodebuild -scheme App build", Target((), Counter(["build"]), Counter(["App"]))),
-        ("make -C app test", Target((), Counter(["test"]), Counter(["app"]))),
-        ("cat --number -- -notes.md", Target((), Counter(["-notes.md"]), Counter())),
-        ("gh api repos/o/r?ref=x", Target(("api", "repos/o/r?ref=x"), Counter(), Counter())),
-        ("cat $NOTE", Target((), Counter(["$NOTE"]), Counter())),
+        ("gh pr diff 1801 --repo o/r", Target("gh", ("pr", "diff"), ("1801",), {"--repo": ("o/r",)})),
+        ("kubectl --namespace=a get pods", Target("kubectl", ("get",), ("pods",), {"--namespace": ("a",)})),
+        ("tail -n 5 build.log", Target("tail", (), ("build.log",), {})),
+        ("rm -f a", Target("rm", (), ("a",), {})),
+        ("kubectl --kubeconfig cfg get pods", Target("kubectl", ("get",), ("cfg", "pods"), {})),
+        ("npm run build", Target("npm", ("run",), ("build",), {})),
+        ("xcrun simctl boot 1111-AAAA", Target("xcrun", ("simctl", "boot"), ("1111-AAAA",), {})),
+        ("xcodebuild -scheme App build", Target("xcodebuild", (), ("App", "build"), {})),
+        ("make -C app test", Target("make", (), ("test",), {"--directory": ("app",)})),
+        ("cat --number -- -notes.md", Target("cat", (), ("-notes.md",), {})),
+        ("gh api repos/o/r?ref=x", Target("gh", ("api", "repos/o/r?ref=x"), (), {})),
+        ("cat $NOTE", Target("cat", (), ("$NOTE",), {})),
     ],
 )
 def test_the_target_is_the_subcommand_and_positional_operands(command, expected):
     assert target(command) == expected
+
+
+def test_commands_of_two_programs_never_share_a_target():
+    assert (same_target("cat a", "less a"), same_target("cat a", "cat --number a")) == (False, True)
 
 
 def test_a_failure_one_second_short_of_a_day_still_pairs():

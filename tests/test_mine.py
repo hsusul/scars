@@ -379,7 +379,7 @@ def test_a_secret_in_the_failed_command_drops_the_candidate(env):
     token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
     t = (
         Claude(env["repo"])
-        .bash("t1", f"pytest --frobnicate tests --auth {token}", FAIL_TEXT)
+        .bash("t1", f"pytest --frobnicate tests --auth={token}", FAIL_TEXT)
         .bash("t2", "pytest tests")
     )
     write(env, "s1", t.text())
@@ -1481,9 +1481,9 @@ def test_a_failure_skips_a_pass_on_another_target_and_pairs_with_the_later_fix(e
         Claude(env["repo"])
         .bash("t1", "sed -n 1,240p a", FAIL_TEXT)
         .bash("t2", "sed -n 1,180p b")
-        .bash("t3", "sed -n 1,200p a")
+        .bash("t3", "sed -n -e 1,240p a")
     )
     write(env, "s1", t.text())
     summary = mine_now(env)
     assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 1, {"operand_mismatch": 1})
-    assert the_lesson(env).text.instead == "run `sed -n 1,200p a` instead"
+    assert the_lesson(env).text.instead == "run `sed -n -e 1,240p a` instead"

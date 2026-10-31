@@ -5,18 +5,23 @@ the same tool and, for shell calls, the same program and the same target, provid
 next 10 calls and no edit call (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `apply_patch`) comes before
 it. An edit means the fix was a source change, which is ordinary debugging and not a lesson.
 
-The same target means the first simple command of each call has the same subcommand and the same
-positional operands, so only options and option values differ. A pass of the same program on another
-file, PR, branch or make target is a different task, not a fix. The subcommand is the first words that are
-neither options nor option values, as many as `SUBCOMMAND_DEPTH` gives for the program (or for the program
-and its first such word), compared in order. Make targets and `xcodebuild` actions are operands. A word
-right after an option written without `=` may be that option's value or an operand, since the miner knows
-no program's options, so it is never a subcommand word, and for the operands each call's
-operands must appear among the other call's operands and such words, so `git push origin main` and
-`git push --force origin main` match while `sed -n 1,240p a` and `sed -n 1,180p b` do not. Words compare as
-written, so an argument the shell expands at run time matches only the same text (an unquoted
-`repos/o/r?ref=x` still matches its quoted retry). Operands are compared as a multiset, because their
-order rarely names a different target.
+The same target means the first simple command of each call has the same subcommand, the same
+positional operands and the same value for every option that selects the target, so only other options
+and their values differ. A pass of the same program on another file, PR, branch, make target, directory,
+repo or namespace is a different task, not a fix. The subcommand is the first words that are neither
+options nor option values, as many as `SUBCOMMAND_DEPTH` gives for the program (or for the program and its
+first such word), compared in order. Make targets and `xcodebuild` actions are operands.
+
+Options are classified from two small per-program tables. `TARGET_OPTIONS` lists options whose value names
+the target (`git -C`, `gh -R`, `kubectl -n`, `npm --prefix`); when both calls give one, the values must be
+equal, while adding one to a call that had none may be the fix itself. `VALUE_OPTIONS` lists options known
+to take a value that may differ (`--limit`, `head -n`, `pytest -k`). The word right after any other option
+written without `=` may be that option's value or an operand, since the miner does not know the option, so
+it is never a subcommand word but must match like an operand: `git push origin main` and
+`git push --force origin main` match, while `rm -f a` and `rm -f b` do not. Words compare as written, so
+an argument the shell expands at run time matches only the same text (an unquoted `repos/o/r?ref=x` still
+matches its quoted retry). Operands are compared in order, since `cp a b` and `cp b a` act on different
+files, except for the subcommands in `UNORDERED`, whose operands name distinct roles.
 
 A pass of the same tool and program in the same place that runs another target is counted as an
 `operand_mismatch` skip, and the failure keeps waiting for its fix within the same window.
@@ -68,15 +73,54 @@ SUBCOMMAND_DEPTH: dict[tuple[str, ...], int] = {
 """How many leading non-option words name the subcommand, keyed by the program's base name alone or with
 its first such word. The longer key wins; a program in neither has no subcommand."""
 
+TARGET_OPTIONS: dict[str, dict[str, str]] = {
+    "git": {"-C": "-C", "--git-dir": "--git-dir", "--work-tree": "--work-tree"},
+    "gh": {"-R": "--repo", "--repo": "--repo"},
+    "npm": {"--prefix": "--prefix", "-w": "--workspace", "--workspace": "--workspace"},
+    "make": {"-C": "--directory", "--directory": "--directory", "-f": "--file", "--file": "--file"},
+    "cargo": {"--manifest-path": "--manifest-path", "-p": "--package", "--package": "--package"},
+    "kubectl": {"-n": "--namespace", "--namespace": "--namespace", "--context": "--context"},
+    "docker": {"-H": "--host", "--host": "--host", "-c": "--context", "--context": "--context"},
+}
+"""Per program, the spellings of options whose value selects the target, mapped to one name per option."""
+
+VALUE_OPTIONS: dict[str, frozenset[str]] = {
+    "git": frozenset(
+        {"-m", "--message", "-n", "--max-count", "--grep", "--since", "--until", "--author", "-c"}
+    ),
+    "gh": frozenset({"--limit", "-L", "--json", "--jq", "-q", "--template", "--state", "-s", "--search"}),
+    "head": frozenset({"-n", "-c"}),
+    "tail": frozenset({"-n", "-c"}),
+    "pytest": frozenset({"-k", "-m", "-n", "-p", "--tb", "--maxfail"}),
+    "make": frozenset({"-j", "--jobs"}),
+    "cargo": frozenset({"-j", "--jobs"}),
+    "rg": frozenset({"-A", "-B", "-C", "-m", "--max-count"}),
+    "grep": frozenset({"-A", "-B", "-C", "-m", "--max-count"}),
+    "kubectl": frozenset({"-o", "--output", "--tail", "--since"}),
+    "docker": frozenset({"--tail", "--since", "--format"}),
+}
+"""Per program, options written without `=` that are known to take the next word as a value that may
+differ between a failure and its fix."""
+
+_VALUE = "value"
+_UNKNOWN = "unknown"
+"""What the word after a bare option is when the option is not in `TARGET_OPTIONS`; selector names start
+with `-`, so neither clashes with one."""
+
+UNORDERED: frozenset[tuple[str, ...]] = frozenset({("git", "worktree", "add")})
+"""Program and subcommand whose operands may come in any order and still name the same target."""
+
 
 @dataclass(frozen=True)
 class Target:
-    """What a shell command acts on: its subcommand and positional operands."""
+    """What a shell command acts on: its program, subcommand, positional operands and selecting options."""
 
+    program: str
     subcommand: tuple[str, ...]
-    operands: Counter[str]
-    option_words: Counter[str]
-    """Words right after an option written without `=`: its value, or an operand."""
+    operands: tuple[str, ...]
+    """In order, including the word right after an option that is in neither option table."""
+    selectors: dict[str, tuple[str, ...]]
+    """The values of the options in `TARGET_OPTIONS`, by option name."""
 
 
 def _is_option(arg: str) -> bool:
@@ -92,34 +136,52 @@ def target(command: str) -> Target | None:
     if not commands:
         return None
     simple = commands[0]
-    words: list[str] = []
-    option_words: Counter[str] = Counter()
-    options_end = after_option = False
+    program = posixpath.basename(simple.program)
+    selecting = TARGET_OPTIONS.get(program, {})
+    valued = VALUE_OPTIONS.get(program, frozenset())
+    words: list[tuple[str, bool]] = []
+    selectors: dict[str, list[str]] = {}
+    options_end = False
+    pending: str | None = None
     for arg in simple.args:
         if not options_end and arg == "--":
-            options_end, after_option = True, False
+            options_end, pending = True, None
         elif not options_end and _is_option(arg):
-            after_option = "=" not in arg
-        elif after_option:
-            option_words[arg] += 1
-            after_option = False
+            name, eq, value = arg.partition("=")
+            pending = None
+            if name in selecting and eq:
+                selectors.setdefault(selecting[name], []).append(value)
+            elif name in selecting:
+                pending = selecting[name]
+            elif not eq:
+                pending = _VALUE if name in valued else _UNKNOWN
+        elif pending is None:
+            words.append((arg, False))
         else:
-            words.append(arg)
-    program = posixpath.basename(simple.program)
-    depth = SUBCOMMAND_DEPTH.get((program, *words[:1]), SUBCOMMAND_DEPTH.get((program,), 0))
-    return Target(tuple(words[:depth]), Counter(words[depth:]), option_words)
-
-
-def _covered(operands: Counter[str], other: Target) -> bool:
-    return not operands - other.operands - other.option_words
+            if pending == _UNKNOWN:
+                words.append((arg, True))
+            elif pending != _VALUE:
+                selectors.setdefault(pending, []).append(arg)
+            pending = None
+    plain = [word for word, ambiguous in words if not ambiguous]
+    depth = SUBCOMMAND_DEPTH.get((program, *plain[:1]), SUBCOMMAND_DEPTH.get((program,), 0))
+    subcommand: list[str] = []
+    operands: list[str] = []
+    for word, ambiguous in words:
+        (subcommand if not ambiguous and len(subcommand) < depth else operands).append(word)
+    return Target(program, tuple(subcommand), tuple(operands), {k: tuple(v) for k, v in selectors.items()})
 
 
 def same_target(failed: str, passing: str) -> bool:
-    """Whether two shell commands act on the same target, so only options and option values differ."""
+    """Whether two shell commands act on the same target, so only options that do not select it differ."""
     a, b = target(failed), target(passing)
-    if a is None or b is None or a.subcommand != b.subcommand:
+    if a is None or b is None or (a.program, a.subcommand) != (b.program, b.subcommand):
         return False
-    return _covered(a.operands, b) and _covered(b.operands, a)
+    if any(a.selectors[name] != b.selectors[name] for name in a.selectors.keys() & b.selectors.keys()):
+        return False
+    if (a.program, *a.subcommand) in UNORDERED:
+        return Counter(a.operands) == Counter(b.operands)
+    return a.operands == b.operands
 
 
 @dataclass(frozen=True)
