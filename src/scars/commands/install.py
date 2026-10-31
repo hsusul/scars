@@ -27,7 +27,8 @@ renamed into place, and keeps the existing file's mode. A read-only file is repl
 person confirms it, never under `--yes`. The Codex merge accepts only the documented shape of
 `hooks.json` (any other shape stops init before it changes anything) and removes only handlers whose
 command is exactly one scars renders; everything else in the file is kept. JSON that would not survive
-a round trip (duplicate keys, numbers that are not finite) counts as another shape. Every file is read
+a round trip (duplicate keys, numbers that are not finite or that a float would round) counts as another
+shape. Every file is read
 again just before it is written, and a file that changed since init planned it (someone edited it while
 init was asking) is left alone, with a message to run init again.
 
@@ -74,7 +75,8 @@ _CWD = re.compile(r'"cwd"\s*:\s*("(?:[^"\\]|\\.)*")')
 
 
 class UnsafeJson(ValueError):
-    """JSON that `json` would load lossily: a duplicate key, or a number that is not finite."""
+    """JSON that `json` would load lossily: a duplicate key, or a number that is not finite or that a
+    float cannot hold exactly enough to write back the same value (`1e-400`, `1.00000000000000000001`)."""
 
 
 def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -86,10 +88,14 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return out
 
 
-def _finite(text: str) -> float:
+def _exact_float(text: str) -> float:
+    from decimal import Decimal
+
     value = float(text)
     if value in (float("inf"), float("-inf")):
         raise UnsafeJson(f"number {text} is not finite")
+    if Decimal(repr(value)) != Decimal(text):
+        raise UnsafeJson(f"number {text} would change in a round trip")
     return value
 
 
@@ -99,7 +105,9 @@ def _no_constant(text: str) -> float:
 
 def load_json_exactly(text: str) -> object:
     """Parse JSON that dumps back without loss, or raise `UnsafeJson` (or ValueError for bad JSON)."""
-    return json.loads(text, object_pairs_hook=_unique_keys, parse_float=_finite, parse_constant=_no_constant)
+    return json.loads(
+        text, object_pairs_hook=_unique_keys, parse_float=_exact_float, parse_constant=_no_constant
+    )
 
 
 @dataclass(frozen=True)
@@ -149,8 +157,8 @@ class PlannedFile:
         lines = difflib.unified_diff(
             [] if old is None else old.splitlines(keepends=True),
             self.content.splitlines(keepends=True),
-            fromfile="/dev/null" if old is None else str(self.path),
-            tofile=str(self.path),
+            fromfile="/dev/null" if old is None else paths.text(str(self.path)),
+            tofile=paths.text(str(self.path)),
         )
         return "".join(lines)
 
@@ -244,7 +252,7 @@ def claude_files(scars_home: Path, hook_path: str) -> list[PlannedFile]:
 
 def shim_file(scars_home: Path, hook_path: str) -> PlannedFile:
     """`~/.scars/bin/scars-hook`, which execs the installed hook with the harness's arguments."""
-    content = f'#!/bin/sh\nexec {shlex.quote(hook_path)} "$@"\n'
+    content = f'#!/bin/sh\nexec {shlex.quote(paths.text(hook_path))} "$@"\n'
     return PlannedFile(scars_home / "bin" / "scars-hook", content, SHIM_MODE, force_mode=True)
 
 
@@ -347,11 +355,11 @@ def codex_file(user_home: Path, hook_path: str) -> PlannedFile:
 
 def launchd_file(user_home: Path, scars_path: str, scars_home: Path, env: dict[str, str]) -> PlannedFile:
     job = plistlib.loads(_template("launchd/dev.scars.miner.plist").encode(UTF8))
-    job["ProgramArguments"] = [scars_path, "mine"]
-    log = str(scars_home / "logs" / "miner.log")
+    job["ProgramArguments"] = [paths.text(scars_path), "mine"]
+    log = paths.text(str(scars_home / "logs" / "miner.log"))
     job["StandardOutPath"] = job["StandardErrorPath"] = log
     if env:
-        job["EnvironmentVariables"] = env
+        job["EnvironmentVariables"] = {k: paths.text(v) for k, v in env.items()}
     content = plistlib.dumps(job).decode(UTF8)
     return PlannedFile(user_home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist", content, PLIST_MODE)
 
@@ -523,7 +531,7 @@ def _recorded(f: PlannedFile) -> PlannedFile:
 
 def plan(ctx: Context, scars_home: Path, hook_path: str) -> Plan:
     shim = _recorded(shim_file(scars_home, hook_path))
-    command = str(shim.path)
+    command = paths.text(str(shim.path))
     job = None
     if ctx.platform == "darwin":
         env = {} if scars_home == ctx.user_home / ".scars" else {"SCARS_HOME": str(scars_home)}
@@ -539,7 +547,7 @@ def install(ctx: Context, scars_home: Path, files_: Plan, yes: bool) -> None:
     if _offer(ctx, "Claude Code plugin", files_.claude, yes):
         plugins = scars_home / "plugins"
         ctx.print("to turn it on in Claude Code, run:")
-        ctx.print(f"  claude plugin marketplace add {shlex.quote(str(plugins))}")
+        ctx.print(f"  claude plugin marketplace add {shlex.quote(paths.text(str(plugins)))}")
         ctx.print("  claude plugin install scars@scars-local")
     if _offer(ctx, "Codex hooks", files_.codex, yes):
         ctx.print("Codex asks you to review and trust the new hooks the next time it starts")
@@ -548,7 +556,8 @@ def install(ctx: Context, scars_home: Path, files_: Plan, yes: bool) -> None:
         return
     job = files_.launchd
     if _offer(ctx, "miner schedule", [job], yes):
-        ctx.print(f"to start it, run: launchctl bootstrap gui/{os.getuid()} {shlex.quote(str(job.path))}")
+        target = shlex.quote(paths.text(str(job.path)))
+        ctx.print(f"to start it, run: launchctl bootstrap gui/{os.getuid()} {target}")
 
 
 def fired_counts(
@@ -645,7 +654,7 @@ def _init_locked(args: argparse.Namespace, ctx: Context, scars_home: Path, files
     tele = store.init_telemetry(scars_home / "telemetry.db")
     store.ensure_telemetry_schema(tele)
     tele.close()
-    ctx.print(f"store: {scars_home}")
+    ctx.print(f"store: {paths.text(str(scars_home))}")
     register_repos(ctx, scars_home, args.yes)
     install(ctx, scars_home, files_, args.yes)
     summary = mining.run(ctx)

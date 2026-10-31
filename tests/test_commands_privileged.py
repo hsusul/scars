@@ -98,6 +98,14 @@ HARNESS_LINES = [
     "/Applications/Codex.app/Contents/MacOS/Codex",
     "/opt/homebrew/Caskroom/codex/0.50.0/codex-aarch64-apple-darwin",
     "bun /Users/u/.bun/install/global/node_modules/@openai/codex/bin/codex.js",
+    # The same installs under a home or volume whose name has spaces.
+    "/Users/Jane Doe/Applications/Remy.app/Contents/MacOS/Remy",
+    "/Volumes/990 Pro/Apps/Claude.app/Contents/MacOS/Claude",
+    "/Users/Jane Doe/Apps/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex x",
+    "/Users/Jane Doe/Applications/Codex.app/Contents/MacOS/Codex",
+    "/Users/Jane Doe/.local/share/claude/versions/2.0.14 --resume",
+    "/Users/Jane Doe/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+    "/Users/Jane Doe/.npm-global/lib/node_modules/@openai/codex/vendor/aarch64-apple-darwin/codex/codex exec",
 ]
 
 
@@ -122,6 +130,9 @@ def test_real_harness_processes_are_recognized(home, user_home, line):
         "node /Users/u/src/remy-clone/server.js",
         "python3 -c import codex",
         "/usr/bin/vim /Applications/Claude.app/Contents/Info.plist",
+        "/usr/bin/vim /Users/Jane Doe/Applications/Remy.app/Contents/MacOS/notes.txt",
+        "/usr/bin/less /Users/Jane Doe/.local/share/claude/versions/README",
+        "/Users/Jane Doe/bin/tool /Users/Jane Doe/node_modules/@openai/codex/README.md",
     ],
 )
 def test_a_harness_word_outside_the_executable_is_not_a_harness(home, user_home, line):

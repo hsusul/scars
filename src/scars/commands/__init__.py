@@ -42,12 +42,18 @@ HARNESS_INSTALL_DIRS = (
 )
 """Install directories of Claude Code (npm, native installer, Homebrew cask) and Codex (npm and its
 per-platform packages, Homebrew cask). The native installer names its binary after the version."""
-HARNESS_APPS = ("Remy", "Claude", "Codex", "ChatGPT")
+HARNESS_APPS = ("Remy", "Claude", "Codex", "CodexCLI", "ChatGPT")
 """macOS app bundles that run agents: Remy, Claude Code in the Claude app, the Codex app and the
 ChatGPT app's bundled Codex CLI."""
-_APP_EXECUTABLE = re.compile(r"^(?:/[^/\s]+)*/(?:" + "|".join(HARNESS_APPS) + r")\.app/")
-"""A command line whose executable lies inside one of those bundles. The path before the bundle has no
-spaces, because `ps` joins arguments with spaces and a later argument must not count."""
+_HARNESS_SHAPES = (
+    *(rf"{app}\.app/Contents/(?:MacOS|Resources)/" for app in HARNESS_APPS),
+    *(re.escape(d.removeprefix("/")) for d in HARNESS_INSTALL_DIRS),
+)
+_EXECUTABLE_SHAPE = re.compile(r"^(?:/(?:[^/\s]|\s(?!/))+)*/(?:" + "|".join(_HARNESS_SHAPES) + ")")
+"""A command line whose executable lies inside a harness app bundle or install directory, matched on the
+whole line because `ps` prints the executable first and joins the arguments with spaces. A directory
+name may hold spaces (`/Users/Jane Doe`), but a space followed by `/` starts the next argument, and a
+harness path there (`vim /Applications/Claude.app/...`) must not count."""
 INTERPRETERS = re.compile(r"(?:node|nodejs|bun|deno|python[0-9.]*)")
 _VALUE_OPTIONS = frozenset({"-r", "--require", "--import", "--loader", "-W", "-X", "--config"})
 _NO_SCRIPT = frozenset({"-e", "--eval", "-p", "--print", "-c"})
@@ -201,7 +207,7 @@ def harness_in(command_line: str) -> bool:
     name or install directory, or for an interpreter (node, bun, deno, python) the script or module it
     runs. A harness name anywhere else, such as a file being edited, does not.
     """
-    if _APP_EXECUTABLE.match(command_line):
+    if _EXECUTABLE_SHAPE.match(command_line):
         return True
     words = command_line.split()
     if not words:
@@ -345,6 +351,10 @@ class CleanLines:
     The read commands (`ls`, `why`, `test`, `doctor`) print to this, so a value that a print site forgot
     to pass through `shown` still cannot put an escape sequence, a non-ASCII character or a secret on
     the terminal or into the agent that ran the command. It is the boundary; `shown` is the finer filter.
+
+    A partial line stays buffered across `flush`, because a secret split over two writes would pass the
+    scan in pieces. It is checked and printed only when its newline arrives or the command `close`s the
+    stream, which leaves `out` itself open.
     """
 
     def __init__(self, out: TextIO) -> None:
@@ -358,6 +368,9 @@ class CleanLines:
         return len(text)
 
     def flush(self) -> None:
+        self.out.flush()
+
+    def close(self) -> None:
         if self._partial:
             self.out.write(clean(self._partial))
             self._partial = ""

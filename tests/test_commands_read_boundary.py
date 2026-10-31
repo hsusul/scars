@@ -1,6 +1,8 @@
 """Every line `ls`, `why`, `test` and `doctor` print passes the sanitizer and the secret scan, and broken
 stored data is reported instead of crashing the command."""
 
+import pytest
+
 from cli_helpers import NOW, SIG, connect, make_ctx, run, seed
 from scars import store, telemetry
 from scars.commands import UserError, doctor
@@ -78,7 +80,74 @@ def test_clean_lines_cleans_a_line_split_across_writes_and_a_last_partial_line()
     stream.write("[2J line\n\nend \x07")
     assert out.getvalue() == "ok\n[hidden: sanitizer.ansi_escape]\n\n"
     stream.flush()
+    assert out.getvalue() == "ok\n[hidden: sanitizer.ansi_escape]\n\n"
+    stream.close()
     assert out.getvalue() == "ok\n[hidden: sanitizer.ansi_escape]\n\n[hidden: sanitizer.control_char]"
+
+
+def test_clean_lines_keeps_a_partial_line_buffered_across_a_flush():
+    import io
+
+    from scars.commands import CleanLines
+
+    out = io.StringIO()
+    stream = CleanLines(out)
+    stream.write("gh")
+    stream.flush()
+    assert out.getvalue() == ""
+    stream.write(TOKEN[2:] + "\n")
+    assert out.getvalue() == "[hidden: secret.github_token]\n"
+
+
+def test_a_read_command_prints_a_partial_line_only_once_it_is_whole(home, user_home, monkeypatch):
+    from scars.commands import inspect
+
+    def split_token(args, ctx):
+        ctx.stdout.write(TOKEN[:2])
+        ctx.stdout.flush()
+        ctx.stdout.write(TOKEN[2:])
+        ctx.stdout.flush()
+        return 0
+
+    monkeypatch.setattr(inspect, "cmd_ls", split_token)
+    assert run(make_ctx(user_home), "ls") == (0, "[hidden: secret.github_token]", "")
+
+
+@pytest.mark.parametrize(
+    ("argv", "module", "function"),
+    [
+        (("ls",), "inspect", "cmd_ls"),
+        (("why", "last"), "inspect", "cmd_why"),
+        (("test", "L-00000000"), "inspect", "cmd_test"),
+        (("doctor",), "doctor", "cmd_doctor"),
+    ],
+)
+def test_a_crash_in_a_read_command_prints_one_clean_line(
+    home, user_home, monkeypatch, argv, module, function
+):
+    from importlib import import_module
+
+    def crash(args, ctx):
+        ctx.print("partial output")
+        raise RuntimeError(f"stored text {TOKEN} {ESC}")
+
+    monkeypatch.setattr(import_module(f"scars.commands.{module}"), function, crash)
+    assert run(make_ctx(user_home), *argv) == (
+        1,
+        "partial output\n",
+        f"scars {argv[0]}: internal error (RuntimeError); run with SCARS_DEBUG=1 for details\n",
+    )
+    assert not (home / "logs" / "cli.log").exists()
+
+    log = home / "logs" / "cli.log"
+    assert run(make_ctx(user_home, env={"SCARS_DEBUG": "1"}), *argv) == (
+        1,
+        "partial output\n",
+        f"scars {argv[0]}: internal error (RuntimeError); traceback in {log}\n",
+    )
+    logged = log.read_text()
+    assert "Traceback (most recent call last):" in logged
+    assert f"RuntimeError: stored text {TOKEN} {ESC}" in logged
 
 
 def test_why_hides_event_type_and_actor(home, user_home):

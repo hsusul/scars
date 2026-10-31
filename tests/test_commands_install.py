@@ -302,8 +302,11 @@ def test_init_reads_and_writes_configs_as_utf8_whatever_the_locale(work):
     argv = [sys.executable, "-m", "scars", "init", "--yes", "--allow-dev-install"]
     result = subprocess.run(argv, env=env, capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert (result.returncode, result.stderr) == (0, "")
+    assert f"store: {scars_home}\n" in result.stdout
     merged = json.loads(codex.read_text(encoding="utf-8"))
     assert merged["hooks"]["Stop"][0] == other
+    shim = shlex.quote(str(scars_home / "bin" / "scars-hook"))
+    assert merged["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == f"{shim} codex PreToolUse"
     assert sorted(merged["hooks"]) == [
         "PostToolUse",
         "PreToolUse",
@@ -316,6 +319,70 @@ def test_init_reads_and_writes_configs_as_utf8_whatever_the_locale(work):
         assert plistlib.loads(plist.read_bytes())["EnvironmentVariables"] == {"SCARS_HOME": str(scars_home)}
 
 
+@pytest.mark.parametrize("variable", ["SCARS_HOME", "HOME"])
+def test_init_refuses_a_home_that_is_not_utf8_without_a_traceback(work, variable):
+    import subprocess
+    import sys
+
+    user = work / "user"
+    user.mkdir()
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CODEX_SANDBOX", "SCARS_OFF")}
+    env.update(HOME=str(user), SCARS_HOME=str(user / ".scars"))
+    env[variable] = str(user / "sch\udcfctz")  # the byte 0xfc, which no UTF-8 text contains
+    argv = [sys.executable, "-m", "scars", "init", "--yes", "--allow-dev-install"]
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=60)
+    assert (result.returncode, result.stdout, result.stderr) == (
+        1,
+        b"",
+        f"scars init: {variable} is not valid UTF-8\n".encode(),
+    )
+    assert sorted(p.name for p in user.iterdir()) == []
+
+
+def test_init_writes_utf8_configs_for_a_home_decoded_as_surrogate_escapes(machine, work, monkeypatch):
+    """Under an ASCII locale Python decodes the UTF-8 bytes of `HOME` into surrogate escapes."""
+    user = work / "j\u00fcrgen"
+    escaped = str(work) + "/j\udcc3\udcbcrgen"
+    assert os.fsencode(escaped) == os.fsencode(str(user))
+    env = dict(os.environ, HOME=escaped, SCARS_HOME=escaped + "/sch\udcc3\udcbctz")
+    monkeypatch.setattr(os, "environ", env)
+    ctx = make_ctx(type(user)(escaped), clock=time.time)
+    code, out, err = run(ctx, "init", "--yes")
+    assert (code, err) == (0, "")
+    scars_home = f"{user}/sch\u00fctz"
+    assert f"store: {scars_home}\n" in out
+    raw = (user / ".codex" / "hooks.json").read_bytes().decode("utf-8")
+    command = json.loads(raw)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    shim = shlex.quote(f"{scars_home}/bin/scars-hook")
+    assert command == f"{shim} codex PreToolUse"
+    plugin = json.loads((user / "sch\u00fctz" / "plugins" / "claude" / "hooks" / "hooks.json").read_bytes())
+    assert plugin["hooks"]["SessionStart"][0]["hooks"][0]["command"] == f"{shim} claude SessionStart"
+    job = plistlib.loads((user / "Library" / "LaunchAgents" / "dev.scars.miner.plist").read_bytes())
+    assert job["EnvironmentVariables"] == {"SCARS_HOME": scars_home}
+    assert job["StandardOutPath"] == f"{scars_home}/logs/miner.log"
+
+
+def test_init_output_cannot_crash_on_a_terminal_encoding_without_the_path(work):
+    import subprocess
+    import sys
+
+    user = work / "user"
+    user.mkdir()
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CODEX_SANDBOX", "SCARS_OFF")}
+    env.update(HOME=str(user), SCARS_HOME=str(user / "sch\u00fctz"), PYTHONIOENCODING="ascii")
+    argv = [sys.executable, "-m", "scars", "init", "--yes", "--allow-dev-install"]
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=60)
+    assert (result.returncode, result.stderr) == (0, b"")
+    assert f"store: {user}/sch\\xfctz\n".encode() in result.stdout
+
+
+def test_strict_json_keeps_numbers_that_survive_a_round_trip():
+    loaded = install.load_json_exactly(
+        '{"a": 0.1, "b": 3, "c": -2.5e-3, "d": 1e5, "e": 123456789012345678901234567890}'
+    )
+    assert loaded == {"a": 0.1, "b": 3, "c": -0.0025, "d": 100000.0, "e": 123456789012345678901234567890}
+
+
 @pytest.mark.parametrize(
     ("text", "detail"),
     [
@@ -324,8 +391,13 @@ def test_init_reads_and_writes_configs_as_utf8_whatever_the_locale(work):
         ('{"hooks": {}, "limit": 1e400}', "number 1e400 is not finite"),
         ('{"hooks": {}, "limit": NaN}', "number NaN is not finite"),
         ('{"hooks": {}, "limit": -Infinity}', "number -Infinity is not finite"),
+        ('{"hooks": {}, "limit": 1e-400}', "number 1e-400 would change in a round trip"),
+        (
+            '{"hooks": {}, "limit": 1.00000000000000000001}',
+            "number 1.00000000000000000001 would change in a round trip",
+        ),
     ],
-    ids=["duplicate", "nested-duplicate", "overflow", "nan", "infinity"],
+    ids=["duplicate", "nested-duplicate", "overflow", "nan", "infinity", "underflow", "precision"],
 )
 def test_init_refuses_json_that_would_not_survive_a_round_trip(machine, text, detail):
     user, scars_home = machine

@@ -3,15 +3,23 @@
 Each command parses its arguments here, then runs a handler in `scars.commands` with a `Context` that
 stands for the terminal. Exit codes: 0 on success, 1 on a user error (one line on stderr) or a failed
 `doctor` check, 2 for a command that is not built yet.
+
+`HOME`, `SCARS_HOME` and the arguments must be UTF-8; anything else is a user error before the command
+starts. A crash in a read command (`ls`, `why`, `test`, `doctor`) prints one line naming the exception
+type and exits 1: its traceback could quote stored text, so it goes to `<scars home>/logs/cli.log`, and
+only when `SCARS_DEBUG` is set. Output never fails on encoding: what the terminal cannot show is written
+as a backslash escape.
 """
 
 import argparse
+import os
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from importlib import import_module
 
-from scars import __version__, hook
+from scars import __version__, hook, paths
 
 Configure = Callable[[argparse.ArgumentParser], None]
 
@@ -139,8 +147,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _tolerant_output() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(AttributeError, ValueError, OSError):
+            stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+
+
+def _check_input(argv: list[str]) -> None:
+    paths.check_env()
+    for i, arg in enumerate(argv, 1):
+        paths.text(arg, f"argument {i}")
+
+
+def _log_crash() -> str | None:
+    """Append the current traceback to the CLI log; the log's path, or None when it cannot be written."""
+    import traceback
+
+    logs = os.path.join(paths.home_path(), "logs")
+    try:
+        os.makedirs(logs, mode=0o700, exist_ok=True)
+        log = os.path.join(logs, "cli.log")
+        with open(log, "a", encoding="utf-8", errors="backslashreplace") as f:
+            traceback.print_exc(file=f)
+    except OSError:
+        return None
+    return log
+
+
 def main(argv: list[str] | None = None, ctx: object = None) -> int:
     """Run one command. `ctx` replaces the terminal in tests; it must be a `scars.commands.Context`."""
+    if ctx is None:
+        _tolerant_output()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
@@ -159,10 +196,22 @@ def main(argv: list[str] | None = None, ctx: object = None) -> int:
     module, _, function = args.handler.partition(":")
     handler = getattr(import_module(f"scars.commands.{module}"), function)
     try:
+        _check_input(sys.argv[1:] if argv is None else argv)
         return handler(args, context)
-    except UserError as exc:
+    except (UserError, paths.NotUtf8) as exc:
         print(f"scars {args.command}: {exc}", file=context.stderr)
         return 1
+    except Exception as exc:
+        if not args.guarded:
+            raise
+        where = "run with SCARS_DEBUG=1 for details"
+        if context.env.get("SCARS_DEBUG") and (log := _log_crash()) is not None:
+            where = f"traceback in {log}"
+        print(f"scars {args.command}: internal error ({type(exc).__name__}); {where}", file=context.stderr)
+        return 1
     finally:
-        context.stdout.flush()
-        context.stderr.flush()
+        for stream in (context.stdout, context.stderr):
+            if args.guarded:
+                stream.close()  # a CleanLines: prints its last partial line, leaves the terminal open
+            else:
+                stream.flush()
