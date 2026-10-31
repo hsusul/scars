@@ -19,7 +19,7 @@ from datetime import datetime
 from scars import hook, render, store, telemetry
 from scars.commands import Context, UserError, get_lesson, lessons_db, shown, shown_json, telemetry_db
 from scars.match import InvalidTrigger, Precision, precision
-from scars.mine import existing_dir
+from scars.mine import known_dir
 from scars.mine.outcomes import recorded
 from scars.model import (
     ACTIVE_STATUSES,
@@ -206,7 +206,7 @@ def _root_of() -> object:
 
     def root(cwd: str) -> str | None:
         if cwd not in cache:
-            found = existing_dir(cwd)
+            found = known_dir(cwd)
             cache[cwd] = hook.repo_root(found) if found else None
         return cache[cwd]
 

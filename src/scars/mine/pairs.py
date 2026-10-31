@@ -7,8 +7,8 @@ the fix was a source change, which is ordinary debugging and not a lesson.
 
 The same place means the same registered repo, or the same working directory when neither directory is
 in a registered repo. A lesson takes its scope and trust from the passing call's repo, so a failure in an
-upstream clone fixed by a call in an own repo would otherwise come out trusted as own code. A failure
-whose working directory is unknown (`cwd` None) never pairs.
+upstream clone fixed by a call in an own repo would otherwise come out trusted as own code. A call whose
+place is unknown (an empty, relative or deleted working directory) never pairs.
 
 A failure still undecided when the batch ends stays open: its count of calls seen so far is carried to
 the next batch. It is dropped once it has seen 10 calls, or once its session has been idle for 24 hours
@@ -44,12 +44,13 @@ class OpenFailure:
     cwd: str | None
 
 
-Place = Callable[[str], Hashable]
-"""Maps a working directory to where it is: its registered repo, or the directory itself."""
+Place = Callable[[str], Hashable | None]
+"""Maps a working directory to where it is (its registered repo, or the directory itself), or None when
+that is unknown."""
 
 
-def same_directory(cwd: str) -> Hashable:
-    return cwd
+def same_directory(cwd: str) -> Hashable | None:
+    return cwd or None
 
 
 @dataclass(frozen=True)
@@ -99,7 +100,8 @@ def _fixes(failure: OpenFailure, call: Call, place: Place) -> bool:
         and call.tool == failure.tool
         and call.program == failure.program
         and failure.cwd is not None
-        and place(failure.cwd) == place(call.cwd)
+        and (where := place(failure.cwd)) is not None
+        and where == place(call.cwd)
     )
 
 

@@ -20,8 +20,10 @@ signature or model id that trips a secret rule is stored as NULL, a working dire
 string (the column is not nullable), a path that does is left out, and a pending failure whose input or
 signature does is not kept (it could only pair into a candidate the scan rejects).
 
-A working directory that no longer exists (a deleted worktree) resolves through its nearest existing
-parent directory.
+A working directory is known only when it is absolute and still exists. An unknown one (empty, relative,
+or a deleted worktree) never pairs and names no repo; it is never resolved through a parent directory,
+which could belong to another repo. Directories outside registered repos compare by real path, so a
+symlinked path and its target are one place.
 
 Event times are the fixing call's time, so expiry counts from the real sighting. Mining the same
 transcripts again changes nothing: offsets, processed ids and observations each guard the work.
@@ -205,17 +207,12 @@ def _pending_row(f: pairs.OpenFailure) -> store.PendingFailure | None:
     )
 
 
-def existing_dir(cwd: str) -> str | None:
-    """`cwd`, or its nearest existing parent when it was deleted; None for a relative or empty path."""
+def known_dir(cwd: str) -> str | None:
+    """`cwd` normalized when it is an absolute path to a directory that exists, else None."""
     if not cwd.startswith("/"):
         return None
     path = os.path.normpath(cwd)
-    while not os.path.isdir(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            return None
-        path = parent
-    return path
+    return path if os.path.isdir(path) else None
 
 
 class _Repos:
@@ -235,19 +232,22 @@ class _Repos:
 
     def resolve(self, cwd: str) -> tuple[RepoId | None, str | None]:
         if cwd not in self._cache:
-            found = existing_dir(cwd)
+            found = known_dir(cwd)
             common = self._common_dir_of(found) if found else None
             repo = store.repo_for_common_dir(self._db, (common, os.path.realpath(common))) if common else None
             self._cache[cwd] = (repo, store.repo_owner_class(self._db, repo) if repo else None)
         return self._cache[cwd]
 
-    def place(self, cwd: str) -> tuple[str, str]:
+    def place(self, cwd: str) -> tuple[str, str] | None:
+        found = known_dir(cwd)
+        if found is None:
+            return None
         repo, _ = self.resolve(cwd)
-        return ("repo", repo) if repo else ("dir", os.path.normpath(cwd) if cwd else "")
+        return ("repo", repo) if repo else ("dir", os.path.realpath(found))
 
     def root(self, cwd: str) -> str | None:
         if cwd not in self._roots:
-            found = existing_dir(cwd)
+            found = known_dir(cwd)
             self._roots[cwd] = self._repo_root_of(found) if found else None
         return self._roots[cwd]
 

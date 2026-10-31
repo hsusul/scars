@@ -10,7 +10,7 @@ import pytest
 
 from scars import mine, store
 from scars.mine import Source, Summary
-from scars.model import Harness, RepoId, Stage, Status, Trigger, TriggerKind, TrustClass
+from scars.model import Harness, RepoId, RepoScope, Stage, Status, Trigger, TriggerKind, TrustClass
 
 FIXTURES = Path(__file__).parent / "fixtures" / "transcripts"
 T0 = 1_800_000_000.0
@@ -112,9 +112,9 @@ def env(tmp_root: Path) -> dict[str, object]:
 
 
 def common_dir_of(cwd: str) -> str | None:
-    if cwd.endswith("/app"):
+    if cwd.endswith("/app") or "/app/" in cwd:
         return "/git/app"
-    if cwd.endswith("/lib"):
+    if cwd.endswith("/lib") or "/lib/" in cwd:
         return "/git/lib"
     return None
 
@@ -1043,11 +1043,104 @@ def test_a_candidate_over_the_repair_budget_is_dropped(env):
     assert summary.skipped == {"over_repair_budget": 1}
 
 
-def test_a_deleted_worktree_cwd_resolves_through_its_nearest_parent(env):
+def test_a_cwd_that_no_longer_exists_is_unknown_and_never_pairs(env):
     write(env, "s1", basic_pair(env["repo"] + "/gone/deeper").text())
     summary = mine_now(env)
-    assert summary.candidates_created == 1
-    assert the_lesson(env).scope.kind == "repo"
+    assert (summary.failures, summary.pairs, summary.candidates_created) == (1, 0, 0)
+
+
+def test_an_empty_cwd_is_unknown_and_never_pairs(env):
+    write(env, "s1", basic_pair("").text())
+    summary = mine_now(env)
+    assert (summary.failures, summary.pairs, summary.candidates_created) == (1, 0, 0)
+
+
+def test_unregistered_directories_compare_by_realpath(env):
+    link = Path(env["loose"]).parent / "loose-link"
+    link.symlink_to(env["loose"])
+    t = Claude(env["loose"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    t.cwd = str(link)
+    t.bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env).pairs == 1
+
+
+def test_a_claude_call_runs_in_its_invocation_cwd_not_the_result_records(env):
+    t = Claude(env["upstream"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT).bash("t2", "pytest tests")
+    for record in t.records:
+        if record["type"] == "user":
+            record["cwd"] = env["repo"]
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert summary.pairs == 1
+    assert lessons_db(env).execute("select cwd from mined_calls order by tool_use_id").fetchall() == [
+        (env["upstream"],),
+        (env["upstream"],),
+    ]
+    assert the_lesson(env).trust_class is TrustClass.THIRD_PARTY_REPO
+
+
+def test_a_codex_file_url_cwd_is_decoded_to_a_path(env, tmp_path):
+    from urllib.parse import quote
+
+    spaced = Path(env["loose"]) / "my app"
+    spaced.mkdir()
+    url = "file://" + quote(str(spaced))
+    root = tmp_path / "codex"
+    root.mkdir()
+    (root / "rollout-2027-01-15T00-00-00-0000000a-0000-4000-8000-000000000009.jsonl").write_text(
+        codex_record(0, "session_meta", {"id": "s", "cwd": url})
+        + codex_record(1, "turn_context", {"model": "gpt-test", "cwd": url})
+        + command_item(2, "e1", "pytest --frobnicate tests", 2, FAIL_TEXT)
+        + command_item(3, "e2", "pytest tests", 0)
+    )
+    summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
+    assert lessons_db(env).execute("select cwd from mined_calls order by tool_use_id").fetchall() == [
+        (str(spaced),),
+        (str(spaced),),
+    ]
+
+
+def test_cd_into_a_literal_dir_then_one_command_is_that_command_run_there(env):
+    work = str(Path(env["repo"]).parent)
+    t = (
+        Claude(work)
+        .bash("t1", "cd app && pytest  --frobnicate tests", FAIL_TEXT)
+        .bash("t2", f"cd {env['repo']} && pytest tests")
+    )
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.skipped) == (1, 1, {})
+    lesson = the_lesson(env)
+    assert (lesson.scope, lesson.text.avoid, lesson.text.instead) == (
+        RepoScope(RepoId("own-app")),
+        "pytest --frobnicate tests",
+        "run `pytest tests` instead",
+    )
+    assert lessons_db(env).execute(
+        "select command, cwd from mined_calls order by tool_use_id"
+    ).fetchall() == [
+        ("pytest --frobnicate tests", env["repo"]),
+        ("pytest tests", env["repo"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "failed",
+    [
+        "cd app && pytest --frobnicate tests && echo done",
+        "cd app; pytest --frobnicate tests",
+        "cd app && cd . && pytest --frobnicate tests",
+        "cd app && pytest --frobnicate tests > log",
+        "cd $APP && pytest --frobnicate tests",
+    ],
+)
+def test_any_other_compound_command_stays_unlessonable(env, failed):
+    work = str(Path(env["repo"]).parent)
+    t = Claude(work).bash("t1", failed, FAIL_TEXT).bash("t2", "cd app && pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env).candidates_created == 0
 
 
 def test_a_failure_upstream_does_not_pair_with_a_pass_in_own_repo(env):
@@ -1087,6 +1180,7 @@ def test_unregistered_failure_pairs_only_in_the_same_directory(env):
 
 
 def test_a_failure_and_its_fix_in_two_directories_of_one_repo_pair(env):
+    (Path(env["repo"]) / "sub").mkdir()
     t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
     t.cwd = env["repo"] + "/sub"
     t.bash("t2", "pytest tests")

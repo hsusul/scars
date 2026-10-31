@@ -38,6 +38,7 @@ def write_transcript(user, repo, name, mtime=None):
 
 def test_mine_prints_the_summary(home, work):
     user = work / "user"
+    (work / "loose").mkdir(exist_ok=True)
     write_transcript(user, work / "loose", "s1")
     ctx = make_ctx(user, clock=time.time)
     assert run(ctx, "mine") == (
