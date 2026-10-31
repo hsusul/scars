@@ -1041,3 +1041,48 @@ def test_a_deleted_worktree_cwd_resolves_through_its_nearest_parent(env):
     summary = mine_now(env)
     assert (summary.candidates_created, summary.provisionalized) == (1, 1)
     assert the_lesson(env).scope.kind == "repo"
+
+
+def test_a_failure_upstream_does_not_pair_with_a_pass_in_own_repo(env):
+    t = Claude(env["upstream"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    t.cwd = env["repo"]
+    t.bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env) == Summary(sessions_read=1, calls=2, failures=1)
+    db = lessons_db(env)
+    assert db.execute("select count(*) from lessons").fetchone()[0] == 0
+    assert db.execute("select tool_use_id, calls_since from pending_failures").fetchall() == [("t1", 1)]
+
+
+def test_a_failure_left_open_upstream_does_not_pair_in_own_repo_next_batch(env):
+    t = Claude(env["upstream"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    write(env, "s1", t.text())
+    assert mine_now(env).failures == 1
+    t.cwd = env["repo"]
+    t.bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    assert mine_now(env) == Summary(sessions_read=1, calls=1)
+    assert lessons_db(env).execute("select count(*) from lessons").fetchone()[0] == 0
+
+
+def test_unregistered_failure_pairs_only_in_the_same_directory(env):
+    t = Claude(env["loose"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    t.cwd = env["loose"] + "/other"
+    t.bash("t2", "pytest tests -q")
+    t.cwd = env["loose"]
+    t.bash("t3", "pytest tests")
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created) == (1, 1)
+    db = lessons_db(env)
+    assert db.execute("select passing_input from observations").fetchall() == [("pytest tests",)]
+    assert db.execute("select scope_kind from lessons").fetchall() == [("session",)]
+
+
+def test_a_failure_and_its_fix_in_two_directories_of_one_repo_pair(env):
+    t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT)
+    t.cwd = env["repo"] + "/sub"
+    t.bash("t2", "pytest tests")
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.provisionalized) == (1, 1)

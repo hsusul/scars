@@ -172,7 +172,7 @@ def _recorded(row: store.MinedCall) -> RecordedCall:
     return outcomes.recorded(row)
 
 
-def _open_from_store(p: store.PendingFailure) -> pairs.OpenFailure:
+def _open_from_store(p: store.PendingFailure, cwd: str | None) -> pairs.OpenFailure:
     return pairs.OpenFailure(
         tool_use_id=p.tool_use_id,
         harness=p.harness,
@@ -183,13 +183,15 @@ def _open_from_store(p: store.PendingFailure) -> pairs.OpenFailure:
         signature=p.error_signature,  # type: ignore[arg-type]
         calls_since=p.calls_since,
         last_call_at=p.last_call_at,
+        cwd=cwd,
     )
 
 
 def _pending_row(f: pairs.OpenFailure) -> store.PendingFailure | None:
     """The row to keep for an open failure, or None when its input or signature holds a secret. Such a
     failure could only pair into a candidate the secret scan rejects, so dropping it loses no lesson."""
-    if _clean(f.input) is None or _clean(f.signature) is None or _clean(f.program) is None:
+    texts = (f.input, f.signature, f.program, f.cwd)
+    if any(_clean(t) is None for t in texts):
         return None
     return store.PendingFailure(
         f.tool_use_id,
@@ -239,6 +241,10 @@ class _Repos:
             repo = store.repo_for_common_dir(self._db, (common, os.path.realpath(common))) if common else None
             self._cache[cwd] = (repo, store.repo_owner_class(self._db, repo) if repo else None)
         return self._cache[cwd]
+
+    def place(self, cwd: str) -> tuple[str, str]:
+        repo, _ = self.resolve(cwd)
+        return ("repo", repo) if repo else ("dir", os.path.normpath(cwd) if cwd else "")
 
     def root(self, cwd: str) -> str | None:
         if cwd not in self._roots:
@@ -399,22 +405,26 @@ def _run(
                 seen.add(call.tool_use_id)
                 streams.setdefault(key, []).append(call)
     new_calls = [c for stream in streams.values() for c in stream]
+    since = now - policy.PRECISION_WINDOW_DAYS * DAY
+    stored = store.mined_calls_since(db, since)
+    # A pending failure's own call is a stored mined call; its row holds the working directory.
+    cwds = {r.tool_use_id: r.cwd for r in stored}
     waiting: dict[tuple[str, str], list[pairs.OpenFailure]] = {}
     for p in store.pending_failures(db):
-        waiting.setdefault((p.harness, p.session_id), []).append(_open_from_store(p))
+        failure = _open_from_store(p, cwds.get(p.tool_use_id))
+        waiting.setdefault((p.harness, p.session_id), []).append(failure)
     found: list[pairs.Pair] = []
     still_open: list[pairs.OpenFailure] = []
     for key in sorted(set(streams) | set(waiting)):
         if key in skipped_sessions:
             still_open.extend(waiting.get(key, ()))
             continue
-        result = pairs.pair_session(waiting.get(key, ()), streams.get(key, ()), now)
+        result = pairs.pair_session(waiting.get(key, ()), streams.get(key, ()), now, repos.place)
         found.extend(result.pairs)
         still_open.extend(result.still_open)
         counts["failures"] += result.failures
-    since = now - policy.PRECISION_WINDOW_DAYS * DAY
     rows = [_mined_row(c) for c in new_calls]
-    recent = [_recorded(r) for r in store.mined_calls_since(db, since)]
+    recent = [_recorded(r) for r in stored]
     recent += [_recorded(r) for r in rows if r.at >= since]
     index = CallIndex(recent, repos.root)
     for pair in sorted(found, key=lambda p: (p.passing.at, p.failed.tool_use_id)):
