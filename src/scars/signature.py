@@ -51,3 +51,16 @@ def signature(text: str) -> ErrorSignature | None:
         result = normalized.strip()[:_MAX]
         return None if _UNLESSONABLE.search(result) else ErrorSignature(result)
     return None
+
+
+TOOL_PREFIX = "[tool "
+
+
+def tool_signature(tool: str, sig: ErrorSignature) -> ErrorSignature:
+    """`sig` qualified by the non-shell tool that failed, as `[tool <name>] <sig>`.
+
+    A structured tool lesson's error trigger is this text, so it fires only when the same tool fails
+    with the same signature; the hook and the outcome pass build it the same way for a failed non-shell
+    call. A shell failure is never qualified.
+    """
+    return ErrorSignature(f"{TOOL_PREFIX}{tool}] {sig}")

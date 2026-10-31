@@ -200,6 +200,8 @@ class HookEvent:
     error_text: str | None
     prompt: str | None
     model_id: str | None
+    tool_name: str | None = None
+    """The harness tool name on tool events, for an error trigger qualified by its tool."""
 
 
 PRIVILEGED_COMMANDS = frozenset(

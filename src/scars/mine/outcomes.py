@@ -8,7 +8,8 @@ whatever their stage (a mined lesson's command pre-trigger lives at the gate sta
 against the worktree root of each call's working directory. Then the first rule that holds decides:
 
 1. `ignored_then_failed`: the lesson's error signature fails a call within the 5 calls after the
-   reference call, or, for a plan hit, the reference call itself.
+   reference call, or, for a plan hit, the reference call itself. A structured tool lesson's signature is
+   qualified by its tool, so only a failed call of that tool counts.
 2. `fired_unneeded`: a plan hit whose reference call succeeded.
 3. `heeded`: a repair hit whose next call of the same tool kind succeeded or no longer matches the
    lesson's pre-trigger. A lesson without a pre-trigger is heeded only by a success.
@@ -29,7 +30,17 @@ from dataclasses import dataclass, replace
 
 from scars import store
 from scars.match import InvalidTrigger, RecordedCall, call_matches
-from scars.model import DelayedOutcome, Lesson, LessonId, Stage, ToolKind, Trigger, TriggerKind
+from scars.model import (
+    DelayedOutcome,
+    ErrorSignature,
+    Lesson,
+    LessonId,
+    Stage,
+    ToolKind,
+    Trigger,
+    TriggerKind,
+)
+from scars.signature import tool_signature
 
 WINDOW = 5
 IDLE_SECONDS = 24 * 3600
@@ -106,7 +117,11 @@ def _matches_pre(facts: LessonFacts, call: store.MinedCall, root_of: Roots) -> b
 
 
 def _failed_with(facts: LessonFacts, call: store.MinedCall) -> bool:
-    return facts.signature is not None and call.status == "failed" and call.error_signature == facts.signature
+    if facts.signature is None or call.status != "failed" or call.error_signature is None:
+        return False
+    sig = ErrorSignature(call.error_signature)
+    qualified = tool_signature(call.tool, sig) if call.tool_kind == ToolKind.OTHER else None
+    return facts.signature in (sig, qualified)
 
 
 def decide(

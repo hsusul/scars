@@ -592,11 +592,13 @@ def _decide_with(
         fresh = replace(fresh, repo_id=repo_id)
     decision = Decision(cwd_repo=fresh, outcome=HitOutcome.NO_MATCH)
     query = QUERIES[event.event]
-    error_sig = None
+    error_sig = tool_sig = None
     if event.event is HookEventKind.TOOL_FAILED and event.error_text:
-        from scars.signature import signature
+        from scars.signature import signature, tool_signature
 
         error_sig = signature(event.error_text)
+        if error_sig is not None and event.tool_kind is ToolKind.OTHER and event.tool_name:
+            tool_sig = tool_signature(event.tool_name, error_sig)
     if event.event is HookEventKind.TOOL_FAILED and error_sig is None:
         lessons = []
     else:
@@ -607,6 +609,7 @@ def _decide_with(
             pinned_only=query.pinned_only,
             trigger_kinds=query.trigger_kinds,
             error_signature=error_sig,
+            tool_error_signature=tool_sig,
         )
     notice = None
     if event.event is HookEventKind.SESSION_START:
@@ -623,7 +626,12 @@ def _decide_with(
 
     from scars import match, render
 
-    context = match.MatchContext(repo_root=repo_root(event.cwd), repo_id=repo_id, error_signature=error_sig)
+    context = match.MatchContext(
+        repo_root=repo_root(event.cwd),
+        repo_id=repo_id,
+        error_signature=error_sig,
+        tool_error_signature=tool_sig,
+    )
     selection = match.select(
         lessons,
         event,

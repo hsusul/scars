@@ -377,11 +377,14 @@ class MatchContext:
 
     `repo_root` is the `git rev-parse --show-toplevel` path, already symlink-resolved by the caller.
     `error_signature` is `signature.signature(event.error_text)`, computed once by the caller.
+    `tool_error_signature` is that signature qualified by the tool (`signature.tool_signature`), set only
+    for a failed non-shell tool call; an error trigger fires on either.
     """
 
     repo_root: str | None = None
     repo_id: RepoId | None = None
     error_signature: ErrorSignature | None = None
+    tool_error_signature: ErrorSignature | None = None
 
 
 @functools.lru_cache(maxsize=256)
@@ -486,7 +489,7 @@ def matches(trigger: Trigger, event: HookEvent, context: MatchContext | None = N
         case PathPattern() as pattern:
             return _any_path(pattern, event_paths(event), event.cwd, ctx.repo_root)
         case ErrorPattern(signature):
-            return ctx.error_signature is not None and ctx.error_signature == signature
+            return signature in {ctx.error_signature, ctx.tool_error_signature} - {None}
         case PromptPattern(keywords):
             return event.prompt is not None and keywords <= set(_WORD.findall(event.prompt.lower()))
 
