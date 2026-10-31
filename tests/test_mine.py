@@ -13,7 +13,7 @@ from scars.mine import Source, Summary
 from scars.model import Harness, RepoId, RepoScope, Stage, Status, Trigger, TriggerKind, TrustClass
 
 FIXTURES = Path(__file__).parent / "fixtures" / "transcripts"
-T0 = 1_800_000_000.0
+START = 1_800_000_000.0
 DAY = 86400.0
 FAIL_TEXT = "pytest: error: unrecognized arguments: --frobnicate"
 SIG = "pytest: error: unrecognized arguments: --frobnicate"
@@ -26,7 +26,7 @@ def iso(t: float) -> str:
 class Claude:
     """Builds a synthetic Claude Code transcript, one tool call at a time."""
 
-    def __init__(self, cwd: str, start: float = T0) -> None:
+    def __init__(self, cwd: str, start: float = START) -> None:
         self.cwd = cwd
         self.at = start
         self.records: list[dict[str, object]] = []
@@ -119,7 +119,9 @@ def common_dir_of(cwd: str) -> str | None:
     return None
 
 
-def mine_now(env: dict[str, object], now: float = T0 + DAY, sources: list[Source] | None = None) -> Summary:
+def mine_now(
+    env: dict[str, object], now: float = START + DAY, sources: list[Source] | None = None
+) -> Summary:
     sources = sources or [Source(Harness.CLAUDE, env["projects"], "*/*.jsonl")]  # type: ignore[arg-type]
     return mine.run(env["home"], sources, now, common_dir_of=common_dir_of)  # type: ignore[arg-type]
 
@@ -134,7 +136,7 @@ def lessons_db(env: dict[str, object]) -> sqlite3.Connection:
     return store.connect(env["home"] / "lessons.db")  # type: ignore[operator]
 
 
-def basic_pair(cwd: str, start: float = T0, prefix: str = "t") -> Claude:
+def basic_pair(cwd: str, start: float = START, prefix: str = "t") -> Claude:
     return (
         Claude(cwd, start)
         .bash(f"{prefix}1", "pytest --frobnicate tests", FAIL_TEXT)
@@ -168,7 +170,7 @@ def test_pair_in_own_repo_is_an_own_code_candidate_with_both_triggers(env):
     assert db.execute(
         "select revision, matched_failing, matched_passing, window_days from precision_runs"
     ).fetchall() == [(1, 1, 0, 30)]
-    assert db.execute("select expires_at from lessons").fetchone()[0] == T0 + 31 + 14 * DAY
+    assert db.execute("select expires_at from lessons").fetchone()[0] == START + 31 + 14 * DAY
     assert store.verify(db) == []
 
 
@@ -319,12 +321,12 @@ def test_pending_failure_completes_in_the_next_batch(env):
 
 def test_pending_failure_is_dropped_after_a_day_idle(env):
     write(env, "s1", Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", FAIL_TEXT).text())
-    mine_now(env, now=T0 + 3600)
+    mine_now(env, now=START + 3600)
     db = lessons_db(env)
     assert db.execute("select count(*) from pending_failures").fetchone()[0] == 1
-    mine_now(env, now=T0 + 11 + DAY - 1)
+    mine_now(env, now=START + 11 + DAY - 1)
     assert db.execute("select count(*) from pending_failures").fetchone()[0] == 1
-    mine_now(env, now=T0 + 11 + DAY)
+    mine_now(env, now=START + 11 + DAY)
     assert db.execute("select count(*) from pending_failures").fetchone()[0] == 0
 
 
@@ -386,7 +388,7 @@ def test_a_secret_in_the_failed_command_drops_the_candidate(env):
 
 def test_lessons_expire_fourteen_days_after_the_last_sighting(env):
     write(env, "s1", basic_pair(env["repo"]).text())
-    last_seen = T0 + 31
+    last_seen = START + 31
     assert mine_now(env, now=last_seen + 14 * DAY - 1).expired == 0
     summary = mine_now(env, now=last_seen + 14 * DAY)
     assert summary.expired == 1
@@ -397,12 +399,12 @@ def test_lessons_expire_fourteen_days_after_the_last_sighting(env):
 
 def test_second_sighting_observes_the_same_lesson_and_resets_expiry(env):
     write(env, "s1", basic_pair(env["repo"]).text())
-    write(env, "s2", basic_pair(env["repo"], start=T0 + 5 * DAY, prefix="u").text())
-    summary = mine_now(env, now=T0 + 6 * DAY)
+    write(env, "s2", basic_pair(env["repo"], start=START + 5 * DAY, prefix="u").text())
+    summary = mine_now(env, now=START + 6 * DAY)
     assert (summary.pairs, summary.candidates_created, summary.observations) == (2, 1, 2)
     db = lessons_db(env)
     assert db.execute("select status, sessions_seen, last_seen_at, fix_programs from lessons").fetchall() == [
-        ("candidate", 2, T0 + 5 * DAY + 31, '["pytest"]')
+        ("candidate", 2, START + 5 * DAY + 31, '["pytest"]')
     ]
     assert store.verify(db) == []
 
@@ -420,12 +422,12 @@ def test_a_mined_lesson_that_no_longer_renders_is_retired_and_mined_afresh(env):
         triggers=(Trigger(TriggerKind.ERROR, SIG, Stage.REPAIR),),
         fingerprint=fingerprint(RepoScope(RepoId("own-app")), SIG),
         actor="miner",
-        at=T0,
+        at=START,
     )
     store.add_observation(
         db,
         store.Observation(
-            legacy, "claude", "s0", "old1", "pytest --frobnicate tests", SIG, "pytest tests", T0
+            legacy, "claude", "s0", "old1", "pytest --frobnicate tests", SIG, "pytest tests", START
         ),
     )
     db.commit()
@@ -465,7 +467,7 @@ def test_seen_counts_distinct_sessions_not_observations(env):
     assert (summary.pairs, summary.candidates_created, summary.observations) == (2, 1, 2)
     db = lessons_db(env)
     assert db.execute("select sessions_seen from lessons").fetchall() == [(1,)]
-    write(env, "s2", basic_pair(env["repo"], start=T0 + 100, prefix="u").text())
+    write(env, "s2", basic_pair(env["repo"], start=START + 100, prefix="u").text())
     mine_now(env)
     assert db.execute("select sessions_seen from lessons").fetchall() == [(2,)]
     assert store.verify(db) == []
@@ -517,7 +519,7 @@ def test_running_twice_changes_nothing(env):
 
 def codex_lines(cwd: str) -> list[dict[str, object]]:
     def at(n: int) -> str:
-        return iso(T0 + n)
+        return iso(START + n)
 
     def item(n: int, item_id: str, command: list[str], code: int | None, output: str) -> dict[str, object]:
         return {
@@ -615,7 +617,7 @@ def test_codex_reader_trusts_only_visible_exit_codes():
 
     def item(n, code):
         return {
-            "timestamp": iso(T0 + n),
+            "timestamp": iso(START + n),
             "type": "event_msg",
             "payload": {
                 "type": "item_completed",
@@ -633,7 +635,7 @@ def test_codex_reader_trusts_only_visible_exit_codes():
     def output(n, text):
         return [
             {
-                "timestamp": iso(T0 + n),
+                "timestamp": iso(START + n),
                 "type": "response_item",
                 "payload": {
                     "type": "function_call",
@@ -643,7 +645,7 @@ def test_codex_reader_trusts_only_visible_exit_codes():
                 },
             },
             {
-                "timestamp": iso(T0 + n),
+                "timestamp": iso(START + n),
                 "type": "response_item",
                 "payload": {"type": "function_call_output", "call_id": f"f{n}", "output": text},
             },
@@ -680,21 +682,21 @@ def test_outcome_pass_writes_outcomes_and_backfills_models(env):
     tdb.execute(
         "insert into hits (seq, at, harness, session_id, tool_use_id, event, stage, lesson_id, outcome) "
         "values (1, ?, 'claude', 's1', 't1', 'tool_failed', 'repair', 'L-x', 'shown')",
-        (T0 + 11,),
+        (START + 11,),
     )
     tdb.execute(
         "insert into hits (seq, at, harness, session_id, event, outcome) "
         "values (2, ?, 'claude', 's1', 'prompt', 'no_match')",
-        (T0 + 5,),
+        (START + 5,),
     )
-    summary = mine_now(env, now=T0 + 2 * DAY)
+    summary = mine_now(env, now=START + 2 * DAY)
     assert (summary.outcomes_written, summary.models_backfilled) == (1, 2)
     assert tdb.execute("select hit_seq, outcome from outcomes").fetchall() == [(1, "heeded")]
     assert tdb.execute("select model_id from hits order by seq").fetchall() == [
         ("claude-test-1",),
         ("claude-test-1",),
     ]
-    assert mine_now(env, now=T0 + 2 * DAY) == Summary()
+    assert mine_now(env, now=START + 2 * DAY) == Summary()
 
 
 def test_missing_telemetry_is_skipped(env):
@@ -752,7 +754,7 @@ def test_mined_lesson_is_selected_at_repair_and_shown_by_the_hook(env, monkeypat
     monkeypatch.setattr(hook, "git_common_dir", lambda cwd: "/git/app")
     monkeypatch.setattr(hook, "repo_root", lambda cwd: env["repo"])
     own_session = failure_event(env["repo"], session="s1")
-    unreviewed = hook.decide(own_session, "PostToolUseFailure", telemetry.EMPTY, now=T0 + 2 * DAY)
+    unreviewed = hook.decide(own_session, "PostToolUseFailure", telemetry.EMPTY, now=START + 2 * DAY)
     assert (unreviewed.outcome, unreviewed.shown) == (HitOutcome.NO_MATCH, [])
     db = lessons_db(env)
     (candidate,) = store.inbox_candidates(db)
@@ -763,7 +765,7 @@ def test_mined_lesson_is_selected_at_repair_and_shown_by_the_hook(env, monkeypat
         expected_revision=candidate.revision,
         actor="human",
         payload={},
-        at=T0 + DAY,
+        at=START + DAY,
     )
     lesson = the_lesson(env)
     event = failure_event(env["repo"])
@@ -774,7 +776,7 @@ def test_mined_lesson_is_selected_at_repair_and_shown_by_the_hook(env, monkeypat
     pre_tool = HookEvent(**{**event.__dict__, "event": HookEventKind.PRE_TOOL, "error_text": None})
     assert match.matches(GATE, pre_tool) is True
     assert match.select([lesson], pre_tool, context).selected == ()
-    decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=T0 + 2 * DAY)
+    decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=START + 2 * DAY)
     assert decision.outcome is HitOutcome.SHOWN
     assert [s.lesson_id for s in decision.shown] == [lesson.id]
     text = json.dumps(decision.output)
@@ -865,7 +867,7 @@ def test_a_crash_while_writing_a_new_lesson_leaves_nothing_behind(env, monkeypat
 def test_a_crash_between_observed_and_the_observation_does_not_double_count(env, monkeypatch):
     write(env, "s1", basic_pair(env["repo"]).text())
     mine_now(env)
-    write(env, "s2", basic_pair(env["repo"], start=T0 + 100, prefix="u").text())
+    write(env, "s2", basic_pair(env["repo"], start=START + 100, prefix="u").text())
     boom_once(monkeypatch, "add_observation")
     with pytest.raises(RuntimeError):
         mine_now(env)
@@ -880,7 +882,7 @@ def test_a_crash_between_observed_and_the_observation_does_not_double_count(env,
 
 
 def codex_record(n: int, kind: str, payload: dict[str, object]) -> str:
-    return json.dumps({"timestamp": iso(T0 + n), "type": kind, "payload": payload}) + "\n"
+    return json.dumps({"timestamp": iso(START + n), "type": kind, "payload": payload}) + "\n"
 
 
 def command_item(n: int, item_id: str, command: str, code: int, output: str = "") -> str:
@@ -1018,12 +1020,12 @@ def test_a_session_with_a_recent_hit_has_not_ended(env):
     write(env, "s1", Claude(env["repo"]).read("t1").text())
     tdb = telemetry_with(
         env,
-        (1, T0 + 20, "s1", "plan", "L-x", "shown", "prompt:plan:deploy"),
-        (2, T0 + 20 * 3600, "s1", None, None, "no_match", None),
+        (1, START + 20, "s1", "plan", "L-x", "shown", "prompt:plan:deploy"),
+        (2, START + 20 * 3600, "s1", None, None, "no_match", None),
     )
-    assert mine_now(env, now=T0 + 25 * 3600).outcomes_written == 0
+    assert mine_now(env, now=START + 25 * 3600).outcomes_written == 0
     assert tdb.execute("select count(*) from outcomes").fetchone()[0] == 0
-    assert mine_now(env, now=T0 + 44 * 3600 + 1).outcomes_written == 1
+    assert mine_now(env, now=START + 44 * 3600 + 1).outcomes_written == 1
     assert tdb.execute("select hit_seq, outcome from outcomes").fetchall() == [(1, "no_attempt")]
 
 
@@ -1039,7 +1041,7 @@ def add_path_lesson(env, *triggers: Trigger) -> str:
         triggers=(Trigger(TriggerKind.ERROR, SIG, Stage.REPAIR), *triggers),
         fingerprint="fp-path",
         actor="test",
-        at=T0,
+        at=START,
     )
 
 
@@ -1054,16 +1056,16 @@ def test_plan_hit_on_a_path_trigger_finds_absolute_paths_under_the_repo_root(env
     lesson = add_path_lesson(env, Trigger(TriggerKind.PATH, "src/**", Stage.PLAN))
     t = Claude(env["repo"]).call("t1", "Edit", {**EDIT_ARGS, "file_path": f"{env['repo']}/src/app.py"})
     write(env, "s1", t.text())
-    tdb = telemetry_with(env, (1, T0, "s1", "plan", lesson, "shown", "path:plan:src/**"))
-    assert mine_with_roots(env, T0 + 2 * DAY).outcomes_written == 1
+    tdb = telemetry_with(env, (1, START, "s1", "plan", lesson, "shown", "path:plan:src/**"))
+    assert mine_with_roots(env, START + 2 * DAY).outcomes_written == 1
     assert tdb.execute("select outcome from outcomes").fetchall() == [("fired_unneeded",)]
 
 
 def test_plan_hit_is_attributed_to_the_trigger_that_fired(env):
     lesson = add_path_lesson(env, Trigger(TriggerKind.PATH, "src/**", Stage.PLAN), GATE)
     write(env, "s1", Claude(env["repo"]).bash("t1", "pytest --frobnicate tests").text())
-    tdb = telemetry_with(env, (1, T0, "s1", "plan", lesson, "shown", "path:plan:src/**"))
-    mine_with_roots(env, T0 + 2 * DAY)
+    tdb = telemetry_with(env, (1, START, "s1", "plan", lesson, "shown", "path:plan:src/**"))
+    mine_with_roots(env, START + 2 * DAY)
     assert tdb.execute("select outcome from outcomes").fetchall() == [("no_attempt",)]
 
 
