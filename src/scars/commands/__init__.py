@@ -8,13 +8,14 @@ stderr and exit code 1.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TextIO
 
@@ -26,10 +27,30 @@ class UserError(Exception):
     """Something the person running the command can fix. The message is one line."""
 
 
-HARNESS_NAMES = frozenset({"claude", "claude-code", "codex", "codex-cli"})
-"""Executable names of the agent harnesses. A privileged command refuses to run under any of them."""
-HARNESS_MARKERS = ("@anthropic-ai/claude-code", "@openai/codex", "/claude-code/", "/codex/bin/")
-"""Command-line fragments that identify a harness run through an interpreter such as node."""
+HARNESS_NAMES = frozenset({"claude", "claude-code", "codex", "codex-cli", "remy"})
+"""Executable names (lowercased, without a `.exe`, `.js` or `.py` suffix) of the agent harnesses."""
+_HARNESS_NAME = re.compile(r"codex-(?:aarch64|x86_64|arm64)-[a-z0-9_-]+")
+"""Codex's per-platform binary names, such as Homebrew's `codex-aarch64-apple-darwin`."""
+HARNESS_INSTALL_DIRS = (
+    "/node_modules/@anthropic-ai/claude-code/",
+    "/node_modules/@openai/codex/",
+    "/node_modules/@openai/codex-",
+    "/.local/share/claude/versions/",
+    "/.claude/local/",
+    "/Caskroom/claude-code/",
+    "/Caskroom/codex/",
+)
+"""Install directories of Claude Code (npm, native installer, Homebrew cask) and Codex (npm and its
+per-platform packages, Homebrew cask). The native installer names its binary after the version."""
+HARNESS_APPS = ("Remy", "Claude", "Codex", "ChatGPT")
+"""macOS app bundles that run agents: Remy, Claude Code in the Claude app, the Codex app and the
+ChatGPT app's bundled Codex CLI."""
+_APP_EXECUTABLE = re.compile(r"^(?:/[^/\s]+)*/(?:" + "|".join(HARNESS_APPS) + r")\.app/")
+"""A command line whose executable lies inside one of those bundles. The path before the bundle has no
+spaces, because `ps` joins arguments with spaces and a later argument must not count."""
+INTERPRETERS = re.compile(r"(?:node|nodejs|bun|deno|python[0-9.]*)")
+_VALUE_OPTIONS = frozenset({"-r", "--require", "--import", "--loader", "-W", "-X", "--config"})
+_NO_SCRIPT = frozenset({"-e", "--eval", "-p", "--print", "-c"})
 HARNESS_ENV = ("CLAUDECODE", "CODEX_SANDBOX")
 ANCESTOR_DEPTH = 12
 PS = next((p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p)), "/bin/ps")
@@ -54,7 +75,9 @@ def process_ancestors(pid: int | None = None) -> list[str] | None:
     """The command lines of `pid` (default: this process's parent) and its ancestors, nearest first.
 
     None when the chain cannot be read: `ps` is missing, fails, prints nothing, or prints something
-    that does not parse. A caller that needs the chain must treat None as a reason to refuse.
+    that does not parse, or the walk stops after `ANCESTOR_DEPTH` processes before reaching pid 1 or 0.
+    A partial chain is no answer: nesting waiting shells would push a harness out of reach. A caller
+    that needs the chain must treat None as a reason to refuse.
     """
     out: list[str] = []
     pid = os.getppid() if pid is None else pid
@@ -76,6 +99,8 @@ def process_ancestors(pid: int | None = None) -> list[str] | None:
         except ValueError:
             return None
         out.append(command.strip())
+    if pid > 1:
+        return None
     return out or None
 
 
@@ -85,14 +110,14 @@ def edit_in_editor(text: str, env: Mapping[str, str]) -> str:
     import tempfile
 
     editor = env.get("VISUAL") or env.get("EDITOR") or "vi"
-    with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as f:
+    with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False, encoding="utf-8") as f:
         f.write(text)
         name = f.name
     try:
         result = subprocess.run([*shlex.split(editor), name])
         if result.returncode != 0:
             raise UserError(f"the editor exited with code {result.returncode}; nothing changed")
-        return Path(name).read_text()
+        return Path(name).read_text(encoding="utf-8")
     finally:
         os.unlink(name)
 
@@ -133,6 +158,10 @@ class Context:
     def rewrite(self, text: str) -> str:
         return self.edit(text) if self.edit is not None else edit_in_editor(text, self.env)
 
+    def guarded(self) -> Context:
+        """This context with stdout and stderr passed line by line through `clean`."""
+        return replace(self, stdout=CleanLines(self.stdout), stderr=CleanLines(self.stderr))
+
 
 def _is_tty(stream: TextIO) -> bool:
     try:
@@ -141,11 +170,48 @@ def _is_tty(stream: TextIO) -> bool:
         return False
 
 
-def harness_in(command_line: str) -> bool:
-    words = command_line.split()
-    if words and os.path.basename(words[0]).lstrip("-") in HARNESS_NAMES:
+def _is_harness_file(path: str) -> bool:
+    name = os.path.basename(path).lstrip("-").lower()
+    for suffix in (".exe", ".js", ".mjs", ".cjs", ".py"):
+        name = name.removesuffix(suffix)
+    if name in HARNESS_NAMES or _HARNESS_NAME.fullmatch(name):
         return True
-    return any(marker in command_line for marker in HARNESS_MARKERS)
+    return any(d in path for d in HARNESS_INSTALL_DIRS)
+
+
+def _script_of(args: list[str]) -> str | None:
+    """The script or module an interpreter runs: its first argument that is not an option."""
+    words = iter(args)
+    for word in words:
+        if word in _NO_SCRIPT:
+            return None
+        if word == "-m":
+            return next(words, None)
+        if word in _VALUE_OPTIONS:
+            next(words, None)
+        elif not word.startswith("-"):
+            return word
+    return None
+
+
+def harness_in(command_line: str) -> bool:
+    """Whether the program a command line runs is an agent harness.
+
+    Only the program's identity counts: an executable inside a harness app bundle, the first word's
+    name or install directory, or for an interpreter (node, bun, deno, python) the script or module it
+    runs. A harness name anywhere else, such as a file being edited, does not.
+    """
+    if _APP_EXECUTABLE.match(command_line):
+        return True
+    words = command_line.split()
+    if not words:
+        return False
+    if _is_harness_file(words[0]):
+        return True
+    if INTERPRETERS.fullmatch(os.path.basename(words[0]).lower()):
+        script = _script_of(words[1:])
+        return script is not None and _is_harness_file(script)
+    return False
 
 
 def refusal(ctx: Context) -> str | None:
@@ -154,8 +220,12 @@ def refusal(ctx: Context) -> str | None:
     Privileged commands change which lessons reach agents, so they need a human. The checks: stdin and
     stdout are terminals, `CLAUDECODE` and `CODEX_SANDBOX` are absent (even set to an empty string they
     mark an agent session), and the ancestor processes can be read and none is an agent harness. When the
-    ancestry cannot be read the answer is no, not yes. An agent determined to get around this can, so it
-    is a speed bump; the hook's agent deny rule is the second layer.
+    ancestry cannot be read, or is deeper than the walk, the answer is no, not yes.
+
+    This is a speed bump, not a security boundary. An agent running as the same user with a shell can
+    always defeat ancestry detection (by detaching from its harness, for example), so it only stops an
+    agent that runs the command directly. The real boundary is the harness's sandbox, which should deny
+    writes to the scars home; the hook's agent deny rule is a further layer.
     """
     for name in HARNESS_ENV:
         if name in ctx.env:
@@ -232,9 +302,13 @@ def lessons_db(*, readonly: bool = False) -> Iterator[sqlite3.Connection]:
 
 
 def get_lesson(db: sqlite3.Connection, lesson_id: str) -> Lesson:
-    lesson = store.get_lesson(db, LessonId(lesson_id))
+    """The lesson, or a `UserError` when there is none or its stored row does not load."""
+    try:
+        lesson = store.get_lesson(db, LessonId(lesson_id))
+    except (ValueError, TypeError) as exc:
+        raise UserError(f"lesson {shown(lesson_id)} cannot be read: {shown(str(exc))}") from None
     if lesson is None:
-        raise UserError(f"no lesson {lesson_id}")
+        raise UserError(f"no lesson {shown(lesson_id)}")
     return lesson
 
 
@@ -252,16 +326,58 @@ def telemetry_db() -> sqlite3.Connection | None:
 DISPLAY_RULES = (*render.SANITIZER_RULES, *render.IMPERATIVE_RULES, *render.SECRET_RULES)
 """The lesson text rules, minus the observed-command rule (which is about a lesson's trust class)."""
 
+_LINE_SANITIZER = ("sanitizer.ansi_escape", "sanitizer.control_char", "sanitizer.non_ascii")
+LINE_RULES = (*(r for r in render.SANITIZER_RULES if r.name in _LINE_SANITIZER), *render.SECRET_RULES)
+"""What every printed line of a read command must pass: printable ASCII only, and no secret."""
+
+
+def clean(line: str) -> str:
+    """`line`, or `[hidden: <rule>]` when it breaks one of `LINE_RULES`."""
+    for rule in LINE_RULES:
+        if rule.hits(line):
+            return f"[hidden: {rule.name}]"
+    return line
+
+
+class CleanLines:
+    """A text stream that writes each complete line to `out` through `clean`.
+
+    The read commands (`ls`, `why`, `test`, `doctor`) print to this, so a value that a print site forgot
+    to pass through `shown` still cannot put an escape sequence, a non-ASCII character or a secret on
+    the terminal or into the agent that ran the command. It is the boundary; `shown` is the finer filter.
+    """
+
+    def __init__(self, out: TextIO) -> None:
+        self.out = out
+        self._partial = ""
+
+    def write(self, text: str) -> int:
+        *lines, self._partial = (self._partial + text).split("\n")
+        for line in lines:
+            self.out.write(clean(line) + "\n")
+        return len(text)
+
+    def flush(self) -> None:
+        if self._partial:
+            self.out.write(clean(self._partial))
+            self._partial = ""
+        self.out.flush()
+
+    def isatty(self) -> bool:
+        return _is_tty(self.out)
+
+    def fileno(self) -> int:
+        return self.out.fileno()
+
 
 def shown(value: str) -> str:
     """`value`, or `[hidden: <rule>]` when it breaks a lesson text rule.
 
     Agents run the read commands too, so whatever they print is a way into an agent's context. Stored
     values (lesson text, trigger specs, mined inputs, observations, event payloads) came from transcripts
-    and are held to the same rules as lesson text before they are printed.
+    and are held to the same rules as lesson text before they are printed. An empty value breaks the
+    sanitizer's empty rule too; a call site where empty is normal says so in words instead.
     """
-    if value == "":
-        return value
     for rule in DISPLAY_RULES:
         if rule.hits(value):
             return f"[hidden: {rule.name}]"

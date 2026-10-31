@@ -17,15 +17,21 @@ Steps, in order:
 
 Both harness configs run a shim, `~/.scars/bin/scars-hook`, which execs the installed `scars-hook` by
 absolute path, so the hook command in them stays the same across upgrades and reinstalls. When the
-installed `scars-hook` lives inside a git checkout, init refuses unless `--allow-dev-install` is given:
-an agent working in that checkout could edit the code every hook run executes.
+installed `scars-hook`, or the `scars` package it imports, lives inside a git checkout, init refuses
+unless `--allow-dev-install` is given: an agent working in that checkout could edit the code every hook
+run executes. Checking the package matters for editable installs, whose script lives elsewhere.
 
 Every write is idempotent: a file that already has the planned content is reported unchanged. A write
 goes to the real file behind any symlink, through a temp file in the same directory that is fsynced and
 renamed into place, and keeps the existing file's mode. A read-only file is replaced only after the
 person confirms it, never under `--yes`. The Codex merge accepts only the documented shape of
 `hooks.json` (any other shape stops init before it changes anything) and removes only handlers whose
-command is exactly one scars renders; everything else in the file is kept.
+command is exactly one scars renders; everything else in the file is kept. JSON that would not survive
+a round trip (duplicate keys, numbers that are not finite) counts as another shape. Every file is read
+again just before it is written, and a file that changed since init planned it (someone edited it while
+init was asking) is left alone, with a message to run init again.
+
+Config files are UTF-8 whatever the locale.
 """
 
 from __future__ import annotations
@@ -45,7 +51,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
@@ -63,7 +69,37 @@ LAUNCHD_LABEL = "dev.scars.miner"
 CONFIG_MODE = 0o600
 PLIST_MODE = 0o644
 SHIM_MODE = 0o755
+UTF8 = "utf-8"
 _CWD = re.compile(r'"cwd"\s*:\s*("(?:[^"\\]|\\.)*")')
+
+
+class UnsafeJson(ValueError):
+    """JSON that `json` would load lossily: a duplicate key, or a number that is not finite."""
+
+
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key, value in pairs:
+        if key in out:
+            raise UnsafeJson(f'duplicate key "{key}"')
+        out[key] = value
+    return out
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if value in (float("inf"), float("-inf")):
+        raise UnsafeJson(f"number {text} is not finite")
+    return value
+
+
+def _no_constant(text: str) -> float:
+    raise UnsafeJson(f"number {text} is not finite")
+
+
+def load_json_exactly(text: str) -> object:
+    """Parse JSON that dumps back without loss, or raise `UnsafeJson` (or ValueError for bad JSON)."""
+    return json.loads(text, object_pairs_hook=_unique_keys, parse_float=_finite, parse_constant=_no_constant)
 
 
 @dataclass(frozen=True)
@@ -73,6 +109,8 @@ class PlannedFile:
     mode: int = CONFIG_MODE
     """The mode of a new file. An existing file keeps its own mode unless `force_mode` is set."""
     force_mode: bool = False
+    planned_over: tuple[str | None] | None = None
+    """What the file held when `content` was planned, as a 1-tuple; None when not recorded yet."""
 
     def target(self) -> Path:
         """The file a write lands in: `path` with every symlink resolved."""
@@ -80,9 +118,16 @@ class PlannedFile:
 
     def current(self) -> str | None:
         try:
-            return self.path.read_text()
+            return self.path.read_text(encoding=UTF8)
         except FileNotFoundError:
             return None
+
+    def changed_since_planned(self) -> bool:
+        """Whether something other than this plan changed the file after it was planned."""
+        if self.planned_over is None:
+            return False
+        now = self.current()
+        return now != self.planned_over[0] and now != self.content
 
     def _mode_ok(self) -> bool:
         try:
@@ -126,7 +171,7 @@ class PlannedFile:
             mode = self.mode
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".scars-tmp")
         try:
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding=UTF8) as f:
                 f.write(self.content)
                 f.flush()
                 os.fchmod(f.fileno(), mode)
@@ -145,7 +190,7 @@ class PlannedFile:
 
 
 def _template(name: str) -> str:
-    return files("scars").joinpath("plugins", *name.split("/")).read_text()
+    return files("scars").joinpath("plugins", *name.split("/")).read_text(encoding=UTF8)
 
 
 def installed_script(name: str) -> str:
@@ -178,7 +223,7 @@ def hooks_config(name: str, hook_path: str) -> dict[str, object]:
 
 
 def _json(value: object) -> str:
-    return json.dumps(value, indent=2) + "\n"
+    return json.dumps(value, indent=2, allow_nan=False) + "\n"
 
 
 def claude_files(scars_home: Path, hook_path: str) -> list[PlannedFile]:
@@ -270,12 +315,23 @@ def merge_codex(existing: dict[str, object], ours: dict[str, object]) -> dict[st
     return {**existing, "hooks": out}
 
 
+def _unknown_shape(path: Path, problem: str) -> UserError:
+    return UserError(
+        f"{path} is not in the shape scars knows ({problem}); nothing was changed. "
+        "Fix it or move it away, then run scars init again"
+    )
+
+
 def codex_file(user_home: Path, hook_path: str) -> PlannedFile:
     path = user_home / ".codex" / "hooks.json"
     existing: dict[str, object] = {}
+    raw: str | None = None
     if path.exists():
         try:
-            loaded = json.loads(path.read_text())
+            raw = path.read_text(encoding=UTF8)
+            loaded = load_json_exactly(raw)
+        except UnsafeJson as exc:
+            raise _unknown_shape(path, str(exc)) from None
         except (ValueError, OSError):
             raise UserError(
                 f"cannot parse {path}; fix it or move it away, then run scars init again"
@@ -283,22 +339,20 @@ def codex_file(user_home: Path, hook_path: str) -> PlannedFile:
         if not isinstance(loaded, dict):
             raise UserError(f"{path} is not a JSON object; fix it or move it away")
         if (problem := codex_shape_problem(loaded)) is not None:
-            raise UserError(
-                f"{path} is not in the shape scars knows ({problem}); nothing was changed. "
-                "Fix it or move it away, then run scars init again"
-            )
+            raise _unknown_shape(path, problem)
         existing = loaded
-    return PlannedFile(path, _json(merge_codex(existing, hooks_config("codex/hooks.json", hook_path))))
+    merged = _json(merge_codex(existing, hooks_config("codex/hooks.json", hook_path)))
+    return PlannedFile(path, merged, planned_over=(raw,))
 
 
 def launchd_file(user_home: Path, scars_path: str, scars_home: Path, env: dict[str, str]) -> PlannedFile:
-    job = plistlib.loads(_template("launchd/dev.scars.miner.plist").encode())
+    job = plistlib.loads(_template("launchd/dev.scars.miner.plist").encode(UTF8))
     job["ProgramArguments"] = [scars_path, "mine"]
     log = str(scars_home / "logs" / "miner.log")
     job["StandardOutPath"] = job["StandardErrorPath"] = log
     if env:
         job["EnvironmentVariables"] = env
-    content = plistlib.dumps(job).decode()
+    content = plistlib.dumps(job).decode(UTF8)
     return PlannedFile(user_home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist", content, PLIST_MODE)
 
 
@@ -315,7 +369,7 @@ def transcript_cwds(user_home: Path, since: float) -> set[str]:
             try:
                 if path.stat().st_mtime < since:
                     continue
-                text = path.read_text(errors="replace")
+                text = path.read_text(encoding=UTF8, errors="replace")
             except OSError:
                 continue
             for m in _CWD.finditer(text):
@@ -443,6 +497,12 @@ def _offer(ctx: Context, title: str, planned: list[PlannedFile], yes: bool) -> b
             ctx.print(f"{title}: not written")
             return False
     for f in planned:
+        if f.changed_since_planned():
+            ctx.print(
+                f"{title}: not written: {f.path} changed since scars init read it; run scars init again"
+            )
+            return False
+    for f in planned:
         f.write()
     ctx.print(f"{title}: written")
     return True
@@ -457,15 +517,19 @@ class Plan:
     launchd: PlannedFile | None
 
 
+def _recorded(f: PlannedFile) -> PlannedFile:
+    return f if f.planned_over is not None else replace(f, planned_over=(f.current(),))
+
+
 def plan(ctx: Context, scars_home: Path, hook_path: str) -> Plan:
-    shim = shim_file(scars_home, hook_path)
+    shim = _recorded(shim_file(scars_home, hook_path))
     command = str(shim.path)
     job = None
     if ctx.platform == "darwin":
         env = {} if scars_home == ctx.user_home / ".scars" else {"SCARS_HOME": str(scars_home)}
-        job = launchd_file(ctx.user_home, installed_script("scars"), scars_home, env)
+        job = _recorded(launchd_file(ctx.user_home, installed_script("scars"), scars_home, env))
     return Plan(
-        claude=[shim, *claude_files(scars_home, command)],
+        claude=[shim, *map(_recorded, claude_files(scars_home, command))],
         codex=[shim, codex_file(ctx.user_home, command)],
         launchd=job,
     )
@@ -520,12 +584,26 @@ def show_top(ctx: Context, scars_home: Path) -> None:
     ctx.print("review them with: scars inbox")
 
 
+def package_file() -> str:
+    """The `__init__.py` of the `scars` package this process imported."""
+    import scars
+
+    return scars.__file__
+
+
 def hook_script(ctx: Context, allow_dev_install: bool) -> str:
-    """The installed `scars-hook`, refused when it sits in a git checkout unless that is allowed."""
+    """The installed `scars-hook`, refused when it or the `scars` package sits in a git checkout,
+    unless that is allowed."""
     hook_path = installed_script("scars-hook")
-    checkout = git_checkout_of(hook_path)
+    for code_path in (hook_path, str(Path(package_file()).parent)):
+        _refuse_checkout(ctx, code_path, allow_dev_install)
+    return hook_path
+
+
+def _refuse_checkout(ctx: Context, code_path: str, allow_dev_install: bool) -> None:
+    checkout = git_checkout_of(code_path)
     if checkout is not None:
-        real = os.path.realpath(hook_path)
+        real = os.path.realpath(code_path)
         if not allow_dev_install:
             raise UserError(
                 f"refused: {real} is inside the git checkout {checkout}, and an agent working in that "
@@ -533,7 +611,6 @@ def hook_script(ctx: Context, allow_dev_install: bool) -> str:
                 "or pass --allow-dev-install to accept that"
             )
         ctx.print(f"warning: {real} is inside the git checkout {checkout} (allowed by --allow-dev-install)")
-    return hook_path
 
 
 @contextmanager

@@ -115,7 +115,7 @@ def cmd_import_guard(args: argparse.Namespace, ctx: Context) -> int:
     require_human(ctx)
     path = Path(args.path) if args.path else ctx.user_home / DEFAULT_GUARD
     try:
-        script = path.read_text()
+        script = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise UserError(f"cannot read {path}: {exc.strerror}") from None
     reasons = deny_reasons(script)

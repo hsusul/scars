@@ -81,6 +81,8 @@ class Command:
     handler: str | None = None
     """`module:function` under `scars.commands`, imported only when the command runs."""
     configure: Configure = _none
+    guarded: bool = False
+    """Every output line goes through the sanitizer and secret scan: agents run these commands too."""
 
 
 PHASE_1_COMMANDS = (
@@ -95,12 +97,20 @@ PHASE_1_COMMANDS = (
     Command("pin", "inject a promoted lesson at session start", "lifecycle:cmd_pin", _lesson_id),
     Command("unpin", "stop injecting a lesson at session start", "lifecycle:cmd_unpin", _lesson_id),
     Command("level", "set a promoted lesson's level to note or warn", "lifecycle:cmd_level", _level),
-    Command("ls", "list lessons", "inspect:cmd_ls", _ls),
-    Command("why", "explain why a lesson fired", "inspect:cmd_why", _why),
-    Command("test", "replay a lesson's triggers against recent tool calls", "inspect:cmd_test", _lesson_id),
+    Command("ls", "list lessons", "inspect:cmd_ls", _ls, guarded=True),
+    Command("why", "explain why a lesson fired", "inspect:cmd_why", _why, guarded=True),
+    Command(
+        "test",
+        "replay a lesson's triggers against recent tool calls",
+        "inspect:cmd_test",
+        _lesson_id,
+        guarded=True,
+    ),
     Command("mute", "stop a lesson from firing", "lifecycle:cmd_mute", _lesson_id),
     Command("retire", "retire a lesson", "lifecycle:cmd_retire", _lesson_id),
-    Command("doctor", "check hook health, store location and store integrity", "doctor:cmd_doctor"),
+    Command(
+        "doctor", "check hook health, store location and store integrity", "doctor:cmd_doctor", guarded=True
+    ),
     Command("bench", "measure full-hook latency under load", "bench:cmd_bench", _bench),
     Command("off", "turn every scars hook off on the next tool call", "lifecycle:cmd_off"),
     Command("on", "turn scars hooks back on", "lifecycle:cmd_on"),
@@ -121,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     for command in PHASE_1_COMMANDS:
         p = sub.add_parser(command.name, help=command.help, description=command.help)
         command.configure(p)
-        p.set_defaults(handler=command.handler)
+        p.set_defaults(handler=command.handler, guarded=command.guarded)
     hook_parser = sub.add_parser("hook", help="entry point that agent hooks call")
     hook_parser.add_argument("harness", choices=["claude", "codex"])
     hook_parser.add_argument("event")
@@ -144,6 +154,8 @@ def main(argv: list[str] | None = None, ctx: object = None) -> int:
     from scars.commands import Context, UserError
 
     context = ctx if isinstance(ctx, Context) else Context()
+    if args.guarded:
+        context = context.guarded()
     module, _, function = args.handler.partition(":")
     handler = getattr(import_module(f"scars.commands.{module}"), function)
     try:
@@ -151,3 +163,6 @@ def main(argv: list[str] | None = None, ctx: object = None) -> int:
     except UserError as exc:
         print(f"scars {args.command}: {exc}", file=context.stderr)
         return 1
+    finally:
+        context.stdout.flush()
+        context.stderr.flush()

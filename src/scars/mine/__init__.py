@@ -87,6 +87,11 @@ def _session_id(source: Source, path: Path) -> str:
     return path.stem
 
 
+def session_key(source: Source, path: Path) -> tuple[str, str]:
+    """The `(harness, session id)` a transcript file belongs to."""
+    return str(source.harness), _session_id(source, path)
+
+
 @dataclass(frozen=True)
 class _Read:
     offsets: tuple[store.Offset, ...]
@@ -353,20 +358,22 @@ def run(
     *,
     common_dir_of: Callable[[str], str | None] = hook.git_common_dir,
     repo_root_of: Callable[[str], str | None] = hook.repo_root,
-    partial: bool = False,
+    skipped_sessions: frozenset[tuple[str, str]] = frozenset(),
 ) -> Summary:
     """Mine one batch into `home`/lessons.db and write outcomes into `home`/telemetry.db if it exists.
 
     `common_dir_of` maps a directory to its git common dir (which names the registered repo), and
     `repo_root_of` to its worktree root (against which path triggers resolve absolute paths).
-    `partial` says `sources` leave some transcripts out on purpose (`scars mine --since`): a pending
-    failure of a session this batch did not read is then kept as it is, neither advanced nor expired,
-    because its transcript was skipped rather than found idle.
+    `skipped_sessions` names the `(harness, session id)` keys whose transcripts were left out on
+    purpose (`scars mine --since`): their pending failures are kept as they are, neither advanced nor
+    expired, because the transcript was skipped rather than found idle. Every other session follows
+    the normal rules, even one that was read and produced no new calls.
     """
     db = store.init_lessons(home / "lessons.db")
     try:
         store.ensure_miner_schema(db)
-        return _run(db, home, sources, now, _Repos(db, common_dir_of, repo_root_of), partial)
+        repos = _Repos(db, common_dir_of, repo_root_of)
+        return _run(db, home, sources, now, repos, skipped_sessions)
     finally:
         db.close()
 
@@ -377,7 +384,7 @@ def _run(
     sources: Iterable[Source],
     now: float,
     repos: _Repos,
-    partial: bool = False,
+    skipped_sessions: frozenset[tuple[str, str]] = frozenset(),
 ) -> Summary:
     counts: Counter[str] = Counter()
     rejected: Counter[str] = Counter()
@@ -398,8 +405,8 @@ def _run(
     found: list[pairs.Pair] = []
     still_open: list[pairs.OpenFailure] = []
     for key in sorted(set(streams) | set(waiting)):
-        if partial and key not in read.streams:
-            still_open.extend(waiting[key])
+        if key in skipped_sessions:
+            still_open.extend(waiting.get(key, ()))
             continue
         result = pairs.pair_session(waiting.get(key, ()), streams.get(key, ()), now)
         found.extend(result.pairs)

@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from cli_helpers import FAILURE_PAIR, NOW, claude_transcript, connect, git_repo, make_ctx, run
+from cli_helpers import FAILURE_PAIR, NOW, SIG, claude_transcript, connect, git_repo, make_ctx, run
 from scars import hook, store
 from scars.commands import UserError
 from scars.commands.import_guard import deny_reasons, draft
@@ -62,6 +62,31 @@ def test_mine_since_reads_only_recent_files(home, work):
     out = run(make_ctx(user, clock=time.time), "mine", "--since", "2d")[1]
     assert out.startswith("read 1 transcripts: 2 calls")
     assert run(make_ctx(user, clock=time.time), "mine")[1].startswith("read 1 transcripts")
+
+
+def test_mine_since_keeps_only_the_skipped_sessions_pending_failures(home, work):
+    user = work / "user"
+    repo = git_repo(work / "app")
+    start = time.time() - 3600
+    paths = {}
+    for name in ("read", "skipped"):
+        path = user / ".claude" / "projects" / "p" / f"{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            claude_transcript(str(repo), start, [(f"{name}-t1", "pytest --frobnicate tests", SIG)])
+        )
+        os.utime(path, (start, start))
+        paths[name] = path
+    run(make_ctx(user, clock=time.time), "mine")
+    assert sorted(p.session_id for p in store.pending_failures(connect(home))) == ["read", "skipped"]
+    later = time.time() + 2 * 86400
+    # The read session gets a line with no tool call, so it is read but produces no new calls.
+    with paths["read"].open("a") as f:
+        f.write(json.dumps({"type": "summary", "summary": "x"}) + "\n")
+    os.utime(paths["read"], (later, later))
+    run(make_ctx(user, clock=lambda: later), "mine", "--since", "1d")
+    # The read session's failure is two days idle and expires; the skipped one is left untouched.
+    assert [p.session_id for p in store.pending_failures(connect(home))] == ["skipped"]
 
 
 def test_parse_since():

@@ -78,13 +78,23 @@ def test_model_backfill_looks_back_only_30_days(home):
 def test_ls_reads_last_seen_with_the_lesson_rows(home, user_home, monkeypatch):
     from cli_helpers import seed
 
-    seed(home)
+    stale = seed(home, at=NOW - 40 * DAY)
+    seed(home, avoid="pytest --fresh", sig="Error: fresh", at=NOW - DAY)
 
     def per_lesson(*_):
         raise AssertionError("ls asked for one lesson's last_seen_at")
 
+    calls = []
+    whole_table = store.lessons_last_seen
     monkeypatch.setattr(store, "lesson_last_seen", per_lesson)
-    assert run(make_ctx(user_home), "ls", "--stale")[0] == 0
+    monkeypatch.setattr(store, "lessons_last_seen", lambda db: calls.append(1) or whole_table(db))
+    assert run(make_ctx(user_home), "ls", "--stale") == (
+        0,
+        "ID          STATUS      LEVEL PIN SEEN  SCOPE  AVOID\n"
+        f"{stale:<11} provisional note -      1  repo app  pytest --frobnicate\n",
+        "",
+    )
+    assert calls == [1]
 
 
 LESSONS = 10_000
@@ -158,6 +168,19 @@ def test_ls_and_doctor_on_10000_lessons_and_100000_hits(home, user_home, monkeyp
         timings[" ".join(argv)] = time.perf_counter() - started
         if argv == ["ls"]:
             assert (code, out.count("\n")) == (0, LESSONS + 1)
+            assert out.startswith("ID          STATUS      LEVEL PIN SEEN  SCOPE  AVOID\n")
+        elif argv == ["ls", "--stale"]:
+            # Every lesson's hits fall on days that include one inside the 30-day window.
+            assert (code, out) == (0, "no lessons\n")
+        else:
+            assert code == 1
+            assert out.splitlines()[0] == (
+                "claude: last hook 2027-01-15 08:00, 4446 runs, p50 2.0 ms, p99 2.0 ms, errors 0 (0.0%), "
+                "error classes: none; hooks not installed (run scars init)"
+            )
+            assert "FAIL  hooks: no harness has scars hooks installed\n" in out
+            assert "ok    event chain: hash chain and replay match the lessons\n" in out
+            assert "ok    canary: skipped\n" in out
     with capsys.disabled():
         print(f"\nscale: built in {built:.1f} s; " + ", ".join(f"{k} {v:.2f} s" for k, v in timings.items()))
     assert timings["ls"] < 15 and timings["ls --stale"] < 15 and timings["doctor"] < 60

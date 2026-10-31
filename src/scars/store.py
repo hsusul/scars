@@ -1278,6 +1278,10 @@ def list_lessons(
     repo_id: RepoId | None = None,
 ) -> list[Lesson]:
     """Lessons in any of `statuses` (all when None), narrowed to one repo's repo and path scopes."""
+    return _load(db, *_list_where(statuses, repo_id))
+
+
+def _list_where(statuses: Iterable[Status] | None, repo_id: RepoId | None) -> tuple[str, list[object]]:
     where, params = "1", []
     if statuses is not None:
         wanted = sorted(str(s) for s in statuses)
@@ -1286,7 +1290,30 @@ def list_lessons(
     if repo_id is not None:
         where += " and repo_id = ?"
         params.append(repo_id)
-    return _load(db, where, params)
+    return where, params
+
+
+def read_lessons(
+    db: sqlite3.Connection,
+    *,
+    statuses: Iterable[Status] | None = None,
+    repo_id: RepoId | None = None,
+) -> tuple[list[Lesson], list[tuple[str, str]]]:
+    """Like `list_lessons`, but a row that does not load (an empty text, an unknown enum value) comes
+    back as `(lesson id, reason)` instead of raising, so one broken row cannot hide the others."""
+    where, params = _list_where(statuses, repo_id)
+    try:
+        return _load(db, where, params), []
+    except (ValueError, TypeError):
+        pass
+    lessons: list[Lesson] = []
+    problems: list[tuple[str, str]] = []
+    for (lesson_id,) in db.execute(f"select id from lessons where {where} order by id", params).fetchall():
+        try:
+            lessons.extend(_load(db, "id = ?", (lesson_id,)))
+        except (ValueError, TypeError) as exc:
+            problems.append((str(lesson_id), str(exc)))
+    return lessons, problems
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from cli_helpers import FAILURE_PAIR, claude_transcript, git_repo, make_ctx, run
+from cli_helpers import FAILURE_PAIR, Tty, claude_transcript, git_repo, make_ctx, run
 from scars import store
 from scars.commands import install
 
@@ -27,6 +27,8 @@ def machine(work, monkeypatch):
     for name in ("SCARS_OFF", "CLAUDECODE", "CODEX_SANDBOX"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(install, "installed_script", lambda name: f"/opt/scars bin/{name}")
+    # The suite imports scars from this checkout's src/, which init refuses; stand in an installed copy.
+    monkeypatch.setattr(install, "package_file", lambda: "/opt/scars lib/scars/__init__.py", raising=False)
     return user, scars_home
 
 
@@ -261,6 +263,112 @@ def test_init_refuses_a_hook_inside_a_git_checkout_unless_allowed(machine, work,
     ).read_text() == f'#!/bin/sh\nexec {shlex.quote(str(script))} "$@"\n'
 
 
+def test_init_refuses_an_editable_install_whose_package_is_in_a_checkout(machine, work, monkeypatch):
+    # `uv tool install -e .` puts scars-hook outside the checkout but imports scars from its src/.
+    user, scars_home = machine
+    checkout = work / "scars-src"
+    (checkout / ".git").mkdir(parents=True)
+    package = checkout / "src" / "scars"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    monkeypatch.setattr(install, "package_file", lambda: str(package / "__init__.py"), raising=False)
+    code, out, err = run(make_ctx(user, clock=time.time), "init", "--yes")
+    assert (code, out, err) == (
+        1,
+        "",
+        f"scars init: refused: {package} is inside the git checkout {checkout}, and an agent working in "
+        "that checkout could edit the hook code every session runs; install scars outside a checkout, "
+        "or pass --allow-dev-install to accept that\n",
+    )
+    assert not scars_home.exists()
+    code, out, err = run(make_ctx(user, clock=time.time), "init", "--yes", "--allow-dev-install")
+    assert (code, err) == (0, "")
+    assert f"warning: {package} is inside the git checkout {checkout}" in out
+
+
+def test_init_reads_and_writes_configs_as_utf8_whatever_the_locale(work):
+    import subprocess
+    import sys
+
+    user = work / "user"
+    scars_home = user / "sch\u00fctz"
+    codex = user / ".codex" / "hooks.json"
+    codex.parent.mkdir(parents=True)
+    other = {"hooks": [{"type": "command", "command": "echo gr\u00fc\u00df"}]}
+    codex.write_text(json.dumps({"hooks": {"Stop": [other]}}, ensure_ascii=False), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CODEX_SANDBOX", "SCARS_OFF")}
+    env.update(HOME=str(user), SCARS_HOME=str(scars_home), LC_ALL="C", LANG="C")
+    env.update(PYTHONUTF8="0", PYTHONCOERCECLOCALE="0", PYTHONIOENCODING="utf-8")
+    argv = [sys.executable, "-m", "scars", "init", "--yes", "--allow-dev-install"]
+    result = subprocess.run(argv, env=env, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert (result.returncode, result.stderr) == (0, "")
+    merged = json.loads(codex.read_text(encoding="utf-8"))
+    assert merged["hooks"]["Stop"][0] == other
+    assert sorted(merged["hooks"]) == [
+        "PostToolUse",
+        "PreToolUse",
+        "SessionStart",
+        "Stop",
+        "UserPromptSubmit",
+    ]
+    if sys.platform == "darwin":
+        plist = user / "Library" / "LaunchAgents" / "dev.scars.miner.plist"
+        assert plistlib.loads(plist.read_bytes())["EnvironmentVariables"] == {"SCARS_HOME": str(scars_home)}
+
+
+@pytest.mark.parametrize(
+    ("text", "detail"),
+    [
+        ('{"hooks": {}, "other": 1, "other": 2}', 'duplicate key "other"'),
+        ('{"hooks": {"Stop": [{"hooks": [], "x": 1, "x": 1}]}}', 'duplicate key "x"'),
+        ('{"hooks": {}, "limit": 1e400}', "number 1e400 is not finite"),
+        ('{"hooks": {}, "limit": NaN}', "number NaN is not finite"),
+        ('{"hooks": {}, "limit": -Infinity}', "number -Infinity is not finite"),
+    ],
+    ids=["duplicate", "nested-duplicate", "overflow", "nan", "infinity"],
+)
+def test_init_refuses_json_that_would_not_survive_a_round_trip(machine, text, detail):
+    user, scars_home = machine
+    path = user / ".codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(text)
+    assert run(make_ctx(user, clock=time.time), "init", "--yes") == (
+        1,
+        "",
+        f"scars init: {path} is not in the shape scars knows ({detail}); nothing was changed. "
+        "Fix it or move it away, then run scars init again\n",
+    )
+    assert path.read_text() == text
+    assert not scars_home.exists()
+
+
+def test_init_does_not_overwrite_a_codex_config_edited_while_it_asked(machine, work):
+    user, _ = machine
+    transcript(user, git_repo(work / "lib", remote="https://example.com/x/lib.git"))
+    path = user / ".codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{}")
+    edited = '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}'
+
+    class EditsDuringPrompt(Tty):
+        def readline(self, *args):
+            if path.read_text() != edited:
+                path.write_text(edited)
+            return super().readline(*args)
+
+    ctx = make_ctx(user, platform="linux", clock=time.time)
+    ctx.stdin = EditsDuringPrompt("s\ny\ny\n")
+    code, out, err = run(ctx, "init")
+    assert (code, err) == (0, "")
+    assert f"Codex hooks: not written: {path} changed since scars init read it; run scars init again\n" in out
+    assert path.read_text() == edited
+    assert "Claude Code plugin: written\n" in out
+    assert run(make_ctx(user, lines="s\ny\ny\n", platform="linux", clock=time.time), "init")[0] == 0
+    merged = json.loads(path.read_text())
+    assert merged["hooks"]["Stop"] == json.loads(edited)["hooks"]["Stop"]
+    assert "PreToolUse" in merged["hooks"]
+
+
 def test_init_writes_through_a_symlinked_codex_config(machine, work):
     user, _ = machine
     real = work / "dotfiles" / "codex-hooks.json"
@@ -315,7 +423,8 @@ def test_init_leaves_a_read_only_config_alone_unless_confirmed(machine):
 def test_concurrent_writes_of_one_file_never_fail_or_leave_temp_files(tmp_path):
     import threading
 
-    target = tmp_path / "hooks.json"
+    target = tmp_path / "codex" / "hooks.json"
+    target.parent.mkdir()
     errors = []
 
     def writer(n):
@@ -331,7 +440,7 @@ def test_concurrent_writes_of_one_file_never_fail_or_leave_temp_files(tmp_path):
     for t in threads:
         t.join()
     assert errors == []
-    assert [p.name for p in tmp_path.iterdir()] == ["hooks.json"]
+    assert [p.name for p in target.parent.iterdir()] == ["hooks.json"]
     assert target.read_text().endswith("-149\n")
 
 

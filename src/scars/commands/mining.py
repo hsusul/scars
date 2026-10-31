@@ -1,7 +1,9 @@
 """`scars mine`: one miner batch over the default Claude Code and Codex transcript folders.
 
 `--since` limits the batch to transcript files modified at or after that time. Each file still resumes
-from its saved offset, so a later run without `--since` reads the rest and nothing is mined twice.
+from its saved offset, so a later run without `--since` reads the rest and nothing is mined twice. The
+sessions whose files were skipped keep their pending failures untouched; every session that was read
+follows the normal rules.
 """
 
 from __future__ import annotations
@@ -28,19 +30,29 @@ def parse_since(text: str, now: float) -> float:
         raise UserError(f"--since takes 30d, 12h or a date like 2026-10-01, not {text!r}") from None
 
 
-def recent_sources(sources: tuple[Source, ...], since: float) -> tuple[Source, ...]:
-    """One source per transcript file modified at or after `since`, keeping each file's own path."""
+def recent_sources(
+    sources: tuple[Source, ...], since: float
+) -> tuple[tuple[Source, ...], frozenset[tuple[str, str]]]:
+    """One source per transcript file modified at or after `since`, keeping each file's own path, and
+    the `(harness, session id)` keys of the files left out (minus any session that also has a file in)."""
     out = []
+    kept: set[tuple[str, str]] = set()
+    skipped: set[tuple[str, str]] = set()
     for source in sources:
         if not source.root.is_dir():
             continue
         for path in sorted(source.root.glob(source.pattern)):
+            key = mine.session_key(source, path)
             try:
-                if path.stat().st_mtime >= since:
-                    out.append(Source(source.harness, path.parent, path.name))
+                recent = path.stat().st_mtime >= since
             except OSError:
-                continue
-    return tuple(out)
+                recent = False
+            if recent:
+                out.append(Source(source.harness, path.parent, path.name))
+                kept.add(key)
+            else:
+                skipped.add(key)
+    return tuple(out), frozenset(skipped - kept)
 
 
 def summary_lines(s: Summary) -> list[str]:
@@ -64,9 +76,10 @@ def summary_lines(s: Summary) -> list[str]:
 
 def run(ctx: Context, since: float | None = None) -> Summary:
     sources = mine.default_sources(ctx.user_home)
+    skipped: frozenset[tuple[str, str]] = frozenset()
     if since is not None:
-        sources = recent_sources(sources, since)
-    return mine.run(paths.home(), sources, ctx.clock(), partial=since is not None)
+        sources, skipped = recent_sources(sources, since)
+    return mine.run(paths.home(), sources, ctx.clock(), skipped_sessions=skipped)
 
 
 def waiting_line(home: Path) -> str | None:

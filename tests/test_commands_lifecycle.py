@@ -64,7 +64,12 @@ def test_privileged_command_refuses_under_a_harness_process(home, user_home, anc
 
 def test_a_plain_terminal_is_not_refused(user_home):
     assert refusal(make_ctx(user_home)) is None
+    assert refusal(make_ctx(user_home, ancestors=["/usr/bin/vim claude.md", "-zsh"])) is None
+    assert refusal(make_ctx(user_home, ancestors=["/usr/bin/vim claude.md", "claude", "-zsh"])) == (
+        "it was started from an agent harness; run it in your own terminal"
+    )
     assert harness_in("/usr/bin/vim claude.md") is False
+    assert harness_in("claude --resume") is True
 
 
 def test_off_creates_the_kill_switch_and_on_removes_it(home, user_home):

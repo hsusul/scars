@@ -12,6 +12,10 @@ Each check prints `ok` or `FAIL` with a reason, and any failure makes the exit c
 
 Per harness it also reports the last hook run, p50 and p99 latency and the error classes of the last 24
 hours. A harness with no runs is reported but is not a failure: it may simply not have been used.
+
+Every printed line passes the sanitizer and secret scan (see `CleanLines`); stored values (error classes,
+event chain problems, exception text) also go through `shown`. Telemetry that does not load is a failed
+`telemetry` check, not a crash.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scars import hook, paths, store, telemetry
-from scars.commands import Context, connect_readonly
+from scars.commands import Context, clean, connect_readonly, shown
 from scars.commands.import_guard import create_pinned
 from scars.commands.inspect import when
 from scars.model import Harness, HitOutcome, LessonText, Stage, Trigger, TriggerKind
@@ -142,7 +146,7 @@ def harness_report(hits: list[telemetry.Hit], harness: Harness) -> tuple[str, bo
         if latencies
         else "no latency"
     )
-    error_text = ", ".join(f"{k} {v}" for k, v in sorted(classes.items())) or "none"
+    error_text = ", ".join(f"{shown(str(k))} {v}" for k, v in sorted(classes.items(), key=str)) or "none"
     line = (
         f"{harness}: last hook {when(max(h.at for h in mine))}, {len(mine)} runs, {timing}, "
         f"errors {sum(errors.values())} ({rate:.1%}), error classes: {error_text}"
@@ -152,7 +156,7 @@ def harness_report(hits: list[telemetry.Hit], harness: Harness) -> tuple[str, bo
 
 def _mentions(path: Path, text: str) -> bool:
     try:
-        return text in path.read_text(errors="replace")
+        return text in path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
 
@@ -223,7 +227,7 @@ def run_canary(budget_ms: float = CANARY_BUDGET_MS) -> Check:
                 else:
                     os.environ[k] = v
     if error is not None:
-        return Check("canary", False, f"the hook raised {error}")
+        return Check("canary", False, f"the hook raised {shown(error)}")
     if not all(lesson_id in out for out in outputs):
         return Check("canary", False, "the hook did not return the canary lesson")
     if elapsed > budget_ms:
@@ -246,12 +250,13 @@ def _store_checks(ctx: Context, scars_home: Path, location: Callable[[Path], str
             problems = store.verify(db)
         finally:
             db.close()
-    except (sqlite3.Error, OSError) as exc:
-        checks.append(Check("event chain", False, f"cannot read the lessons store: {exc}"))
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+        checks.append(Check("event chain", False, f"cannot read the lessons store: {shown(str(exc))}"))
         return checks
     if problems:
-        shown = "; ".join(problems[:3]) + (f"; and {len(problems) - 3} more" if len(problems) > 3 else "")
-        checks.append(Check("event chain", False, shown))
+        listed = "; ".join(shown(p) for p in problems[:3])
+        more = f"; and {len(problems) - 3} more" if len(problems) > 3 else ""
+        checks.append(Check("event chain", False, listed + more))
     else:
         checks.append(Check("event chain", True, "hash chain and replay match the lessons"))
     return checks
@@ -270,18 +275,21 @@ def doctor(
     out: list[Check | str] = []
     hits: list[telemetry.Hit] = []
     tele_path = scars_home / "telemetry.db"
-    if tele_path.exists():
-        try:
+    reports = None
+    try:
+        if tele_path.exists():
             tele = connect_readonly(tele_path, "hits")
             try:
                 hits = telemetry.hits_since(tele, ctx.clock() - DAY)
             finally:
                 tele.close()
-        except (sqlite3.Error, OSError) as exc:
-            out.append(Check("telemetry", False, f"cannot read telemetry.db: {exc}"))
+        reports = {harness: harness_report(hits, harness) for harness in Harness}
+    except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError) as exc:
+        out.append(Check("telemetry", False, f"cannot read telemetry.db: {shown(str(exc))}"))
+        reports = {harness: harness_report([], harness) for harness in Harness}
     plugins = _plugin_state(ctx, scars_home)
     for harness in Harness:
-        line, healthy = harness_report(hits, harness)
+        line, healthy = reports[harness]
         out.append(f"{line}; hooks {plugins[harness]}")
         if not healthy:
             out.append(
@@ -302,6 +310,6 @@ def cmd_doctor(_: argparse.Namespace, ctx: Context) -> int:
         if isinstance(item, str):
             ctx.print(item)
             continue
-        ctx.print(f"{'ok  ' if item.ok else 'FAIL'}  {item.name}: {item.detail}")
+        ctx.print(f"{'ok  ' if item.ok else 'FAIL'}  {item.name}: {clean(item.detail)}")
         failed |= not item.ok
     return 1 if failed else 0
