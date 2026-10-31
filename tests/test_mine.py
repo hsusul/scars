@@ -407,6 +407,51 @@ def test_second_sighting_observes_the_same_lesson_and_resets_expiry(env):
     assert store.verify(db) == []
 
 
+def test_a_mined_lesson_that_no_longer_renders_is_retired_and_mined_afresh(env):
+    from scars.mine.build import fingerprint
+    from scars.model import LessonText
+
+    db = lessons_db(env)
+    legacy = store.create_lesson(
+        db,
+        text=LessonText("pytest --frobnicate", "run `pytest tests` instead", FAIL_TEXT),
+        scope=RepoScope(RepoId("own-app")),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=(Trigger(TriggerKind.ERROR, SIG, Stage.REPAIR),),
+        fingerprint=fingerprint(RepoScope(RepoId("own-app")), SIG),
+        actor="miner",
+        at=T0,
+    )
+    store.add_observation(
+        db,
+        store.Observation(
+            legacy, "claude", "s0", "old1", "pytest --frobnicate tests", SIG, "pytest tests", T0
+        ),
+    )
+    db.commit()
+    write(env, "s1", basic_pair(env["repo"]).text())
+    summary = mine_now(env)
+    assert (summary.candidates_created, summary.retired_unrenderable) == (1, 1)
+    assert db.execute(
+        "select type, payload from events where lesson_id = ? order by seq", (legacy,)
+    ).fetchall() == [
+        (
+            "proposed",
+            db.execute(
+                "select payload from events where lesson_id = ? and type = 'proposed'", (legacy,)
+            ).fetchone()[0],
+        ),
+        ("retired", '{"reason":"cannot render: mined.reason_template"}'),
+    ]
+    (fresh,) = store.inbox_candidates(db)
+    assert (fresh.text.avoid, fresh.text.reason, fresh.sessions_seen) == (
+        "pytest --frobnicate tests",
+        MINED_WHY,
+        1,
+    )
+    assert store.verify(db) == []
+
+
 def test_seen_counts_distinct_sessions_not_observations(env):
     write(
         env,

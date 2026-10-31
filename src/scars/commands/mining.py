@@ -60,6 +60,8 @@ def summary_lines(s: Summary) -> list[str]:
         f"read {s.sessions_read} transcripts: {s.calls} calls, {s.failures} failures, {s.pairs} pairs",
         f"lessons: {s.candidates_created} new, {s.observations} observations, {s.expired} expired",
     ]
+    if s.retired_unrenderable:
+        lines.append(f"retired because they no longer render, and mined again: {s.retired_unrenderable}")
     if s.pre_triggers_dropped:
         lines.append(f"pre-triggers dropped by the precision check: {s.pre_triggers_dropped}")
     if s.skipped:

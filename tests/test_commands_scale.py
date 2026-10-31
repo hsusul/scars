@@ -137,7 +137,8 @@ def big_store(home):
 
 def add_lesson(db, i):
     sig = f"tool{i}: error: unknown flag --bad{i}"
-    store.create_lesson(
+    at = NOW - (i % 60) * DAY
+    lesson_id = store.create_lesson(
         db,
         text=LessonText(f"tool{i} --bad{i}", f"run `tool{i} --good` instead", render.MINED_REASON),
         scope=RepoScope("app"),
@@ -145,7 +146,13 @@ def add_lesson(db, i):
         triggers=[Trigger(TriggerKind.ERROR, sig, Stage.REPAIR)],
         fingerprint=f"fp-{i}",
         actor="miner",
-        at=NOW - (i % 60) * DAY,
+        at=at,
+    )
+    store.add_observation(
+        db,
+        store.Observation(
+            lesson_id, "claude", f"s{i}", f"tu{i}", f"tool{i} --bad{i}", sig, f"tool{i} --good", at
+        ),
     )
 
 

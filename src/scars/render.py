@@ -771,6 +771,17 @@ def render(
     )
 
 
+def render_problem(
+    lesson: Lesson, *, known_commands: frozenset[str], registered_repos: Sequence[str] = ()
+) -> RejectedText | None:
+    """The rule that keeps `lesson` from rendering, or None when `render` would show it."""
+    try:
+        _recheck(lesson, known_commands, registered_repos)
+    except RejectedText as exc:
+        return exc
+    return None
+
+
 # ---------------------------------------------------------------- budgets
 
 

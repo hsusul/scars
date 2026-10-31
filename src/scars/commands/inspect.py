@@ -17,7 +17,16 @@ import sqlite3
 from datetime import datetime
 
 from scars import hook, render, store, telemetry
-from scars.commands import Context, UserError, get_lesson, lessons_db, shown, shown_json, telemetry_db
+from scars.commands import (
+    Context,
+    UserError,
+    get_lesson,
+    lessons_db,
+    shown,
+    shown_json,
+    telemetry_db,
+    unrenderable,
+)
 from scars.match import InvalidTrigger, Precision, precision
 from scars.mine import known_dir
 from scars.mine.outcomes import recorded
@@ -80,6 +89,7 @@ def cmd_ls(args: argparse.Namespace, ctx: Context) -> int:
     repo = RepoId(args.repo) if args.repo else None
     with lessons_db(readonly=True) as db:
         lessons, problems = store.read_lessons(db, statuses=statuses, repo_id=repo)
+        refused = unrenderable(db, lessons)
         try:
             last_seen = store.lessons_last_seen(db) if args.stale else {}
         except (ValueError, TypeError) as exc:
@@ -99,6 +109,10 @@ def cmd_ls(args: argparse.Namespace, ctx: Context) -> int:
         ctx.print(f"{'ID':<11} {'STATUS':<11} {'LEVEL':<4} PIN {'SEEN':>4}  SCOPE  AVOID")
     for lesson in lessons:
         ctx.print(row(lesson))
+    shown_ids = {le.id for le in lessons}
+    for lesson_id, exc in refused:
+        if lesson_id in shown_ids:
+            ctx.print(f"cannot render: lesson {shown(lesson_id)} breaks {exc.rule} in {exc.field}")
     for lesson_id, reason in problems:
         ctx.print(f"problem: lesson {shown(lesson_id)} cannot be read: {shown(reason)}")
     return 1 if problems else 0

@@ -47,9 +47,25 @@ def test_healthy_doctor(home, user_home, monkeypatch):
         "ok    kill switch: off\n"
         f"ok    store location: {home}\n"
         "ok    event chain: hash chain and replay match the lessons\n"
+        "ok    lessons render: every active lesson renders\n"
         "ok    canary: lesson returned in 7 ms\n",
         "",
     )
+
+
+def test_doctor_fails_on_an_active_lesson_that_cannot_render(home, user_home, monkeypatch):
+    stub(monkeypatch)
+    seed(home)
+    legacy = seed(
+        home,
+        avoid="npm tset",
+        passing="npm test",
+        sig="npm ERR! Unknown command: tset",
+        reason="npm ERR! tset",
+    )
+    code, out, _ = run(make_ctx(user_home), "doctor")
+    assert code == 1
+    assert f"FAIL  lessons render: {legacy}: mined.reason_template in reason\n" in out
 
 
 def test_each_failing_check_makes_doctor_exit_1(home, user_home, monkeypatch):
@@ -71,6 +87,7 @@ def test_each_failing_check_makes_doctor_exit_1(home, user_home, monkeypatch):
         "FAIL  kill switch: on: hooks do nothing (scars on)",
         f"FAIL  store location: {home}: it is on an external disk",
         f"FAIL  event chain: {lesson_id}: avoid is tampered in lessons but pytest --frobnicate from events",
+        f"FAIL  lessons render: {lesson_id}: mined.program_mismatch in instead",
         "FAIL  canary: no lesson",
     ]
 

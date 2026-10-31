@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scars import hook, paths, store, telemetry
-from scars.commands import Context, clean, connect_readonly, shown
+from scars.commands import Context, clean, connect_readonly, shown, unrenderable
 from scars.commands.import_guard import create_pinned
 from scars.commands.inspect import when
 from scars.model import Harness, HitOutcome, LessonText, Stage, Trigger, TriggerKind
@@ -248,6 +248,7 @@ def _store_checks(ctx: Context, scars_home: Path, location: Callable[[Path], str
         db = connect_readonly(lessons, "lessons")
         try:
             problems = store.verify(db)
+            refused = unrenderable(db, store.read_lessons(db)[0])
         finally:
             db.close()
     except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
@@ -259,6 +260,12 @@ def _store_checks(ctx: Context, scars_home: Path, location: Callable[[Path], str
         checks.append(Check("event chain", False, listed + more))
     else:
         checks.append(Check("event chain", True, "hash chain and replay match the lessons"))
+    if refused:
+        listed = "; ".join(f"{shown(lesson_id)}: {exc.rule} in {exc.field}" for lesson_id, exc in refused[:3])
+        more = f"; and {len(refused) - 3} more" if len(refused) > 3 else ""
+        checks.append(Check("lessons render", False, listed + more))
+    else:
+        checks.append(Check("lessons render", True, "every active lesson renders"))
     return checks
 
 

@@ -243,6 +243,7 @@ PAYLOAD_KEYS: dict[EventType, dict[str, PayloadKey]] = {
         "trust_class": PayloadKey(str),
     },
     EventType.SUPERSEDED: {"superseded_by": PayloadKey(str, required=True)},
+    EventType.RETIRED: {"reason": PayloadKey(str)},
 }
 """The payload keys each event accepts. Events not listed take an empty payload."""
 

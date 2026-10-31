@@ -10,6 +10,8 @@
 4. Build each pair's candidate (see `build`), in order of the fixing call's time. A new fingerprint
    creates a candidate, which waits in the inbox for a human; an existing one gets an `observed` event
    the first time a session sights it, so `sessions_seen` counts sessions, not repeats within one.
+   An existing lesson that is not `human` and no longer passes the render rules (text mined before a
+   rule change) is retired with the rule it breaks, and the pair creates a fresh candidate instead.
    Each pair adds one observation. A pair's lesson write, precision run and observation commit in one
    transaction, and the observation, unique per failed tool use id, marks the pair processed, so a crash
    never counts a sighting twice.
@@ -41,7 +43,7 @@ from scars import hook, policy, render, store
 from scars.match import InvalidTrigger, Precision, RecordedCall
 from scars.mine import build, calls, claude, codex, outcomes, pairs
 from scars.mine.replay import CallIndex
-from scars.model import ErrorSignature, EventType, Harness, RepoId, Trigger
+from scars.model import ErrorSignature, EventType, Harness, RepoId, Trigger, TrustClass
 
 DAY = 86400.0
 
@@ -69,6 +71,8 @@ class Summary:
     pairs: int = 0
     candidates_created: int = 0
     observations: int = 0
+    retired_unrenderable: int = 0
+    """Mined lessons retired because their stored text no longer renders; fresh candidates replace them."""
     pre_triggers_dropped: int = 0
     expired: int = 0
     outcomes_written: int = 0
@@ -287,6 +291,24 @@ def _write_pair(
 ) -> None:
     at = pair.passing.at
     existing = store.get_lesson_by_fingerprint(db, candidate.fingerprint)
+    if existing is not None and existing.trust_class is not TrustClass.HUMAN:
+        problem = render.render_problem(
+            existing,
+            known_commands=store.passing_inputs(db, [existing.id])[existing.id],
+            registered_repos=store.repo_names(db),
+        )
+        if problem is not None:
+            store.apply_event(
+                db,
+                lesson_id=existing.id,
+                event=EventType.RETIRED,
+                expected_revision=existing.revision,
+                actor=policy.ACTOR,
+                payload={"reason": f"cannot render: {problem.rule}"},
+                at=at,
+            )
+            counts["retired_unrenderable"] += 1
+            existing = None
     if existing is not None:
         lesson_id, revision = existing.id, existing.revision
         if not store.observed_in_session(db, lesson_id, pair.failed.harness, pair.failed.session_id):
@@ -451,6 +473,7 @@ def _run(
         pairs=len(found),
         candidates_created=counts["candidates_created"],
         observations=counts["observations"],
+        retired_unrenderable=counts["retired_unrenderable"],
         pre_triggers_dropped=counts["pre_triggers_dropped"],
         expired=expired,
         outcomes_written=result.outcomes,
