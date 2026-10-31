@@ -24,7 +24,9 @@ One run, in order:
    are rendered with their own observed passing commands and fitted to the stage budget.
 6. The output is printed and flushed.
 7. One telemetry transaction writes a hit row per shown lesson (or one `no_match` or `blocked` row), the
-   new shown rows, a freshly resolved cache row and, on compaction, the new epoch. If the file is busy,
+   new shown rows, a freshly resolved cache row and, on compaction, the new epoch, which moves even when
+   lessons.db is unavailable. An event the adapter ignores gets one `ignored` row and reads no lessons.
+   If the file is busy,
    all of it is dropped.
 
 Any exception prints nothing, records an `error` hit when telemetry is available, and exits 0. The
@@ -580,13 +582,14 @@ def _hit(
     shown: Shown | None = None,
     trigger_key: str | None = None,
     error_class: str | None = None,
+    session_id: str = "",
 ) -> telemetry.Hit:
     return telemetry.Hit(
         at=now,
         harness=harness.value,
         harness_version=(event.harness_version or None) if event else None,
         model_id=(event.model_id or None) if event else None,
-        session_id=event.session_id if event else "",
+        session_id=event.session_id if event else session_id,
         tool_use_id=event.tool_use_id if event else None,
         event=event.event.value if event else "unknown",
         stage=STAGES[event.event].value if event else None,
@@ -700,6 +703,17 @@ def run(
             payload = read_payload(stdin)
             event = ADAPTERS[harness].parse(event_name, payload)
         except Ignored:
+            tele = telemetry.connect(_telemetry_path())
+            session = payload.get("session_id")
+            hit = _hit(
+                harness,
+                None,
+                HitOutcome.IGNORED,
+                now=time.time(),
+                latency_ms=elapsed_ms(),
+                session_id=session if isinstance(session, str) else "",
+            )
+            telemetry.write(tele, telemetry.Writes((hit,)))
             return
         except (MalformedInput, BadStdin) as exc:
             error_class = exc.error_class if isinstance(exc, BadStdin) else "malformed_input"
@@ -730,7 +744,10 @@ def run(
             hit = _hit(
                 harness, event, HitOutcome.ERROR, now=now, latency_ms=elapsed_ms(), error_class=error_class
             )
-            telemetry.write(tele, telemetry.Writes((hit,)))
+            writes = telemetry.Writes(
+                (hit,), session_id=event.session_id, epoch=state.epoch, bump_epoch=compaction
+            )
+            telemetry.write(tele, writes)
             raise
         if decision.output is not None:
             stdout.write(json.dumps(decision.output))

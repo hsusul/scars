@@ -239,6 +239,7 @@ SHELL_HOME_REASON = (
     "scars: this command names the scars home directory and is not a plain read (cat, ls, grep and the "
     "like, with no `>`). Lessons change only through scars commands a human runs at a terminal."
 )
+IGNORED_HIT = ("claude", "s1", None, "unknown", None, None, None, None, "ignored", 0, None)
 GATE_NO_MATCH = ("pre_tool", "gate", None, None, None, "no_match", 0, None)
 GATE_DENY = ("pre_tool", "gate", None, None, "agent_deny", "blocked", 0, None)
 
@@ -392,12 +393,12 @@ def test_claude_post_compact_prints_nothing_and_leaves_the_epoch_alone(env):
     add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR, status="pinned")
     payload = {"session_id": "s1", "cwd": str(repo), "hook_event_name": "PostCompact", "trigger": "auto"}
     assert run_hook(home, "claude", "PostCompact", payload).stdout == ""
-    assert hits(home) == []
+    assert hits(home) == [IGNORED_HIT]
     assert rows(home, "select * from session_epoch") == []
     # The same session's SessionStart compact is what moves the epoch and records a hit.
     assert run_hook(home, "claude", "SessionStart", session_start(repo, "compact")).stdout != ""
     assert rows(home, "select session_id, context_epoch from session_epoch") == [("s1", 1)]
-    assert [h[3] for h in hits(home)] == ["compact"]
+    assert [h[3] for h in hits(home)] == ["unknown", "compact"]
 
 
 def test_user_prompt_submit_delivers_a_pinned_prompt_lesson(env):
@@ -444,7 +445,18 @@ def test_codex_post_tool_use_with_a_nonzero_exit_delivers_repair(env):
     ]
     success = {**payload, "tool_use_id": "call_2", "tool_response": "all good"}
     assert run_hook(home, "codex", "PostToolUse", success).stdout == ""
-    assert len(hits(home)) == 1
+    assert rows(home, "select harness, session_id, model_id, event, outcome, lesson_id from hits") == [
+        ("codex", "thr_1", "gpt-5.5-codex", "tool_failed", "shown", lesson_id),
+        ("codex", "thr_1", None, "unknown", "ignored", None),
+    ]
+
+
+def test_a_cursor_event_is_ignored_and_recorded_without_reading_lessons(env):
+    home, repo = env
+    (home / "lessons.db").write_bytes(b"not a database")
+    payload = {**session_start(repo, "startup"), "cursor_version": "1.2"}
+    assert run_hook(home, "claude", "SessionStart", payload).stdout == ""
+    assert hits(home) == [IGNORED_HIT]
 
 
 def test_codex_session_start_compact_reinjects_pinned_lessons(env):
@@ -735,7 +747,9 @@ def test_every_fixture_replays_through_the_hook(tmp_path, harness, event_name, c
             (harness, e["session_id"], e["tool_use_id"], e["event"], STAGES[e["event"]], *NO_LESSON)
         ]
     elif case["error"] == "Ignored":
-        assert hits(home) == []
+        assert [(h[0], h[1], h[3], h[8]) for h in hits(home)] == [
+            (harness, case["stdin"].get("session_id", ""), "unknown", "ignored")
+        ]
     else:
         assert [(h[0], h[3], h[8], h[10]) for h in hits(home)] == [
             (harness, "unknown", "error", "malformed_input")
@@ -916,6 +930,14 @@ def test_missing_lessons_db_prints_nothing_quickly_and_records_an_error(env):
     home, repo = env
     assert_silent_and_fast(run_hook(home, "claude", "PostToolUseFailure", claude_failure(repo)))
     assert outcomes(home) == [("error", "lessons_unavailable")]
+
+
+def test_a_compaction_moves_the_epoch_even_when_the_lessons_store_is_missing(env):
+    home, repo = env
+    for _ in range(2):
+        assert_silent_and_fast(run_hook(home, "claude", "SessionStart", session_start(repo, "compact")))
+    assert rows(home, "select session_id, context_epoch from session_epoch") == [("s1", 2)]
+    assert outcomes(home) == [("error", "lessons_unavailable"), ("error", "lessons_unavailable")]
 
 
 @NOT_ROOT
