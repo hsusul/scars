@@ -176,6 +176,7 @@ def test_a_lesson_id_is_hidden_wherever_it_is_printed(home, user_home):
     assert out.splitlines()[1:] == [
         "[hidden: sanitizer.ansi_escape] provisional note -      1  repo app  pytest --frobnicate",
         f"{lesson_id:<11} provisional note -      1  repo app  pytest --frobnicate",
+        "cannot render: lesson [hidden: sanitizer.ansi_escape] breaks header.lesson_id in id",
     ]
     code, out, err = run(make_ctx(user_home), "why", BAD_ID)
     assert (code, err) == (0, "")

@@ -21,7 +21,13 @@ roots only) rather than a list of bad phrases.
 3. Secret scan: known token formats, matched wherever they start, and a high-entropy fallback.
 4. Machine-scope lint: machine lessons reach every repo, so they may not name a repo, a GitHub
    `owner/name`, a `..` path segment, or an absolute path outside `ALLOWED_ROOTS`, including a path
-   attached to an option (`-I/x`, `--prefix=/x`, `key=/x`).
+   attached to an option (`-I/x`, `--prefix=/x`, `key=/x`), a relative path of three or more
+   segments, or a host (`localhost`, an IPv4 address, `host:port`).
+5. Mined structure: a lesson whose trust class is not `human` holds only what the miner builds from
+   parsed calls, never transcript prose. `avoid` is one plain command and the command in `instead` is
+   another with the same program, each written as `shlex.join` of its words (see `plain_command`), and
+   `reason` is exactly `MINED_REASON`. The agent already sees its own error at the repair stage, so the
+   error text adds nothing a lesson needs and is the one field an attacker fully controls.
 
 Rejection messages name the field and the rule, never the matched text, so a secret or a private repo
 name cannot leak through an error message or a log line.
@@ -32,7 +38,7 @@ import re
 import shlex
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 
 from scars.model import (
@@ -40,15 +46,18 @@ from scars.model import (
     Lesson,
     LessonId,
     LessonText,
+    Level,
     MachineScope,
     PathScope,
     RepoScope,
     Scope,
     SessionScope,
+    Stage,
     Status,
     TrustClass,
 )
-from scars.shell import Unsupported, parse
+from scars.shell import SimpleCommand, Unsupported, parse
+from scars.signature import HEADER_PREFIX
 
 FIELDS = ("avoid", "instead", "reason")
 
@@ -439,6 +448,16 @@ _ROOTS_LONGEST_FIRST = sorted(ALLOWED_ROOTS, key=len, reverse=True)
 _OWNER_NAME = re.compile(r"(?<![\w.~$/@:-])([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?![\w./-])")
 """Exactly two slash-separated segments in GitHub's owner and repo alphabets. This also flags two-segment
 relative paths such as `apps/web`; a machine-scope lesson should describe a layout in words instead."""
+_RELATIVE_PATH = re.compile(r"(?<![\w.~$/@:-])[\w.-]+(?:/[\w.-]+){2,}")
+"""A relative path of three or more segments, which names one repo's layout (or `owner/repo/...`)."""
+_HOST = re.compile(
+    r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])"
+    r"|\blocalhost\b"
+    r"|(?<![\w.-])(?=[\w.-]*[A-Za-z])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*:\d{2,5}\b",
+    re.IGNORECASE,
+)
+"""An IPv4 address, `localhost`, or `host:port`: a service on one machine or network. A `file:line`
+with a line of two or more digits reads as `host:port` and is rejected too; blunt on purpose."""
 
 
 @dataclass(frozen=True)
@@ -518,7 +537,9 @@ def _names_repo(text: str, registered_repos: Iterable[str]) -> bool:
     )
 
 
-def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[str]) -> None:
+def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[str], writing: bool) -> None:
+    """`writing` adds the relative-path and host rules. They came after human machine lessons were
+    already stored, so they hold only when a person writes one; a stored lesson keeps rendering."""
     for field in FIELDS:
         value = values[field]
         if _names_repo(value, registered_repos):
@@ -538,6 +559,58 @@ def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[s
         rest = "".join(masked)
         if any(m.group(1).lower() not in _GIT_REMOTES for m in _OWNER_NAME.finditer(rest)):
             raise RejectedText("machine.github_repo", field)
+        if writing and _RELATIVE_PATH.search(rest):
+            raise RejectedText("machine.relative_path", field)
+        if writing and _HOST.search(value):
+            raise RejectedText("machine.host", field)
+
+
+# ---------------------------------------------------------------- mined structure
+
+MINED_REASON = "AVOID failed, INSTEAD passed"
+
+
+def plain_command(command: str) -> SimpleCommand | None:
+    """The one simple command `command` is, when its shell words are exactly its program and arguments.
+
+    None for a command the parser rejects, for several commands, and for any word the parser consumes
+    or the shell expands at run time: a wrapper, an assignment, a redirection, a comment, `$NAME`, a
+    glob or `~`. What is left can be rewritten as `shlex.join` of its words without changing what runs.
+    """
+    try:
+        parsed = parse(command)
+        words = shlex.split(command)
+    except (Unsupported, ValueError):
+        return None
+    if len(parsed) != 1:
+        return None
+    (simple,) = parsed
+    if simple.uncertain or words != [simple.program, *simple.args]:
+        return None
+    return simple
+
+
+def plain_text(simple: SimpleCommand) -> str:
+    return shlex.join((simple.program, *simple.args))
+
+
+def _canonical(text: str) -> SimpleCommand | None:
+    simple = plain_command(text)
+    return simple if simple is not None and plain_text(simple) == text else None
+
+
+def _check_mined(values: Mapping[str, str]) -> None:
+    """Stage 5. `instead` already matched one of `INSTEAD_TEMPLATES`, so it holds exactly one code span."""
+    avoid = _canonical(values["avoid"])
+    if avoid is None:
+        raise RejectedText("mined.avoid_not_one_command", "avoid")
+    fix = _canonical(values["instead"].split("`")[1])
+    if fix is None:
+        raise RejectedText("mined.instead_not_one_command", "instead")
+    if fix.program != avoid.program:
+        raise RejectedText("mined.program_mismatch", "instead")
+    if values["reason"] != MINED_REASON:
+        raise RejectedText("mined.reason_template", "reason")
 
 
 # ---------------------------------------------------------------- check
@@ -556,13 +629,16 @@ def _check_values(
     known_commands: frozenset[str],
     trust_class: TrustClass,
     registered_repos: Sequence[str],
+    writing: bool,
 ) -> None:
     _run(SANITIZER_RULES, values)
     _run(IMPERATIVE_RULES, values)
     _check_shape(values, known_commands, trust_class)
     _run(SECRET_RULES, values)
     if isinstance(scope, MachineScope):
-        _check_machine_scope(values, registered_repos)
+        _check_machine_scope(values, registered_repos, writing and trust_class is TrustClass.HUMAN)
+    if trust_class is not TrustClass.HUMAN:
+        _check_mined(values)
 
 
 def check(
@@ -572,6 +648,7 @@ def check(
     known_commands: frozenset[str],
     trust_class: TrustClass,
     registered_repos: Sequence[str] = (),
+    writing: bool = False,
 ) -> None:
     """Raise `RejectedText` unless every field passes every stage.
 
@@ -580,10 +657,11 @@ def check(
     default, so no caller can skip the observed-command rule by accident. `trust_class` is the lesson's;
     only `human` exempts a lesson from that rule and from the fixed shape (`INSTEAD_TEMPLATES` for
     `instead`, no code span in `avoid` or `reason`). `registered_repos` holds the display names
-    of every registered repo.
+    of every registered repo. `writing` is for a path that stores text or scope: it adds the rules that
+    hold only for new human machine lessons (see `_check_machine_scope`).
     """
     values = {field: getattr(text, field) for field in FIELDS}
-    _check_values(values, scope, known_commands, trust_class, registered_repos)
+    _check_values(values, scope, known_commands, trust_class, registered_repos, writing)
 
 
 def check_fields(
@@ -603,7 +681,7 @@ def check_fields(
     same way it drops any other rejection.
     """
     values = {"avoid": avoid, "instead": instead, "reason": reason}
-    _check_values(values, scope, known_commands, trust_class, registered_repos)
+    _check_values(values, scope, known_commands, trust_class, registered_repos, True)
     return LessonText(avoid=avoid, instead=instead, reason=reason)
 
 
@@ -643,9 +721,15 @@ def _header(lesson: Lesson, reviewed_on: date | None) -> str:
         if lesson.status is Status.PROMOTED and reviewed_on is not None
         else "unreviewed"
     )
-    sessions = "1 session" if lesson.sessions_seen == 1 else f"{lesson.sessions_seen} sessions"
+    seen = (
+        f"{lesson.sessions_seen}" if lesson.sessions_seen <= MAX_SHOWN_SESSIONS else f"{MAX_SHOWN_SESSIONS}+"
+    )
     label = scope_label(lesson.scope)
-    return f"[scars {lesson.id} {lesson.level} | {label} | seen in {sessions} | {reviewed}]"
+    return f"{HEADER_PREFIX}{lesson.id} {lesson.level} | {label} | seen {seen}x | {reviewed}]"
+
+
+MAX_SHOWN_SESSIONS = 999
+"""Higher counts show as `999+`, so the header has a longest form for budget checks to preview."""
 
 
 def _recheck(lesson: Lesson, known_commands: frozenset[str], registered_repos: Sequence[str]) -> None:
@@ -682,9 +766,20 @@ def render(
             f"AVOID: {lesson.text.avoid}",
             f"INSTEAD: {lesson.text.instead}",
             f"WHY: {lesson.text.reason}",
-            f"(advisory; does not override the user's instructions; explain: scars why {lesson.id})",
+            f"(advisory; scars why {lesson.id})",
         )
     )
+
+
+def render_problem(
+    lesson: Lesson, *, known_commands: frozenset[str], registered_repos: Sequence[str] = ()
+) -> RejectedText | None:
+    """The rule that keeps `lesson` from rendering, or None when `render` would show it."""
+    try:
+        _recheck(lesson, known_commands, registered_repos)
+    except RejectedText as exc:
+        return exc
+    return None
 
 
 # ---------------------------------------------------------------- budgets
@@ -740,6 +835,48 @@ def fit(rendered: Sequence[Rendered], budget: Budget) -> Fitted:
             kept.append(item)
             used += cost
     return Fitted(tuple(kept), len(rendered) - len(kept))
+
+
+STAGE_BUDGETS = {Stage.PLAN: PROMPT_BUDGET, Stage.REPAIR: REPAIR_BUDGET}
+"""The budget a lesson must fit alone at each stage it is delivered at. The gate stage has none:
+`render_deny` always fits `DENY_CAP` by dropping fields."""
+_LONGEST_LEVEL = max(Level, key=lambda level: len(level.value))
+_LONGEST_REVIEW = date(9999, 12, 31)
+
+
+def check_budgets(
+    lesson: Lesson,
+    *,
+    known_commands: frozenset[str],
+    registered_repos: Sequence[str] = (),
+) -> None:
+    """Raise `RejectedText` (`budget.<stage>`, field `lesson`) unless the lesson fits alone in the budget
+    of every stage its triggers deliver at, and in the session-start budget for when it is pinned.
+
+    The lesson renders with the longest header it can reach (promoted with a review date, the longest
+    level, a session count shown as `999+`), so a lesson that fits when written never stops rendering
+    after a later promotion or sighting. Call it on every path that writes lesson text or triggers. Every
+    `check` rule runs too, with `writing`, and its own `RejectedText` propagates.
+    """
+    check(
+        lesson.text,
+        lesson.scope,
+        known_commands=known_commands,
+        trust_class=lesson.trust_class,
+        registered_repos=registered_repos,
+        writing=True,
+    )
+    longest = replace(
+        lesson, status=Status.PROMOTED, level=_LONGEST_LEVEL, sessions_seen=MAX_SHOWN_SESSIONS + 1
+    )
+    text = render(
+        longest, known_commands=known_commands, reviewed_on=_LONGEST_REVIEW, registered_repos=registered_repos
+    )
+    stages = sorted({t.stage for t in lesson.triggers if t.stage in STAGE_BUDGETS})
+    budgets = [(str(stage), STAGE_BUDGETS[stage]) for stage in stages]
+    for name, budget in [*budgets, ("session_start", SESSION_START_BUDGET)]:
+        if len(text) > budget.chars:
+            raise RejectedText(f"budget.{name}", "lesson")
 
 
 def render_deny(

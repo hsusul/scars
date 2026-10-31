@@ -2,6 +2,8 @@
 
 import json
 import os
+import posixpath
+import shlex
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,7 +35,8 @@ class Call:
     """The harness tool name. Shell calls are `Bash` and Codex edits are `apply_patch` in both harnesses."""
     tool_kind: ToolKind
     input: str
-    """The shell command for shell calls, else the tool input as compact JSON, capped at 4 KB."""
+    """The shell command for shell calls, else the tool input as compact JSON, capped at 4 KB. For
+    `cd <dir> && <command>` it is the command alone (see `cd_yield`)."""
     program: str | None
     """For shell calls, the program of the first simple command, or None when the parser rejects it."""
     paths: tuple[str, ...]
@@ -42,6 +45,7 @@ class Call:
     """Output text of a failed call, capped at 4 KB; empty otherwise."""
     at: float
     cwd: str
+    """The directory the call ran in; empty when unknown."""
     model_id: str | None
 
     @property
@@ -124,6 +128,27 @@ def tool_kind(tool: str) -> ToolKind:
     return ToolKind.EDIT if tool in EDIT_TOOLS else ToolKind.OTHER
 
 
+def cd_yield(command: str, cwd: str) -> tuple[str, str] | None:
+    """For a command that is exactly `cd <literal dir> && <one plain simple command>`, that simple command
+    (`shlex.join` of its words) and the directory it runs in, resolved against `cwd`: empty when the
+    directory is relative and `cwd` is not absolute. None for every other command."""
+    try:
+        words = shlex.split(command)
+        parsed = parse(command)
+    except (ValueError, Unsupported):
+        return None
+    if len(words) < 4 or words[0] != "cd" or words[2] != "&&" or len(parsed) != 1:
+        return None
+    (simple,) = parsed
+    plain = not simple.uncertain and simple.cwd_known and simple.cwd == words[1]
+    if not plain or words[3:] != [simple.program, *simple.args]:
+        return None
+    target = words[1]
+    if not target.startswith("/"):
+        target = posixpath.join(cwd, target) if cwd.startswith("/") else ""
+    return shlex.join(words[3:]), posixpath.normpath(target) if target else ""
+
+
 def shell_program(command: str) -> str | None:
     try:
         commands = parse(command)
@@ -166,7 +191,10 @@ def make_call(
     model_id: str | None,
 ) -> Call:
     kind = tool_kind(tool)
-    if kind is ToolKind.SHELL and command is not None:
+    if kind is ToolKind.SHELL and command is not None and (yielded := cd_yield(command, cwd)) is not None:
+        text, cwd = yielded
+        program = shell_program(text)
+    elif kind is ToolKind.SHELL and command is not None:
         text, program = command, shell_program(command)
     else:
         text, program = compact_json(raw_input), None

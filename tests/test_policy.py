@@ -7,8 +7,6 @@ from scars.model import (
     LessonText,
     RepoId,
     RepoScope,
-    SessionId,
-    SessionScope,
     Stage,
     Trigger,
     TriggerKind,
@@ -17,19 +15,6 @@ from scars.model import (
 
 T0 = 1_800_000_000.0
 DAY = 86400.0
-
-
-@pytest.mark.parametrize(
-    ("scope", "trust", "expected"),
-    [
-        (RepoScope(RepoId("r")), TrustClass.OWN_CODE, True),
-        (RepoScope(RepoId("r")), TrustClass.THIRD_PARTY_REPO, False),
-        (RepoScope(RepoId("r")), TrustClass.WEB, False),
-        (SessionScope(SessionId("s")), TrustClass.OWN_CODE, False),
-    ],
-)
-def test_only_own_code_repo_candidates_become_provisional(scope, trust, expected):
-    assert policy.provisional_on_first_sighting(scope, trust) is expected
 
 
 @pytest.mark.parametrize(

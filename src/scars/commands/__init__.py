@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TextIO
 
 from scars import paths, render, store, telemetry
-from scars.model import Lesson, LessonId
+from scars.model import ACTIVE_STATUSES, Lesson, LessonId
 
 
 class UserError(Exception):
@@ -316,6 +316,34 @@ def get_lesson(db: sqlite3.Connection, lesson_id: str) -> Lesson:
     if lesson is None:
         raise UserError(f"no lesson {shown(lesson_id)}")
     return lesson
+
+
+_BUDGET_CHARS = {f"budget.{stage}": b.chars for stage, b in render.STAGE_BUDGETS.items()} | {
+    "budget.session_start": render.SESSION_START_BUDGET.chars
+}
+
+
+def rejection(exc: render.RejectedText) -> str:
+    """Why `render` refused a lesson, in words for the person who wrote it."""
+    chars = _BUDGET_CHARS.get(exc.rule)
+    if chars is None:
+        return f"{exc.field} breaks {exc.rule}"
+    stage = exc.rule.removeprefix("budget.").replace("_", " ")
+    return f"the lesson is over the {stage} budget of {chars} characters"
+
+
+def unrenderable(db: sqlite3.Connection, lessons: list[Lesson]) -> list[tuple[LessonId, render.RejectedText]]:
+    """Each active lesson in `lessons` that `render` refuses, with the rule it breaks, so no lesson
+    drops out of delivery without a word."""
+    active = [le for le in lessons if le.status in ACTIVE_STATUSES]
+    known = store.passing_inputs(db, [le.id for le in active])
+    repos = store.repo_names(db)
+    found = []
+    for lesson in active:
+        problem = render.render_problem(lesson, known_commands=known[lesson.id], registered_repos=repos)
+        if problem is not None:
+            found.append((lesson.id, problem))
+    return found
 
 
 def telemetry_db() -> sqlite3.Connection | None:

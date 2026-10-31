@@ -14,7 +14,10 @@ from scars.model import (
     RepoScope,
     SessionId,
     SessionScope,
+    Stage,
     Status,
+    Trigger,
+    TriggerKind,
     TrustClass,
 )
 from scars.render import (
@@ -26,6 +29,7 @@ from scars.render import (
     RejectedText,
     Rendered,
     check,
+    check_budgets,
     check_fields,
     fit,
     normalize_command,
@@ -51,7 +55,8 @@ KNOWN = frozenset(
 """Commands that ran successfully on this machine, as the miner and hook pass them."""
 REPOS = ("openwhispr", "client-app")
 CLEAN = LessonText(avoid="cd into a subdirectory", instead="run `git status`", reason="depth")
-FOOTER = "(advisory; does not override the user's instructions; explain: scars why L-7c2e)"
+FOOTER = "(advisory; scars why L-7c2e)"
+MINED_WHY = "AVOID failed, INSTEAD passed"
 
 # Secret-shaped fixtures are assembled at runtime so the source file itself holds no token literal.
 GHP = "ghp" + "_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
@@ -79,7 +84,7 @@ def lesson(**overrides) -> Lesson:
             instead='run `cd "$(git rev-parse --show-toplevel)"` first',
             reason="worktree roots do not contain apps/ at the same depth",
         ),
-        trust_class=TrustClass.OWN_CODE,
+        trust_class=TrustClass.HUMAN,
         triggers=(),
         fingerprint="f",
         sessions_seen=7,
@@ -99,7 +104,7 @@ def reject(field: str, value: str, scope=REPO, known=KNOWN, trust=OWN) -> str:
     return caught.value.rule
 
 
-def body(text: LessonText, scope=MACHINE, known=KNOWN, trust=OWN) -> list[str]:
+def body(text: LessonText, scope=MACHINE, known=KNOWN, trust=HUMAN) -> list[str]:
     """The AVOID, INSTEAD and WHY lines of the rendered lesson."""
     stored = lesson(scope=scope, text=text, trust_class=trust)
     rendered = render(stored, known_commands=known, registered_repos=REPOS)
@@ -120,7 +125,7 @@ REALISTIC = pytest.mark.parametrize(
                 reason="worktree roots do not contain apps/ at the same depth",
             ),
             'cd "$(git rev-parse --show-toplevel)"',
-            "[scars L-7c2e note | repo openwhispr | seen in 7 sessions | reviewed 2026-10-30]\n"
+            "[scars L-7c2e note | repo openwhispr | seen 7x | reviewed 2026-10-30]\n"
             "AVOID: cd apps/web from a worktree root\n"
             'INSTEAD: run `cd "$(git rev-parse --show-toplevel)"` first\n'
             "WHY: worktree roots do not contain apps/ at the same depth\n" + FOOTER,
@@ -133,7 +138,7 @@ REALISTIC = pytest.mark.parametrize(
                 reason="virtualenv shebang lines break when the path holds a space",
             ),
             "uv run tox -e py311",
-            "[scars L-7c2e note | machine | seen in 7 sessions | reviewed 2026-10-30]\n"
+            "[scars L-7c2e note | machine | seen 7x | reviewed 2026-10-30]\n"
             'AVOID: running tox inside "/Volumes/990 Pro/OpenSource/my app"\n'
             "INSTEAD: run `uv run tox -e py311` instead\n"
             "WHY: virtualenv shebang lines break when the path holds a space\n" + FOOTER,
@@ -146,7 +151,7 @@ REALISTIC = pytest.mark.parametrize(
                 reason="simulator UDIDs change when a device is erased or recreated",
             ),
             "xcrun simctl list devices",
-            "[scars L-7c2e note | machine | seen in 7 sessions | reviewed 2026-10-30]\n"
+            "[scars L-7c2e note | machine | seen 7x | reviewed 2026-10-30]\n"
             "AVOID: reusing a simulator UDID from an older session\n"
             "INSTEAD: run `xcrun simctl list devices` first\n"
             "WHY: simulator UDIDs change when a device is erased or recreated\n" + FOOTER,
@@ -159,7 +164,7 @@ REALISTIC = pytest.mark.parametrize(
                 reason="command not found: pdftoppm ships in the poppler formula",
             ),
             "brew install poppler",
-            "[scars L-7c2e note | machine | seen in 7 sessions | reviewed 2026-10-30]\n"
+            "[scars L-7c2e note | machine | seen 7x | reviewed 2026-10-30]\n"
             "AVOID: calling pdftoppm when it is not installed\n"
             "INSTEAD: run `brew install poppler`\n"
             "WHY: command not found: pdftoppm ships in the poppler formula\n" + FOOTER,
@@ -186,7 +191,7 @@ def test_realistic_lessons_are_rejected_when_their_command_was_not_observed(scop
         check(text, scope, known_commands=others, trust_class=OWN, registered_repos=REPOS)
     assert (caught.value.rule, caught.value.field) == ("lint.instead_unobserved_command", "instead")
     with pytest.raises(RejectedText) as caught:
-        render(lesson(scope=scope, text=text), known_commands=others, registered_repos=REPOS)
+        render(lesson(scope=scope, text=text, trust_class=OWN), known_commands=others, registered_repos=REPOS)
     assert caught.value.rule == "lint.instead_unobserved_command"
 
 
@@ -231,7 +236,8 @@ def test_instead_templates_are_fixed_and_each_one_passes_with_an_observed_comman
     )
     for template in INSTEAD_TEMPLATES:
         instead = template.format(command=normalize_command("  uv   sync "))
-        assert check_fields("a", instead, "c", REPO, known_commands=KNOWN, trust_class=OWN).instead == instead
+        text = check_fields("uv lock", instead, MINED_WHY, REPO, known_commands=KNOWN, trust_class=OWN)
+        assert text.instead == instead
 
 
 # ---------------------------------------------------------------- accepted near-misses
@@ -279,7 +285,8 @@ def test_human_near_misses_render_in_machine_scope_and_other_trust_classes_need_
         ("reason", "the path /Volumes/990 Pro/OpenSource holds every clone"),
         ("reason", "~/.scars/lessons.db, /usr/local/bin, /tmp/build and /opt/homebrew are fine"),
         ("reason", "NODE_OPTIONS and test_render_budget_fits_exact_boundary are ordinary names"),
-        ("reason", "internationalization of src/scars/render.py and tokenizer.json"),
+        ("reason", "internationalization of render.py and tokenizer.json"),
+        ("reason", "retry at 10:30, after version 1.2.3"),
         ("reason", "risk-free, task-runner and disk-usage are words"),
         ("reason", "AKIA alone is not a key, and process.env is code"),
         ("reason", "a rule override in ruff config is fine"),
@@ -292,10 +299,9 @@ def test_human_near_misses_render_in_machine_scope_and_other_trust_classes_need_
         ("reason", "PATH=/usr/bin:/opt/homebrew/bin"),
     ],
 )
-@pytest.mark.parametrize("trust", [OWN, HUMAN])
-def test_near_misses_render_in_machine_scope(field, value, trust):
+def test_near_misses_render_in_machine_scope(field, value):
     text = replace(CLEAN, **{field: value})
-    assert body(text, trust=trust) == [
+    assert body(text) == [
         f"AVOID: {text.avoid}",
         f"INSTEAD: {text.instead}",
         f"WHY: {text.reason}",
@@ -472,6 +478,10 @@ def test_hex_tops_out_at_four_bits_so_a_full_sha_never_trips_entropy():
         ("reason", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig", "secret.jwt"),
         ("reason", "clone //alice:hunter2@host", "secret.url_userinfo"),
         ("reason", "-----BEGIN CERTIFICATE-----", "secret.pem_header"),
+        ("reason", "key AIza" + "SyA1b2C3d4E5f6G7h8I9j0", "secret.google_api_key"),
+        ("reason", "npm" + "_" + "abcdefghij0123456789", "secret.npm_token"),
+        ("reason", "sk" + "_live_" + "abc", "secret.stripe_key"),
+        ("reason", "rk" + "_test_" + "abc", "secret.stripe_key"),
         ("reason", "value " + RANDOM_24, "secret.high_entropy"),
     ],
 )
@@ -559,13 +569,40 @@ def test_machine_scope_lint(value, rule):
     assert body(text, scope=REPO)[2] == f"WHY: {value}"
 
 
+WRITE_TIME_MACHINE_LINT = [
+    ("see apps/web/src for the config", "machine.relative_path"),
+    ("hsusul/widgets/tree/main has it", "machine.relative_path"),
+    ("./apps/web/src holds it", "machine.relative_path"),
+    ("start the server on localhost:8080 first", "machine.host"),
+    ("connect to db.internal:5432", "machine.host"),
+    ("check 10.0.0.1 is up", "machine.host"),
+    ("open 192.168.1.5/admin", "machine.host"),
+]
+
+
+@pytest.mark.parametrize(("value", "rule"), WRITE_TIME_MACHINE_LINT)
+def test_a_human_writing_a_machine_lesson_may_not_name_a_relative_path_or_host(value, rule):
+    with pytest.raises(RejectedText) as caught:
+        check_fields(CLEAN.avoid, CLEAN.instead, value, MACHINE, known_commands=KNOWN, trust_class=HUMAN)
+    assert (caught.value.rule, caught.value.field) == (rule, "reason")
+    stored = lesson(scope=MACHINE, text=replace(CLEAN, reason=value), trust_class=HUMAN)
+    with pytest.raises(RejectedText) as caught:
+        check_budgets(stored, known_commands=KNOWN, registered_repos=REPOS)
+    assert (caught.value.rule, caught.value.field) == (rule, "reason")
+
+
+@pytest.mark.parametrize(("value", "rule"), WRITE_TIME_MACHINE_LINT)
+def test_an_existing_human_machine_lesson_naming_a_relative_path_or_host_still_renders(value, rule):
+    assert body(replace(CLEAN, reason=value))[2] == f"WHY: {value}"
+
+
 # ---------------------------------------------------------------- check_fields
 
 
 def test_check_fields_returns_the_text():
     assert check_fields(
-        "a", "run `git status`", "c", REPO, known_commands=KNOWN, trust_class=OWN
-    ) == LessonText(avoid="a", instead="run `git status`", reason="c")
+        "git log", "run `git status`", MINED_WHY, REPO, known_commands=KNOWN, trust_class=OWN
+    ) == LessonText(avoid="git log", instead="run `git status`", reason=MINED_WHY)
 
 
 @pytest.mark.parametrize(
@@ -635,7 +672,12 @@ def test_quotes_cannot_hide_inline_code_even_in_an_observed_command(instead, rul
 
 def test_an_observed_command_is_accepted_exactly():
     text = check_fields(
-        "a", "run `npm run build`", "c", REPO, known_commands=frozenset({"npm run build"}), trust_class=OWN
+        "npm run biuld",
+        "run `npm run build`",
+        MINED_WHY,
+        REPO,
+        known_commands=frozenset({"npm run build"}),
+        trust_class=OWN,
     )
     assert text.instead == "run `npm run build`"
 
@@ -671,9 +713,8 @@ def test_normalize_command_collapses_whitespace_outside_quotes_only(command, nor
 
 def test_both_sides_are_normalized_before_the_exact_comparison():
     known = frozenset({"  uv   sync "})
-    assert check_fields("a", "run `uv sync`", "c", REPO, known_commands=known, trust_class=OWN).instead == (
-        "run `uv sync`"
-    )
+    text = check_fields("uv lock", "run `uv sync`", MINED_WHY, REPO, known_commands=known, trust_class=OWN)
+    assert text.instead == "run `uv sync`"
     quoted = frozenset({'git commit -m "a  b"'})
     with pytest.raises(RejectedText) as caught:
         check_fields("a", 'run `git commit -m "a b"`', "c", REPO, known_commands=quoted, trust_class=OWN)
@@ -759,16 +800,16 @@ def test_mined_avoid_and_reason_shapes_stay_allowed():
     text = check_fields(
         "npm run biuld",
         "run `npm run build` instead",
-        "npm ERR! Missing script: biuld",
+        MINED_WHY,
         REPO,
         known_commands=frozenset({"npm run build"}),
         trust_class=OWN,
     )
-    assert text.avoid == "npm run biuld"
+    assert text == LessonText("npm run biuld", "run `npm run build` instead", MINED_WHY)
 
 
 def test_known_commands_and_trust_class_have_no_defaults():
-    stored = lesson(text=replace(CLEAN, instead="run `uv run evil`"))
+    stored = lesson(text=replace(CLEAN, instead="run `uv run evil`"), trust_class=OWN)
     with pytest.raises(TypeError):
         render(stored)
     with pytest.raises(TypeError):
@@ -787,7 +828,7 @@ def test_known_commands_and_trust_class_have_no_defaults():
 def test_render_takes_the_trust_class_from_the_lesson_only():
     text = replace(CLEAN, instead="run `brew install poppler`")
     with pytest.raises(RejectedText) as caught:
-        render_deny(lesson(text=text), known_commands=frozenset())
+        render_deny(lesson(text=text, trust_class=OWN), known_commands=frozenset())
     assert caught.value.rule == "lint.instead_unobserved_command"
     with pytest.raises(TypeError):
         render(lesson(text=text), known_commands=frozenset(), trust_class=HUMAN)
@@ -812,7 +853,7 @@ def test_render_rejects_stored_commands_that_no_longer_check():
 
 def test_render_matches_the_template_exactly():
     assert render(lesson(), reviewed_on=date(2026, 10, 30), known_commands=KNOWN) == (
-        "[scars L-7c2e note | repo openwhispr | seen in 7 sessions | reviewed 2026-10-30]\n"
+        "[scars L-7c2e note | repo openwhispr | seen 7x | reviewed 2026-10-30]\n"
         "AVOID: cd apps/<dir> from a worktree root\n"
         'INSTEAD: run `cd "$(git rev-parse --show-toplevel)"` first\n'
         "WHY: worktree roots do not contain apps/ at the same depth\n" + FOOTER
@@ -824,15 +865,15 @@ def test_render_matches_the_template_exactly():
     [
         (
             {"status": Status.PROVISIONAL},
-            "[scars L-7c2e note | repo openwhispr | seen in 7 sessions | unreviewed]",
+            "[scars L-7c2e note | repo openwhispr | seen 7x | unreviewed]",
         ),
         (
             {"status": Status.CANDIDATE, "sessions_seen": 1, "scope": SessionScope(SessionId("s1"))},
-            "[scars L-7c2e note | session | seen in 1 session | unreviewed]",
+            "[scars L-7c2e note | session | seen 1x | unreviewed]",
         ),
         (
             {"level": Level.WARN, "scope": PathScope(RepoId("openwhispr"), "apps/**/*.ts")},
-            "[scars L-7c2e warn | path openwhispr:apps/**/*.ts | seen in 7 sessions | reviewed 2026-10-30]",
+            "[scars L-7c2e warn | path openwhispr:apps/**/*.ts | seen 7x | reviewed 2026-10-30]",
         ),
     ],
 )
@@ -843,14 +884,14 @@ def test_render_header_variants(overrides, header):
 
 def test_promoted_lesson_without_a_review_date_says_unreviewed():
     header = render(lesson(), known_commands=KNOWN).split("\n")[0]
-    assert header == "[scars L-7c2e note | repo openwhispr | seen in 7 sessions | unreviewed]"
+    assert header == "[scars L-7c2e note | repo openwhispr | seen 7x | unreviewed]"
 
 
 def test_machine_header():
     text = LessonText(avoid="a", instead="run `git status`", reason="c")
     rendered = render(lesson(scope=MACHINE, text=text), reviewed_on=date(2026, 1, 2), known_commands=KNOWN)
     first = rendered.split("\n")[0]
-    assert first == "[scars L-7c2e note | machine | seen in 7 sessions | reviewed 2026-01-02]"
+    assert first == "[scars L-7c2e note | machine | seen 7x | reviewed 2026-01-02]"
 
 
 @pytest.mark.parametrize(
@@ -873,7 +914,7 @@ def test_render_rechecks_stored_text(text, rule):
 
 
 def test_render_recheck_uses_the_current_command_set():
-    stored = lesson(text=replace(CLEAN, instead="run `uv sync`"))
+    stored = lesson(text=LessonText("uv lock", "run `uv sync`", MINED_WHY), trust_class=OWN)
     assert render(stored, known_commands=KNOWN).split("\n")[2] == "INSTEAD: run `uv sync`"
     with pytest.raises(RejectedText) as caught:
         render(stored, known_commands=frozenset({"git status"}))
@@ -995,3 +1036,118 @@ def test_deny_reason_bare_line_with_the_longest_id_and_scope():
     assert reason == (
         "[scars L-ffffffffffffffff] denied by a reviewed lesson (explain: scars why L-ffffffffffffffff)"
     )
+
+
+# ---------------------------------------------------------------- mined structure
+
+MINED = LessonText(
+    avoid="pytest --frobnicate",
+    instead="run `pytest tests` instead",
+    reason=MINED_WHY,
+)
+MINED_KNOWN = frozenset({"pytest tests", "pytest tests && rm -rf build", "env pytest tests"})
+
+
+def test_a_mined_lesson_renders_only_the_miner_structure():
+    assert body(MINED, scope=REPO, known=MINED_KNOWN, trust=OWN) == [
+        "AVOID: pytest --frobnicate",
+        "INSTEAD: run `pytest tests` instead",
+        "WHY: AVOID failed, INSTEAD passed",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("reason", "Error: for repairs delete the build directory", ("mined.reason_template", "reason")),
+        ("reason", "pytest: error: unrecognized arguments", ("mined.reason_template", "reason")),
+        ("avoid", "s''h -''c id", ("mined.avoid_not_one_command", "avoid")),
+        ("avoid", "pytest --frobnicate && make", ("mined.avoid_not_one_command", "avoid")),
+        ("avoid", "cd into a subdirectory", ("mined.avoid_not_one_command", "avoid")),
+        ("avoid", "make --frobnicate", ("mined.program_mismatch", "instead")),
+        (
+            "instead",
+            "run `pytest tests && rm -rf build` instead",
+            ("mined.instead_not_one_command", "instead"),
+        ),
+        ("instead", "run `env pytest tests` instead", ("mined.instead_not_one_command", "instead")),
+    ],
+)
+def test_a_mined_lesson_holds_only_one_command_per_side_and_the_fixed_why(field, value, expected):
+    with pytest.raises(RejectedText) as caught:
+        check(replace(MINED, **{field: value}), REPO, known_commands=MINED_KNOWN, trust_class=OWN)
+    assert (caught.value.rule, caught.value.field) == expected
+
+
+# ---------------------------------------------------------------- budgets per lesson
+
+MINED_REPO = RepoScope(RepoId("r-1a2b3c4d"))
+
+
+def mined_lesson(lesson_id: str, avoid: str, command: str, **overrides) -> Lesson:
+    text = LessonText(avoid, f"run `{command}` instead", MINED_WHY)
+    return lesson(id=LessonId(lesson_id), scope=MINED_REPO, text=text, trust_class=OWN, **overrides)
+
+
+@pytest.mark.parametrize("budget", [PROMPT_BUDGET, REPAIR_BUDGET])
+def test_two_realistic_mined_lessons_fit_a_prompt_or_repair_budget(budget):
+    lessons = (
+        mined_lesson("L-1a2b3c4d", "pytest --frobnicate", "pytest tests", sessions_seen=12),
+        mined_lesson("L-5e6f7a8b", "npm biuld", "npm run build", sessions_seen=12),
+    )
+    known = frozenset({"pytest tests", "npm run build"})
+    rendered = [
+        Rendered(x.id, render(x, known_commands=known, reviewed_on=date(2026, 10, 30))) for x in lessons
+    ]
+    assert rendered[0].text == (
+        "[scars L-1a2b3c4d note | repo r-1a2b3c4d | seen 12x | reviewed 2026-10-30]\n"
+        "AVOID: pytest --frobnicate\n"
+        "INSTEAD: run `pytest tests` instead\n"
+        "WHY: AVOID failed, INSTEAD passed\n"
+        "(advisory; scars why L-1a2b3c4d)"
+    )
+    assert fit(rendered, budget) == Fitted(tuple(rendered), 0)
+
+
+def test_a_session_count_over_999_renders_as_999_plus():
+    stored = mined_lesson("L-1a2b3c4d", "npm biuld", "npm run build", sessions_seen=12345)
+    header = render(stored, known_commands=frozenset({"npm run build"})).split("\n")[0]
+    assert header == "[scars L-1a2b3c4d note | repo r-1a2b3c4d | seen 999+x | unreviewed]"
+
+
+REPAIR_TRIGGER = (Trigger(TriggerKind.ERROR, "E: x", Stage.REPAIR),)
+
+
+@pytest.mark.parametrize(("pad", "rule"), [(198, None), (199, "budget.repair")])
+def test_budget_check_previews_the_longest_header_a_lesson_can_reach(pad, rule):
+    command = "pytest " + "t" * pad
+    stored = mined_lesson(
+        "L-1a2b3c4d",
+        "pytest --frobnicate",
+        command,
+        status=Status.CANDIDATE,
+        sessions_seen=1,
+        triggers=REPAIR_TRIGGER,
+    )
+    known = frozenset({command})
+    assert len(render(stored, known_commands=known)) == 189 + pad
+    if rule is None:
+        assert check_budgets(stored, known_commands=known) is None
+    else:
+        with pytest.raises(RejectedText) as caught:
+            check_budgets(stored, known_commands=known)
+        assert (caught.value.rule, caught.value.field) == (rule, "lesson")
+
+
+def test_budget_check_uses_the_prompt_budget_for_plan_triggers():
+    command = "pytest " + "t" * 199
+    plan = (Trigger(TriggerKind.PROMPT, "run the tests", Stage.PLAN),)
+    stored = mined_lesson("L-1a2b3c4d", "pytest --frobnicate", command, triggers=plan)
+    with pytest.raises(RejectedText) as caught:
+        check_budgets(stored, known_commands=frozenset({command}))
+    assert caught.value.rule == "budget.plan"
+
+
+def test_a_human_lesson_keeps_free_wording():
+    text = replace(MINED, avoid="cd into a subdirectory", reason="worktree roots differ")
+    assert check(text, REPO, known_commands=frozenset(), trust_class=HUMAN) is None

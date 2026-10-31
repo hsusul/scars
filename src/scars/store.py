@@ -243,6 +243,7 @@ PAYLOAD_KEYS: dict[EventType, dict[str, PayloadKey]] = {
         "trust_class": PayloadKey(str),
     },
     EventType.SUPERSEDED: {"superseded_by": PayloadKey(str, required=True)},
+    EventType.RETIRED: {"reason": PayloadKey(str)},
 }
 """The payload keys each event accepts. Events not listed take an empty payload."""
 
@@ -873,22 +874,20 @@ def get_lesson_by_fingerprint(db: sqlite3.Connection, fingerprint: str) -> Lesso
 
 
 ACTIVE_FOR_HOOK_WHERE = (
-    "(status in ('provisional','promoted') and scope_kind = 'machine')"
-    " or (status in ('provisional','promoted') and scope_kind in ('repo','path') and repo_id = ?)"
-    " or (status = 'candidate' and scope_kind = 'session' and session_id = ?)"
+    "(status = 'promoted' and scope_kind = 'machine')"
+    " or (status = 'promoted' and scope_kind in ('repo','path') and repo_id = ?)"
 )
 
 
-def active_for_hook(db: sqlite3.Connection, repo_id: RepoId | None, session_id: SessionId) -> list[Lesson]:
-    """Promoted and provisional lessons in machine scope or this repo's repo and path scopes, plus this
-    session's session-scoped candidates. Stage rules (pins, levels, trigger kinds) are the caller's job."""
-    return _load(db, ACTIVE_FOR_HOOK_WHERE, (repo_id, session_id))
+def active_for_hook(db: sqlite3.Connection, repo_id: RepoId | None) -> list[Lesson]:
+    """Promoted lessons in machine scope or this repo's repo and path scopes: only a lesson a human
+    approved reaches an agent. Stage rules (pins, levels, trigger kinds) are the caller's job."""
+    return _load(db, ACTIVE_FOR_HOOK_WHERE, (repo_id,))
 
 
 def active_for_stage(
     db: sqlite3.Connection,
     repo_id: RepoId | None,
-    session_id: SessionId,
     *,
     stage: Stage,
     pinned_only: bool,
@@ -904,7 +903,7 @@ def active_for_stage(
     triggers. With `trigger_kinds` None the stage selects without triggers, so no trigger is required.
     """
     where = f"({ACTIVE_FOR_HOOK_WHERE})"
-    params: list[object] = [repo_id, session_id]
+    params: list[object] = [repo_id]
     if pinned_only:
         where += " and pinned = 1"
     if trigger_kinds is not None:
@@ -1137,6 +1136,15 @@ def mined_call(db: sqlite3.Connection, tool_use_id: str) -> MinedCall | None:
 
 def has_observation(db: sqlite3.Connection, failed_tool_use_id: str) -> bool:
     found = db.execute("select 1 from observations where failed_tool_use_id = ?", (failed_tool_use_id,))
+    return found.fetchone() is not None
+
+
+def observed_in_session(db: sqlite3.Connection, lesson_id: LessonId, harness: str, session_id: str) -> bool:
+    """Whether this lesson already has an observation from this session."""
+    found = db.execute(
+        "select 1 from observations where lesson_id = ? and harness = ? and session_id = ?",
+        (lesson_id, harness, session_id),
+    )
     return found.fetchone() is not None
 
 

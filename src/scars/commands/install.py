@@ -60,7 +60,7 @@ from pathlib import Path
 from scars import hook, paths, store
 from scars.commands import Context, UserError, mining
 from scars.commands import inbox as inbox_cmd
-from scars.mine import default_sources, existing_dir
+from scars.mine import default_sources, known_dir
 from scars.model import RepoId, TriggerKind
 
 DAY = 86400.0
@@ -420,7 +420,7 @@ def repo_name(common_dir: str) -> str:
 def discover(cwds: set[str]) -> list[FoundRepo]:
     by_common: dict[str, FoundRepo] = {}
     for cwd in sorted(cwds):
-        found = existing_dir(cwd)
+        found = known_dir(cwd)
         common = hook.git_common_dir(found) if found else None
         if common is None:
             continue

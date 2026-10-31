@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from scars import store
+from scars import render, store
 from scars.commands import Context, UserError
 from scars.model import EventType, LessonText, RepoId, RepoScope, Stage, Trigger, TriggerKind, TrustClass
 
@@ -30,10 +30,12 @@ SIGNATURE = "Error: Cannot find module 'express'"
 ERROR = "Exit code 1\n" + SIGNATURE
 MISS = "Exit code 1\nError: nothing like any lesson"
 WARMUP_RUNS = 5
+FAILED = "npm test"
+PASSED = "npm install"
 
 
 def build_home(root: Path, lessons: int) -> tuple[Path, Path]:
-    """A scars home under `root` with `lessons` provisional repair lessons, and a registered git repo."""
+    """A scars home under `root` with `lessons` promoted repair lessons, and a registered git repo."""
     home, repo = root / "home", root / "repo"
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -49,27 +51,27 @@ def build_home(root: Path, lessons: int) -> tuple[Path, Path]:
         store.add_repo(db, REPO, "bench", "own")
         store.add_clone(db, common, REPO, 0.0)
         for i in range(lessons):
-            reason = SIGNATURE if i == lessons - 1 else f"Error: bulk failure number {i}"
+            signature = SIGNATURE if i == lessons - 1 else f"Error: bulk failure number {i}"
             lesson_id = store.create_lesson(
                 db,
-                text=LessonText("npm test", "run `npm install && npm test`", reason),
+                text=LessonText(FAILED, f"run `{PASSED}` instead", render.MINED_REASON),
                 scope=RepoScope(REPO),
                 trust_class=TrustClass.OWN_CODE,
-                triggers=(Trigger(TriggerKind.ERROR, reason, Stage.REPAIR),),
+                triggers=(Trigger(TriggerKind.ERROR, signature, Stage.REPAIR),),
                 fingerprint=f"fp{i}",
                 actor="miner",
             )
             db.execute(
                 "insert into observations (lesson_id, harness, session_id, failed_tool_use_id, failed_input, "
                 "error_signature, passing_input, at) values (?,?,?,?,?,?,?,?)",
-                (lesson_id, "claude", "old", f"tu{i}", "npm test", reason, "npm install && npm test", 0.0),
+                (lesson_id, "claude", "old", f"tu{i}", FAILED, signature, PASSED, 0.0),
             )
             store.apply_event(
                 db,
                 lesson_id=lesson_id,
-                event=EventType.PROVISIONALIZED,
+                event=EventType.PROMOTED,
                 expected_revision=1,
-                actor="miner",
+                actor="human",
                 payload={},
             )
     db.close()

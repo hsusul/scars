@@ -1,5 +1,5 @@
 from cli_helpers import DAY, NOW, SIG, connect, human, make_ctx, run, seed
-from scars import store, telemetry
+from scars import render, store, telemetry
 from scars.model import EventType, HitOutcome
 
 pytest_plugins = ("cli_fixtures",)
@@ -31,7 +31,12 @@ def shown_hit(home, lesson_id, tool_use_id="tu-hook", at=NOW - 600):
 def test_ls_lists_active_lessons(home, user_home):
     a = seed(home)
     b = seed(
-        home, avoid="npm tset", sig="npm ERR! Unknown command: tset", pre_trigger=None, provisional=False
+        home,
+        avoid="npm tset",
+        passing="npm test",
+        sig="npm ERR! Unknown command: tset",
+        pre_trigger=None,
+        provisional=False,
     )
     human(home, a, EventType.PROMOTED)
     human(home, a, EventType.PINNED)
@@ -48,9 +53,21 @@ def test_ls_lists_active_lessons(home, user_home):
     )
 
 
+def test_ls_names_each_lesson_that_cannot_render_and_the_rule_it_breaks(home, user_home):
+    legacy = seed(home, reason="Error: pytest exited with code 4", provisional=False)
+    code, out, err = run(make_ctx(user_home), "ls")
+    assert (code, out.splitlines()[-1], err) == (
+        0,
+        f"cannot render: lesson {legacy} breaks mined.reason_template in reason",
+        "",
+    )
+
+
 def test_ls_filters_by_status_repo_firing_and_stale(home, user_home):
     a = seed(home)
-    b = seed(home, avoid="npm tset", sig="npm ERR! Unknown command: tset", at=NOW - 40 * DAY)
+    b = seed(
+        home, avoid="npm tset", passing="npm test", sig="npm ERR! Unknown command: tset", at=NOW - 40 * DAY
+    )
     human(home, b, EventType.RETIRED)
     shown_hit(home, a)
     assert run(make_ctx(user_home), "ls")[1].count("\n") == 2
@@ -71,7 +88,7 @@ def test_why_shows_trigger_input_observations_and_events(home, user_home):
     expected = f"""{header}
   avoid:   pytest --frobnicate
   instead: run `pytest tests` instead
-  reason:  {SIG}
+  reason:  {render.MINED_REASON}
 triggers:
   command at gate: pytest ** --frobnicate
   error at repair: {SIG}

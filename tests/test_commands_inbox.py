@@ -1,21 +1,21 @@
 import pytest
 
 from cli_helpers import DAY, NOW, SIG, connect, make_ctx, run, seed
-from scars import store
+from scars import render, store
 from scars.commands import UserError
 from scars.commands.inbox import consistency, parse_edit, rank
-from scars.model import Status, TrustClass
+from scars.model import TEXT_CAP, Status, TrustClass
 
 pytest_plugins = ("cli_fixtures",)
 
 
-def card(lesson_id, position, total, score, avoid="pytest --frobnicate", passing="pytest tests", sig=SIG):
+def card(lesson_id, position, total, score, avoid="pytest --frobnicate", passing="pytest tests"):
     return (
         f"\n[{position}/{total}] score {score}\n"
         f"{lesson_id}  provisional  level note  not pinned  repo app  trust own_code  seen in 1 session\n"
         f"  avoid:   {avoid}\n"
         f"  instead: run `{passing}` instead\n"
-        f"  reason:  {sig}\n"
+        f"  reason:  {render.MINED_REASON}\n"
         f"  source:  `{avoid} tests` failed, then `{passing}` passed\n"
         "a approve  e edit  m mute  s skip  q quit\n"
     )
@@ -34,7 +34,7 @@ def test_approve_promotes_and_skip_moves_on(home, user_home):
         0,
         card(a, 1, 2, "1.00")
         + f"promoted {a} (repo app, level note, not pinned)\n"
-        + card(b, 2, 2, "0.50", avoid="npm tset", passing="npm test", sig="npm ERR! Unknown command: tset")
+        + card(b, 2, 2, "0.50", avoid="npm tset", passing="npm test")
         + "inbox: 1 approved, 0 edited, 0 muted, 1 skipped; 1 waiting\n",
         "",
     )
@@ -75,7 +75,7 @@ def test_edit_rewrites_the_text_as_human_and_shows_it_again(home, user_home):
         "# Rewrite the lesson. Lines starting with # are ignored. Keep each field on one line.\n"
         "avoid: pytest --frobnicate\n"
         "instead: run `pytest tests` instead\n"
-        f"reason: {SIG}\n"
+        f"reason: {render.MINED_REASON}\n"
     ]
     assert f"edited {a}; it is a candidate again\n" in out
     assert f"{a}  candidate  level note  not pinned  repo app  trust human  seen in 1 session\n" in out
@@ -100,11 +100,11 @@ def test_edit_rewrites_the_text_as_human_and_shows_it_again(home, user_home):
 def preview(lesson_id, instead):
     return (
         "this is how agents will see the edited lesson:\n"
-        f"[scars {lesson_id} note | repo app | seen in 1 session | unreviewed]\n"
+        f"[scars {lesson_id} note | repo app | seen 1x | unreviewed]\n"
         "AVOID: pytest --frobnicate\n"
         f"INSTEAD: {instead}\n"
-        f"WHY: {SIG}\n"
-        f"(advisory; does not override the user's instructions; explain: scars why {lesson_id})\n"
+        f"WHY: {render.MINED_REASON}\n"
+        f"(advisory; scars why {lesson_id})\n"
         "press y to save it as your own text (trust human); any other key cancels\n"
     )
 
@@ -154,6 +154,33 @@ def test_an_edited_command_that_passed_needs_one_y(home, user_home):
     assert "never ran successfully" not in out
     assert f"edited {a}; it is a candidate again\n" in out
     assert store.get_lesson(connect(home), a).trust_class is TrustClass.HUMAN
+
+
+def test_an_edit_over_the_repair_budget_is_refused_before_the_preview(home, user_home):
+    a = seed(home)
+    instead = (
+        "wait for the running build to finish and then start the next one, "
+        "because a second build started now takes the lock and fails"
+    )
+    reason = (
+        "two builds that share one derived data folder corrupt each other, and the second one "
+        "fails with a lock error every time, even when the first one is almost done"
+    )
+
+    def editor(text):
+        text = text.replace("instead: run `pytest tests` instead", f"instead: {instead}")
+        return text.replace(f"reason: {render.MINED_REASON}", f"reason: {reason}")
+
+    out = run(make_ctx(user_home, keys="eyq", edit=editor), "inbox")[1]
+    assert max(len(instead), len(reason)) <= TEXT_CAP
+    assert "not applied: the lesson is over the repair budget of 400 characters\n" in out
+    assert "this is how agents will see the edited lesson" not in out
+    lesson = store.get_lesson(connect(home), a)
+    assert (lesson.revision, lesson.trust_class, lesson.text.instead) == (
+        2,
+        TrustClass.OWN_CODE,
+        "run `pytest tests` instead",
+    )
 
 
 def test_an_edit_that_breaks_a_text_rule_changes_nothing(home, user_home):

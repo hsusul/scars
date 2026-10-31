@@ -38,3 +38,14 @@ def test_signature_normalizes_variable_parts(output, expected):
 )
 def test_signature_is_none_for_output_no_lesson_can_address(output):
     assert signature(output) is None
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "[scars L-1a2b3c4d note | repo app | seen 2x | unreviewed]\nError: boom",
+        "Error: boom, see [SCARS L-1a2b warn] for the fix",
+    ],
+)
+def test_output_carrying_a_scars_header_is_never_a_signature(output):
+    assert signature(output) is None

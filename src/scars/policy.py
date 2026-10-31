@@ -1,9 +1,7 @@
-"""Provisional, expiry and precision rules for mined lessons.
+"""Expiry and precision rules for mined lessons.
 
-- A mined candidate becomes provisional on its first sighting when its trust class is `own_code` and
-  its scope is a repo. Lessons from upstream repos (`third_party_repo`) or the web never become
-  provisional on their own; a human promotes them or they expire. Only the miner's own first sighting
-  provisionalizes: a candidate that exists for another reason (a human edit sent it back) is left alone.
+- A mined lesson stays a candidate in the inbox until a human approves it; the miner never shares one
+  with an agent on its own, not even with the session it was mined from.
 - A command or path pre-trigger ships only when the precision check over the last 30 days of mined
   calls keeps it: at most 4 passing matches per failing match. Otherwise the lesson is stored with its
   error trigger alone. The decision is made before the lesson is first stored, because changing a stored
@@ -15,15 +13,11 @@ import sqlite3
 
 from scars import store
 from scars.match import Precision
-from scars.model import EventType, RepoScope, Scope, TrustClass
+from scars.model import EventType
 
 PRECISION_WINDOW_DAYS = 30
 EXPIRY_SECONDS = store.EXPIRY_SECONDS
 ACTOR = "miner"
-
-
-def provisional_on_first_sighting(scope: Scope, trust_class: TrustClass) -> bool:
-    return isinstance(scope, RepoScope) and trust_class is TrustClass.OWN_CODE
 
 
 def keeps_pre_trigger(result: Precision) -> bool:

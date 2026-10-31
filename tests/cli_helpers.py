@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from scars import cli, store
+from scars import cli, render, store
 from scars.commands import Context
 from scars.model import (
     EventType,
@@ -89,6 +89,7 @@ def seed(
     pre_trigger: str | None = "pytest ** --frobnicate",
     at: float = NOW - DAY,
     trust: TrustClass = TrustClass.OWN_CODE,
+    reason: str = render.MINED_REASON,
 ) -> LessonId:
     """One mined-looking repo lesson with one observation, provisional unless told otherwise."""
     db = connect(home)
@@ -97,7 +98,7 @@ def seed(
         triggers.append(Trigger(TriggerKind.COMMAND, pre_trigger, Stage.GATE))
     lesson_id = store.create_lesson(
         db,
-        text=LessonText(avoid, f"run `{passing}` instead", sig),
+        text=LessonText(avoid, f"run `{passing}` instead", reason),
         scope=RepoScope(REPO),
         trust_class=trust,
         triggers=triggers,

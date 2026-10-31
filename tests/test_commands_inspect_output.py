@@ -85,7 +85,8 @@ def test_ls_and_test_hide_values_that_fail_the_text_rules(home, user_home):
     assert (code, out, err) == (
         0,
         "ID          STATUS      LEVEL PIN SEEN  SCOPE  AVOID\n"
-        f"{lesson_id:<11} candidate   note -      1  repo app  [hidden: sanitizer.non_ascii]\n",
+        f"{lesson_id:<11} candidate   note -      1  repo app  [hidden: sanitizer.non_ascii]\n"
+        f"cannot render: lesson {lesson_id} breaks sanitizer.non_ascii in avoid\n",
         "",
     )
     out = run(make_ctx(user_home), "test", lesson_id)[1]

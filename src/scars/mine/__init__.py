@@ -8,10 +8,13 @@
 2. Drop calls whose tool use id an earlier batch already processed: resumed sessions copy history.
 3. Pair failures with their fixes (see `pairs`), continuing the failures left open by earlier batches.
 4. Build each pair's candidate (see `build`), in order of the fixing call's time. A new fingerprint
-   creates a candidate, which an `own_code` repo-scope candidate leaves at once as provisional; an
-   existing one gets an `observed` event. Each pair adds one observation. A pair's lesson write,
-   provisionalization, precision run and observation commit in one transaction, and the observation,
-   unique per failed tool use id, marks the pair processed, so a crash never counts a sighting twice.
+   creates a candidate, which waits in the inbox for a human; an existing one gets an `observed` event
+   the first time a session sights it, so `sessions_seen` counts sessions, not repeats within one.
+   An existing lesson that is not `human` and no longer passes the render rules (text mined before a
+   rule change) is retired with the rule it breaks, and the pair creates a fresh candidate instead.
+   Each pair adds one observation. A pair's lesson write, precision run and observation commit in one
+   transaction, and the observation, unique per failed tool use id, marks the pair processed, so a crash
+   never counts a sighting twice.
 5. Commit offsets, processed ids, the open failures and the new mined calls in one transaction.
 6. Expire lessons not sighted for 14 days, then write delayed hit outcomes.
 
@@ -20,8 +23,10 @@ signature or model id that trips a secret rule is stored as NULL, a working dire
 string (the column is not nullable), a path that does is left out, and a pending failure whose input or
 signature does is not kept (it could only pair into a candidate the scan rejects).
 
-A working directory that no longer exists (a deleted worktree) resolves through its nearest existing
-parent directory.
+A working directory is known only when it is absolute and still exists. An unknown one (empty, relative,
+or a deleted worktree) never pairs and names no repo; it is never resolved through a parent directory,
+which could belong to another repo. Directories outside registered repos compare by real path, so a
+symlinked path and its target are one place.
 
 Event times are the fixing call's time, so expiry counts from the real sighting. Mining the same
 transcripts again changes nothing: offsets, processed ids and observations each guard the work.
@@ -38,7 +43,7 @@ from scars import hook, policy, render, store
 from scars.match import InvalidTrigger, Precision, RecordedCall
 from scars.mine import build, calls, claude, codex, outcomes, pairs
 from scars.mine.replay import CallIndex
-from scars.model import ErrorSignature, EventType, Harness, RepoId, Trigger
+from scars.model import ErrorSignature, EventType, Harness, RepoId, Trigger, TrustClass
 
 DAY = 86400.0
 
@@ -66,7 +71,8 @@ class Summary:
     pairs: int = 0
     candidates_created: int = 0
     observations: int = 0
-    provisionalized: int = 0
+    retired_unrenderable: int = 0
+    """Mined lessons retired because their stored text no longer renders; fresh candidates replace them."""
     pre_triggers_dropped: int = 0
     expired: int = 0
     outcomes_written: int = 0
@@ -172,7 +178,7 @@ def _recorded(row: store.MinedCall) -> RecordedCall:
     return outcomes.recorded(row)
 
 
-def _open_from_store(p: store.PendingFailure) -> pairs.OpenFailure:
+def _open_from_store(p: store.PendingFailure, cwd: str | None) -> pairs.OpenFailure:
     return pairs.OpenFailure(
         tool_use_id=p.tool_use_id,
         harness=p.harness,
@@ -183,13 +189,15 @@ def _open_from_store(p: store.PendingFailure) -> pairs.OpenFailure:
         signature=p.error_signature,  # type: ignore[arg-type]
         calls_since=p.calls_since,
         last_call_at=p.last_call_at,
+        cwd=cwd,
     )
 
 
 def _pending_row(f: pairs.OpenFailure) -> store.PendingFailure | None:
     """The row to keep for an open failure, or None when its input or signature holds a secret. Such a
     failure could only pair into a candidate the secret scan rejects, so dropping it loses no lesson."""
-    if _clean(f.input) is None or _clean(f.signature) is None or _clean(f.program) is None:
+    texts = (f.input, f.signature, f.program, f.cwd)
+    if any(_clean(t) is None for t in texts):
         return None
     return store.PendingFailure(
         f.tool_use_id,
@@ -204,17 +212,12 @@ def _pending_row(f: pairs.OpenFailure) -> store.PendingFailure | None:
     )
 
 
-def existing_dir(cwd: str) -> str | None:
-    """`cwd`, or its nearest existing parent when it was deleted; None for a relative or empty path."""
+def known_dir(cwd: str) -> str | None:
+    """`cwd` normalized when it is an absolute path to a directory that exists, else None."""
     if not cwd.startswith("/"):
         return None
     path = os.path.normpath(cwd)
-    while not os.path.isdir(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            return None
-        path = parent
-    return path
+    return path if os.path.isdir(path) else None
 
 
 class _Repos:
@@ -234,15 +237,22 @@ class _Repos:
 
     def resolve(self, cwd: str) -> tuple[RepoId | None, str | None]:
         if cwd not in self._cache:
-            found = existing_dir(cwd)
+            found = known_dir(cwd)
             common = self._common_dir_of(found) if found else None
             repo = store.repo_for_common_dir(self._db, (common, os.path.realpath(common))) if common else None
             self._cache[cwd] = (repo, store.repo_owner_class(self._db, repo) if repo else None)
         return self._cache[cwd]
 
+    def place(self, cwd: str) -> tuple[str, str] | None:
+        found = known_dir(cwd)
+        if found is None:
+            return None
+        repo, _ = self.resolve(cwd)
+        return ("repo", repo) if repo else ("dir", os.path.realpath(found))
+
     def root(self, cwd: str) -> str | None:
         if cwd not in self._roots:
-            found = existing_dir(cwd)
+            found = known_dir(cwd)
             self._roots[cwd] = self._repo_root_of(found) if found else None
         return self._roots[cwd]
 
@@ -281,18 +291,37 @@ def _write_pair(
 ) -> None:
     at = pair.passing.at
     existing = store.get_lesson_by_fingerprint(db, candidate.fingerprint)
-    if existing is not None:
-        last = store.lesson_last_seen(db, existing.id) or at
-        revision = store.apply_event(
-            db,
-            lesson_id=existing.id,
-            event=EventType.OBSERVED,
-            expected_revision=existing.revision,
-            actor=policy.ACTOR,
-            payload={"fix_program": candidate.fix_program},
-            at=max(at, last),
+    if existing is not None and existing.trust_class is not TrustClass.HUMAN:
+        problem = render.render_problem(
+            existing,
+            known_commands=store.passing_inputs(db, [existing.id])[existing.id],
+            registered_repos=store.repo_names(db),
         )
-        lesson_id = existing.id
+        if problem is not None:
+            store.apply_event(
+                db,
+                lesson_id=existing.id,
+                event=EventType.RETIRED,
+                expected_revision=existing.revision,
+                actor=policy.ACTOR,
+                payload={"reason": f"cannot render: {problem.rule}"},
+                at=at,
+            )
+            counts["retired_unrenderable"] += 1
+            existing = None
+    if existing is not None:
+        lesson_id, revision = existing.id, existing.revision
+        if not store.observed_in_session(db, lesson_id, pair.failed.harness, pair.failed.session_id):
+            last = store.lesson_last_seen(db, lesson_id) or at
+            revision = store.apply_event(
+                db,
+                lesson_id=lesson_id,
+                event=EventType.OBSERVED,
+                expected_revision=revision,
+                actor=policy.ACTOR,
+                payload={"fix_program": candidate.fix_program},
+                at=max(at, last),
+            )
         pre = next((t for t in existing.triggers if t.kind.value in ("command", "path")), None)
         checked = _precision(index, pre, candidate.signature)
     else:
@@ -314,17 +343,6 @@ def _write_pair(
         )
         counts["candidates_created"] += 1
         revision = 1
-        if policy.provisional_on_first_sighting(candidate.scope, candidate.trust_class):
-            revision = store.apply_event(
-                db,
-                lesson_id=lesson_id,
-                event=EventType.PROVISIONALIZED,
-                expected_revision=revision,
-                actor=policy.ACTOR,
-                payload={},
-                at=at,
-            )
-            counts["provisionalized"] += 1
     if checked is not None:
         store.record_precision(
             db,
@@ -399,22 +417,26 @@ def _run(
                 seen.add(call.tool_use_id)
                 streams.setdefault(key, []).append(call)
     new_calls = [c for stream in streams.values() for c in stream]
+    since = now - policy.PRECISION_WINDOW_DAYS * DAY
+    stored = store.mined_calls_since(db, since)
+    # A pending failure's own call is a stored mined call; its row holds the working directory.
+    cwds = {r.tool_use_id: r.cwd for r in stored}
     waiting: dict[tuple[str, str], list[pairs.OpenFailure]] = {}
     for p in store.pending_failures(db):
-        waiting.setdefault((p.harness, p.session_id), []).append(_open_from_store(p))
+        failure = _open_from_store(p, cwds.get(p.tool_use_id))
+        waiting.setdefault((p.harness, p.session_id), []).append(failure)
     found: list[pairs.Pair] = []
     still_open: list[pairs.OpenFailure] = []
     for key in sorted(set(streams) | set(waiting)):
         if key in skipped_sessions:
             still_open.extend(waiting.get(key, ()))
             continue
-        result = pairs.pair_session(waiting.get(key, ()), streams.get(key, ()), now)
+        result = pairs.pair_session(waiting.get(key, ()), streams.get(key, ()), now, repos.place)
         found.extend(result.pairs)
         still_open.extend(result.still_open)
         counts["failures"] += result.failures
-    since = now - policy.PRECISION_WINDOW_DAYS * DAY
     rows = [_mined_row(c) for c in new_calls]
-    recent = [_recorded(r) for r in store.mined_calls_since(db, since)]
+    recent = [_recorded(r) for r in stored]
     recent += [_recorded(r) for r in rows if r.at >= since]
     index = CallIndex(recent, repos.root)
     for pair in sorted(found, key=lambda p: (p.passing.at, p.failed.tool_use_id)):
@@ -451,7 +473,7 @@ def _run(
         pairs=len(found),
         candidates_created=counts["candidates_created"],
         observations=counts["observations"],
-        provisionalized=counts["provisionalized"],
+        retired_unrenderable=counts["retired_unrenderable"],
         pre_triggers_dropped=counts["pre_triggers_dropped"],
         expired=expired,
         outcomes_written=result.outcomes,

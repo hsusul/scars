@@ -13,7 +13,8 @@ Each line is `{"timestamp", "type", "payload"}`. Two shapes of tool call are rea
 A call fails only when a non-zero exit code is visible, by the same rule as the hook adapter: an integer
 `exit_code`, or an exit-code line in the output header. A call with no visible exit code has status
 `unknown`. The model comes from the latest `turn_context`. The session id is the id at the end of the
-file name, which is also the first `session_meta` id.
+file name, which is also the first `session_meta` id. A cwd given as a `file://` URL is decoded to its
+path (`%20` becomes a space).
 
 The cwd and model in force at the resume point are returned with the calls, and the next batch starts
 from them, so calls read later keep the context set by lines an earlier batch consumed. Calls are emitted
@@ -27,6 +28,7 @@ import re
 import shlex
 from collections.abc import Iterable
 from dataclasses import dataclass
+from urllib.parse import unquote, urlsplit
 
 from scars.adapters.codex import exit_status, patch_paths
 from scars.mine.calls import (
@@ -63,6 +65,13 @@ class _Started:
     at: float | None
     cwd: str
     model: str | None
+
+
+def directory(value: object) -> str | None:
+    """A cwd as a path, or None when it is not a string."""
+    if not isinstance(value, str):
+        return None
+    return unquote(urlsplit(value).path) if value.startswith("file://") else value
 
 
 def command_text(command: object) -> str | None:
@@ -142,11 +151,11 @@ def parse(lines: Iterable[Line], session_id: str, context: Context | None = None
         ptype = payload.get("type")
         if kind in ("session_meta", "turn_context"):
             contexts.append((line.offset, Context(cwd, model)))
-        if kind == "session_meta" and not cwd and isinstance(payload.get("cwd"), str):
-            cwd = payload["cwd"]
+        if kind == "session_meta" and not cwd:
+            cwd = directory(payload.get("cwd")) or cwd
         elif kind == "turn_context":
             model = payload["model"] if isinstance(payload.get("model"), str) else model
-            cwd = payload["cwd"] if isinstance(payload.get("cwd"), str) else cwd
+            cwd = directory(payload.get("cwd")) or cwd
         elif kind == "event_msg" and ptype == "item_completed" and at is not None:
             item = payload.get("item")
             if not isinstance(item, dict) or not isinstance(item.get("id"), str):
@@ -169,7 +178,7 @@ def parse(lines: Iterable[Line], session_id: str, context: Context | None = None
                     status=status,
                     output=output if isinstance(output, str) else "",
                     at=at,
-                    cwd=item["cwd"] if isinstance(item.get("cwd"), str) else cwd,
+                    cwd=directory(item.get("cwd")) or cwd,
                     model_id=model,
                 )
             elif item.get("type") == "FileChange":
@@ -214,7 +223,7 @@ def parse(lines: Iterable[Line], session_id: str, context: Context | None = None
                 if command is None:
                     inv.dropped = True
                     continue
-                workdir = found.get("workdir")
+                workdir = directory(found.get("workdir"))
                 inv.call = _make(
                     session_id,
                     tool_use_id=call_id,
@@ -225,7 +234,7 @@ def parse(lines: Iterable[Line], session_id: str, context: Context | None = None
                     status=status,
                     output=output,
                     at=at,
-                    cwd=workdir if isinstance(workdir, str) else begun.cwd,
+                    cwd=workdir or begun.cwd,
                     model_id=begun.model,
                 )
             else:
