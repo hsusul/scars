@@ -720,15 +720,34 @@ def test_parse_rejects_redirections_bash_would_refuse_or_could_refuse(command):
         ("make;# x", (cmd("make"),)),
         ("xcodebuild > ~/log", (cmd("xcodebuild", writes=["~/log"]),)),
         ("sort < ~/in", (cmd("sort"),)),
-        ("> f", (cmd(":", writes=["f"]),)),
-        ("X=1 > f", (cmd(":", writes=["f"]),)),
-        ("cd /tmp > f && true", (cmd(":", writes=["f"]), cmd("true", cwd="/tmp"))),
-        ("cd a && > f", (cmd(":", cwd="a", writes=["f"]),)),
+        ("> f", ()),
+        ("X=1 > f", ()),
+        ("cd /tmp > f && true", (cmd("true", cwd="/tmp"),)),
+        ("(X=1) > f", ()),
         ("< f", ()),
     ],
 )
 def test_parse_accepts_valid_redirections_and_operators(command, expected):
     assert parse(command) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("> f", (cmd(":", writes=["f"]),)),
+        ("X=1 > f", (cmd(":", writes=["f"]),)),
+        ("cd /tmp > f && true", (cmd(":", writes=["f"]), cmd("true", cwd="/tmp"))),
+        ("cd a && > f", (cmd(":", cwd="a", writes=["f"]),)),
+        ("(X=1) > f", (cmd(":", writes=["f"]),)),
+        ("(< /dev/null) > f 2> g", (cmd(":", writes=["f", "g"]),)),
+        ("(sh -c 'X=1') > f", (cmd(":", writes=["f"]),)),
+        ("(cd a && X=1) > f", (cmd(":", writes=["f"]),)),
+        ("(make) > f", (cmd("make", writes=["f"]),)),
+        ("< f", ()),
+    ],
+)
+def test_null_commands_report_writes_that_run_no_program(command, expected):
+    assert parse(command, null_commands=True) == expected
 
 
 # Each of these runs nothing, or runs the command somewhere other than the directory a parse would record.

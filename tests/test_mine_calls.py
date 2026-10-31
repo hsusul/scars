@@ -1,4 +1,19 @@
-from scars.mine.calls import UNRESOLVED_HORIZON, Chunk, Invocation, Line, read_from, settle
+import pytest
+
+from scars.mine.calls import UNRESOLVED_HORIZON, Chunk, Invocation, Line, read_from, settle, shell_program
+
+
+@pytest.mark.parametrize(
+    ("command", "program"),
+    [
+        ("cd /tmp > /dev/null && pytest", "pytest"),
+        ("> /readonly/f", None),
+        ("X=1 > f; make", "make"),
+    ],
+)
+def test_shell_program_skips_redirections_that_run_no_program(command, program):
+    assert shell_program(command) == program
+
 
 START = 1_800_000_000.0
 

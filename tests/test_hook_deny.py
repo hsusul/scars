@@ -70,6 +70,11 @@ ALLOWED = [
     "sort < ../.scars/lessons.db",
     "touch ~/.scarsrc/x",
     "which scars",
+    "pytest src/scars -k verify",
+    "pytest src/scars -k off",
+    "git add src/scars *.py",
+    "cp -r src/scars ~/backup",
+    "ls src/scars/commands",
 ]
 
 
@@ -144,6 +149,16 @@ DENIED = [
     ("cd /tmp > ../.scars/OFF && true", HOME_REASON),
     ("sort <> ~/.scars/lessons.db", HOME_REASON),
     ("sort <> ../.scars/lessons.db", HOME_REASON),
+    ("(X=1) > ~/.scars/OFF", HOME_REASON),
+    ("(< /dev/null) > ~/.scars/OFF", HOME_REASON),
+    ("(sh -c 'X=1') > ~/.scars/OFF", HOME_REASON),
+    ("command sh -c 'rm $SCARS_HOME/OFF'", HOME_REASON),
+    ("command sh -c 'rm ${SCARS_HOME}/OFF'", HOME_REASON),
+    ("/usr/local/bin/scars off", run("off")),
+    ("timeout 5 ~/.local/bin/scars off", run("off")),
+    # Accepted false deny: whether `scars` is an option's operand or the program depends on each
+    # program's option arity, which the hook cannot know, so a word exactly `scars` always counts.
+    ("make -C scars verify", run("verify")),
 ]
 
 

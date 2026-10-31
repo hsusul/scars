@@ -181,10 +181,13 @@ def shell_deny_reason(text: str, cwd: str, home: str) -> str | None:
     - Running scars (by any path, through the wrappers the parser removes, or as `python -m scars`) with
       `inbox` or a privileged subcommand, or with a first operand the shell expands at run time, is denied.
       So is a command that is not `provably_read_only` and has an argument word naming the `scars`
-      program followed by such a subcommand, because runners the parser does not model (`timeout`,
-      `xargs`, `find -exec`) pass it on; `xargs` with no subcommand after `scars` takes it from input.
+      program (exactly `scars`, or a path ending in `/bin/scars`) followed by such a subcommand, because
+      runners the parser does not model (`timeout`, `xargs`, `find -exec`) pass it on; `xargs` with no
+      subcommand after `scars` takes it from input. A word such as `src/scars` is not the program, so
+      nothing after it is read as a subcommand.
     - A command that is not `provably_read_only` is denied when an argument spells the scars home, the
-      default `~/.scars`, `$HOME/.scars` or `${HOME}/.scars` anywhere in it, even inside a quoted script.
+      default `~/.scars`, `$HOME/.scars`, `${HOME}/.scars`, `$SCARS_HOME` or `${SCARS_HOME}` anywhere in
+      it, even inside a quoted script.
     - A command that is not `provably_read_only` is denied when one of its arguments may resolve under
       the scars home or the default `~/.scars`. Arguments are paths relative to the command's directory
       (the event cwd, after a leading `cd`, and both when the `cd` may have failed); the text after an `=`
@@ -202,7 +205,7 @@ def shell_deny_reason(text: str, cwd: str, home: str) -> str | None:
     from scars import shell
 
     try:
-        commands = shell.parse(text)
+        commands = shell.parse(text, null_commands=True)
     except shell.Unsupported:
         return _unparsed_reason(text, home)
     roots = _roots(home)
@@ -231,6 +234,7 @@ def shell_deny_reason(text: str, cwd: str, home: str) -> str | None:
 
 def _home_spellings(roots: tuple[str, ...]) -> re.Pattern[str]:
     spelled = [*(re.escape(r) for r in roots), r"~/\.scars", r"\$HOME/\.scars", r"\$\{HOME\}/\.scars"]
+    spelled += [r"\$SCARS_HOME", r"\$\{SCARS_HOME\}"]
     return re.compile(rf"(?:{'|'.join(spelled)})(?![\w.-])", re.IGNORECASE)
 
 
@@ -255,13 +259,20 @@ def _scars_subcommand(c: "shell.SimpleCommand", read_only: bool) -> str | None:
     if read_only:
         return None
     for i, arg in enumerate(c.args):
-        if i in c.uncertain or arg.rsplit("/", 1)[-1].lower() != "scars":
+        if not _names_cli(arg):
             continue
         if (found := _protected_operand(c, i + 1)) is not None:
             return found
         if name == "xargs" and all(a.startswith("-") for a in c.args[i + 1 :]):
             return "..."
     return None
+
+
+def _names_cli(word: str) -> bool:
+    """Whether an argument word names the scars program: exactly `scars`, or a path ending in `/bin/scars`,
+    which covers the installed versions and a virtualenv. `src/scars` and other paths are not the CLI."""
+    word = word.lower()
+    return word == "scars" or word.endswith("/bin/scars")
 
 
 def _protected_operand(c: "shell.SimpleCommand", start: int) -> str | None:

@@ -109,5 +109,12 @@ def test_plan_rules(calls, ended, expected):
     assert decide(PLAN, FACTS, calls, ended) is expected
 
 
+def test_a_redirection_with_no_program_does_not_match_a_null_command_trigger():
+    facts = LessonFacts(SIG, (Trigger(TriggerKind.COMMAND, ":", Stage.PLAN),))
+    closed = [read(2), read(3), read(4), read(5)]
+    calls = [failing(0), failing(1, "other", "> /tmp/log"), *closed]
+    assert decide(REPAIR, facts, calls, False) is DelayedOutcome.HEEDED
+
+
 def test_plan_hit_ignores_matching_calls_before_the_hit():
     assert decide(PLAN, FACTS, [failing(0), shell(1)], True) is DelayedOutcome.NO_ATTEMPT

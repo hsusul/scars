@@ -96,8 +96,9 @@ class SimpleCommand:
     """False when the directory depends on whether an earlier `cd` succeeded."""
     writes: tuple[str, ...] = ()
     """Files its redirections open for writing (`<>` included), including those on an enclosing group, as
-    written: a leading `~` is not expanded. A command with no program, such as `> f`, `X=1 > f` or the
-    redirection on a leading `cd`, is reported as the null command `:` so its targets are kept."""
+    written: a leading `~` is not expanded. With `null_commands`, a command with no program, such as `> f`,
+    `X=1 > f`, `(X=1) > f` or the redirection on a leading `cd`, is reported as the null command `:` so its
+    targets are kept."""
 
 
 class Unsupported(Exception):
@@ -265,7 +266,7 @@ _WRAPPERS: dict[str, _Wrapper] = {
 }
 
 
-def parse(command: str) -> tuple[SimpleCommand, ...]:
+def parse(command: str, *, null_commands: bool = False) -> tuple[SimpleCommand, ...]:
     """Split a shell command into simple commands with wrappers removed.
 
     Leading `VAR=value` assignments are dropped, then wrappers from the wrapper table are removed in any
@@ -274,8 +275,13 @@ def parse(command: str) -> tuple[SimpleCommand, ...]:
     parse their script again, one level deep. A `cd DIR &&` at the start of the command, or at the start
     of a subshell group, sets the working directory of the commands after it in that group and is not
     reported as a command. The reported program is the basename of the program word.
+
+    `null_commands` also reports redirections that run no program as the null command `:` (see
+    `SimpleCommand.writes`). `:` is never a program word the parser accepts, so it cannot be confused with
+    one; callers that ask what runs leave it off.
     """
-    return _parse(command, depth=0)
+    commands = _parse(command, depth=0)
+    return commands if null_commands else tuple(c for c in commands if c.program != ":")
 
 
 def _parse(command: str, depth: int) -> tuple[SimpleCommand, ...]:
@@ -492,6 +498,8 @@ class _Grouper:
                     if self._redirect(text, fd, target):
                         if self.closed_group:
                             start = self.closed_from
+                            if start == len(self.commands):
+                                self._emit_null(self.frames[-1], ())
                             self.commands[start:] = [
                                 replace(c, writes=(*c.writes, target.text)) for c in self.commands[start:]
                             ]

@@ -35,10 +35,12 @@ from scars.render import (
     mask_secrets,
     names_secret,
     normalize_command,
+    plain_command,
     render,
     render_deny,
     shannon_entropy,
 )
+from scars.shell import SimpleCommand
 
 REPO = RepoScope(RepoId("openwhispr"))
 MACHINE = MachineScope()
@@ -1204,3 +1206,15 @@ def test_a_human_edit_naming_a_secret_argument_is_refused():
     with pytest.raises(RejectedText) as caught:
         check_fields("deploy", "pass --token:hunter2", "c", REPO, known_commands=KNOWN, trust_class=HUMAN)
     assert str(caught.value) == "instead: secret.keyed_argument"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("> /tmp/log", None),
+        ("cd /tmp > /dev/null && pytest", None),
+        ("pytest -k x", SimpleCommand("pytest", ("-k", "x"), None)),
+    ],
+)
+def test_plain_command_reports_no_null_command_for_a_redirection(command, expected):
+    assert plain_command(command) == expected

@@ -145,19 +145,45 @@ def test_ignored_events_do_not_count_toward_the_error_rate(home, user_home, monk
     ]
 
 
-def test_doctor_upgrades_and_reports_a_telemetry_schema_older_than_the_code(home, user_home, monkeypatch):
+OLD_SCHEMA = (
+    "ok    telemetry schema: version 1 is older than this scars (version 2); "
+    "scars mine or scars init upgrades it"
+)
+
+
+def test_doctor_reports_an_older_telemetry_schema_without_writing_it(home, user_home, monkeypatch):
     stub(monkeypatch)
     install_codex(user_home)
     seed(home)
     (home / "telemetry.db").unlink()
     first_telemetry(home / "telemetry.db")
+    before = (home / "telemetry.db").read_bytes()
     code, out, _ = run(make_ctx(user_home), "doctor")
     assert code == 0
     assert out.splitlines()[:3] == [
-        "ok    telemetry schema: version 1 was older than this scars (version 2); upgraded",
+        OLD_SCHEMA,
         "claude: no hook runs in the last 24 hours; hooks not installed (run scars init)",
         "codex: last hook 2027-01-15 07:59, 1 runs, no latency, errors 0 (0.0%), error classes: none; "
         "hooks installed",
     ]
-    assert telemetry_version(home / "telemetry.db") == 2
-    assert run(make_ctx(user_home), "doctor")[1].splitlines()[0].startswith("claude: ")
+    assert (home / "telemetry.db").read_bytes() == before
+    assert telemetry_version(home / "telemetry.db") == 1
+
+
+def test_an_older_telemetry_schema_in_a_read_only_store_does_not_fail_doctor(home, user_home, monkeypatch):
+    stub(monkeypatch)
+    install_codex(user_home)
+    seed(home)
+    (home / "telemetry.db").unlink()
+    first_telemetry(home / "telemetry.db")
+    (home / "telemetry.db").chmod(0o400)
+    home.chmod(0o500)
+    try:
+        code, out, _ = run(make_ctx(user_home), "doctor")
+    finally:
+        home.chmod(0o700)
+        (home / "telemetry.db").chmod(0o600)
+    assert code == 0
+    assert out.splitlines()[0] == OLD_SCHEMA
+    assert "FAIL  telemetry" not in out
+    assert telemetry_version(home / "telemetry.db") == 1

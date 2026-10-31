@@ -33,6 +33,12 @@ def pair(failed_command, passing_command):
     return Pair(failure, call("p", passing_command))
 
 
+def test_a_redirection_with_no_program_is_not_a_command_of_its_own():
+    with pytest.raises(build.Skipped) as caught:
+        build.build(pair("cd /tmp > /dev/null && pytest --frobnicate", "pytest tests"), RepoId("r"), "own")
+    assert caught.value.reason == "not_plain_command"
+
+
 def test_a_retry_of_the_same_words_is_no_lesson():
     with pytest.raises(build.Skipped) as caught:
         build.build(pair("pytest tests", "pytest   'tests'"), RepoId("r"), "own")

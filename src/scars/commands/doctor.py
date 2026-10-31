@@ -285,8 +285,8 @@ def doctor(
     hits: list[telemetry.Hit] = []
     tele_path = scars_home / "telemetry.db"
     reports = None
-    if tele_path.exists() and (upgrade := _upgrade_telemetry(tele_path)) is not None:
-        out.append(upgrade)
+    if tele_path.exists() and (schema := _telemetry_schema(tele_path)) is not None:
+        out.append(schema)
     try:
         if tele_path.exists():
             tele = connect_readonly(tele_path, "hits")
@@ -315,32 +315,22 @@ def doctor(
     return out
 
 
-def _upgrade_telemetry(path: Path) -> Check | None:
-    """Upgrade a telemetry.db older than this scars and report it. None when the file is current, or
-    unreadable, which the hits read reports."""
+def _telemetry_schema(path: Path) -> Check | None:
+    """Report a telemetry.db older than this scars, without writing it: doctor only reads. None when the
+    file is current, or unreadable, which the hits read reports."""
     current = store.TELEMETRY_SCHEMA_VERSION
-    found = None
     try:
         db = connect_readonly(path, "hits")
         try:
             found = db.execute("pragma user_version").fetchone()[0]
         finally:
             db.close()
-        if not 0 < found < current:
-            return None
-        db = store.connect(path, synchronous="NORMAL")
-        try:
-            store.ensure_telemetry_schema(db)
-        finally:
-            db.close()
-    except (sqlite3.Error, OSError) as exc:
-        if found is None:
-            return None
-        detail = f"version {found} is older than this scars (version {current}); the upgrade failed: "
-        return Check("telemetry schema", False, detail + shown(str(exc)))
-    return Check(
-        "telemetry schema", True, f"version {found} was older than this scars (version {current}); upgraded"
-    )
+    except (sqlite3.Error, OSError):
+        return None
+    if not 0 < found < current:
+        return None
+    detail = f"version {found} is older than this scars (version {current}); "
+    return Check("telemetry schema", True, detail + "scars mine or scars init upgrades it")
 
 
 def cmd_doctor(_: argparse.Namespace, ctx: Context) -> int:

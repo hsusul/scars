@@ -50,6 +50,13 @@ def test_index_counts_literal_values_and_memoizes():
     assert index.precision(path, SIG) == Precision(0, 1, 1, 11)
 
 
+def test_a_redirection_with_no_program_runs_no_null_command():
+    calls = [shell("> /tmp/log", True), shell("cd /tmp > /dev/null && pytest", True)]
+    index = CallIndex(calls, lambda cwd: None)
+    assert index.precision(Trigger(TriggerKind.COMMAND, ":", Stage.GATE), SIG) == Precision(0, 0, 0, 2)
+    assert index.precision(Trigger(TriggerKind.COMMAND, "pytest", Stage.GATE), SIG) == Precision(0, 1, 1, 2)
+
+
 def test_index_rejects_error_triggers():
     with pytest.raises(ValueError):
         CallIndex(CALLS, lambda cwd: None).precision(Trigger(TriggerKind.ERROR, SIG, Stage.REPAIR), SIG)
