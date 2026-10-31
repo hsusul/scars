@@ -65,7 +65,7 @@ def test_init_mine_inbox_then_the_hook_shows_the_lesson(work, monkeypatch):
     )
     assert (result.returncode, result.stderr) == (0, "")
     context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
-    assert f"[scars {lesson.id} note | repo app | seen in 1 session | reviewed " in context
+    assert f"[scars {lesson.id} note | repo app | seen 1x | reviewed " in context
     assert "pytest --frobnicate" in context
 
     code, out, _ = run(make_ctx(user_home), "why", "last")

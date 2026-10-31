@@ -1,5 +1,5 @@
 from cli_helpers import DAY, NOW, SIG, connect, human, make_ctx, run, seed
-from scars import store, telemetry
+from scars import render, store, telemetry
 from scars.model import EventType, HitOutcome
 
 pytest_plugins = ("cli_fixtures",)
@@ -71,7 +71,7 @@ def test_why_shows_trigger_input_observations_and_events(home, user_home):
     expected = f"""{header}
   avoid:   pytest --frobnicate
   instead: run `pytest tests` instead
-  reason:  {SIG}
+  reason:  {render.MINED_REASON}
 triggers:
   command at gate: pytest ** --frobnicate
   error at repair: {SIG}

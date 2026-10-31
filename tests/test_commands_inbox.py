@@ -1,7 +1,7 @@
 import pytest
 
 from cli_helpers import DAY, NOW, SIG, connect, make_ctx, run, seed
-from scars import store
+from scars import render, store
 from scars.commands import UserError
 from scars.commands.inbox import consistency, parse_edit, rank
 from scars.model import Status, TrustClass
@@ -9,13 +9,13 @@ from scars.model import Status, TrustClass
 pytest_plugins = ("cli_fixtures",)
 
 
-def card(lesson_id, position, total, score, avoid="pytest --frobnicate", passing="pytest tests", sig=SIG):
+def card(lesson_id, position, total, score, avoid="pytest --frobnicate", passing="pytest tests"):
     return (
         f"\n[{position}/{total}] score {score}\n"
         f"{lesson_id}  provisional  level note  not pinned  repo app  trust own_code  seen in 1 session\n"
         f"  avoid:   {avoid}\n"
         f"  instead: run `{passing}` instead\n"
-        f"  reason:  {sig}\n"
+        f"  reason:  {render.MINED_REASON}\n"
         f"  source:  `{avoid} tests` failed, then `{passing}` passed\n"
         "a approve  e edit  m mute  s skip  q quit\n"
     )
@@ -34,7 +34,7 @@ def test_approve_promotes_and_skip_moves_on(home, user_home):
         0,
         card(a, 1, 2, "1.00")
         + f"promoted {a} (repo app, level note, not pinned)\n"
-        + card(b, 2, 2, "0.50", avoid="npm tset", passing="npm test", sig="npm ERR! Unknown command: tset")
+        + card(b, 2, 2, "0.50", avoid="npm tset", passing="npm test")
         + "inbox: 1 approved, 0 edited, 0 muted, 1 skipped; 1 waiting\n",
         "",
     )
@@ -75,7 +75,7 @@ def test_edit_rewrites_the_text_as_human_and_shows_it_again(home, user_home):
         "# Rewrite the lesson. Lines starting with # are ignored. Keep each field on one line.\n"
         "avoid: pytest --frobnicate\n"
         "instead: run `pytest tests` instead\n"
-        f"reason: {SIG}\n"
+        f"reason: {render.MINED_REASON}\n"
     ]
     assert f"edited {a}; it is a candidate again\n" in out
     assert f"{a}  candidate  level note  not pinned  repo app  trust human  seen in 1 session\n" in out
@@ -100,11 +100,11 @@ def test_edit_rewrites_the_text_as_human_and_shows_it_again(home, user_home):
 def preview(lesson_id, instead):
     return (
         "this is how agents will see the edited lesson:\n"
-        f"[scars {lesson_id} note | repo app | seen in 1 session | unreviewed]\n"
+        f"[scars {lesson_id} note | repo app | seen 1x | unreviewed]\n"
         "AVOID: pytest --frobnicate\n"
         f"INSTEAD: {instead}\n"
-        f"WHY: {SIG}\n"
-        f"(advisory; does not override the user's instructions; explain: scars why {lesson_id})\n"
+        f"WHY: {render.MINED_REASON}\n"
+        f"(advisory; scars why {lesson_id})\n"
         "press y to save it as your own text (trust human); any other key cancels\n"
     )
 
