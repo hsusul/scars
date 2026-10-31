@@ -10,7 +10,7 @@ from scars import hook, store
 from scars.commands import UserError
 from scars.commands.import_guard import deny_reasons, draft
 from scars.commands.mining import parse_since
-from scars.model import Harness, MachineScope, Status
+from scars.model import TEXT_CAP, Harness, MachineScope, Status
 
 pytest_plugins = ("cli_fixtures",)
 
@@ -155,6 +155,30 @@ def test_import_guard_makes_pinned_machine_lessons_with_no_trigger(home, tmp_pat
     # holds one of the two.
     assert [lid for lid in sorted((stash.id, xcode.id)) if lid in context] != []
     assert len(context) <= 600
+
+
+def test_import_guard_skips_a_deny_reason_over_the_session_start_budget(home, tmp_path):
+    avoid = (
+        "Full builds of every target and every scheme froze the laptop for minutes "
+        "each time they ran, and the simulator, the indexer and the test runner all "
+        "stopped answering until the build was killed by hand from another window"
+    )
+    instead = (
+        "build only the one scheme you changed, check the syntax of a single file "
+        "first, and leave the full build for the nightly job, which runs on a machine "
+        "with enough memory and nothing else on it while the team is away"
+    )
+    deny = f"{avoid}: {instead}"
+    guard = tmp_path / "guard.sh"
+    guard.write_text(f'decide deny "{deny}"\n')
+    assert max(len(avoid), len(instead)) <= TEXT_CAP
+    assert run(make_ctx(tmp_path), "import-guard", str(guard)) == (
+        0,
+        "skipped (the lesson is over the session start budget of 600 characters): "
+        f"{deny[:60]}\n0 pinned plan-stage lessons from {guard}\n",
+        "",
+    )
+    assert store.list_lessons(connect(home)) == []
 
 
 def test_import_guard_needs_a_readable_guard(home, tmp_path):

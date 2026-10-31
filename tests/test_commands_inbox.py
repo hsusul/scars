@@ -4,7 +4,7 @@ from cli_helpers import DAY, NOW, SIG, connect, make_ctx, run, seed
 from scars import render, store
 from scars.commands import UserError
 from scars.commands.inbox import consistency, parse_edit, rank
-from scars.model import Status, TrustClass
+from scars.model import TEXT_CAP, Status, TrustClass
 
 pytest_plugins = ("cli_fixtures",)
 
@@ -154,6 +154,33 @@ def test_an_edited_command_that_passed_needs_one_y(home, user_home):
     assert "never ran successfully" not in out
     assert f"edited {a}; it is a candidate again\n" in out
     assert store.get_lesson(connect(home), a).trust_class is TrustClass.HUMAN
+
+
+def test_an_edit_over_the_repair_budget_is_refused_before_the_preview(home, user_home):
+    a = seed(home)
+    instead = (
+        "wait for the running build to finish and then start the next one, "
+        "because a second build started now takes the lock and fails"
+    )
+    reason = (
+        "two builds that share one derived data folder corrupt each other, and the second one "
+        "fails with a lock error every time, even when the first one is almost done"
+    )
+
+    def editor(text):
+        text = text.replace("instead: run `pytest tests` instead", f"instead: {instead}")
+        return text.replace(f"reason: {render.MINED_REASON}", f"reason: {reason}")
+
+    out = run(make_ctx(user_home, keys="eyq", edit=editor), "inbox")[1]
+    assert max(len(instead), len(reason)) <= TEXT_CAP
+    assert "not applied: the lesson is over the repair budget of 400 characters\n" in out
+    assert "this is how agents will see the edited lesson" not in out
+    lesson = store.get_lesson(connect(home), a)
+    assert (lesson.revision, lesson.trust_class, lesson.text.instead) == (
+        2,
+        TrustClass.OWN_CODE,
+        "run `pytest tests` instead",
+    )
 
 
 def test_an_edit_that_breaks_a_text_rule_changes_nothing(home, user_home):

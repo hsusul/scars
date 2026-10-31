@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+from dataclasses import replace
 
 from scars import paths, render, store
-from scars.commands import Context, UserError, get_lesson, lessons_db, require_human
+from scars.commands import Context, UserError, get_lesson, lessons_db, rejection, require_human
 from scars.model import EventType, Lesson, Level, MachineScope, RepoId, RepoScope, Scope, SessionScope
 
 ACTOR = "human"
@@ -55,7 +56,7 @@ def promotion_scope(db: sqlite3.Connection, lesson: Lesson, *, machine: bool, re
                 registered_repos=store.repo_names(db),
             )
         except render.RejectedText as exc:
-            raise UserError(f"{lesson.id} cannot have machine scope: {exc.field} breaks {exc.rule}") from None
+            raise UserError(f"{lesson.id} cannot have machine scope: {rejection(exc)}") from None
         return MachineScope()
     if repo is not None:
         if store.repo_owner_class(db, RepoId(repo)) is None:
@@ -67,6 +68,17 @@ def promotion_scope(db: sqlite3.Connection, lesson: Lesson, *, machine: bool, re
 
 
 def promote(db: sqlite3.Connection, ctx: Context, lesson: Lesson, scope: Scope) -> None:
+    """Promote `lesson` into `scope`, unless the lesson there would not fit a stage budget: a longer
+    scope label lengthens the header, and promotion adds the review date."""
+    try:
+        render.check_budgets(
+            replace(lesson, scope=scope),
+            known_commands=store.passing_inputs(db, [lesson.id])[lesson.id],
+            registered_repos=store.repo_names(db),
+        )
+    except render.RejectedText as exc:
+        label = render.scope_label(scope)
+        raise UserError(f"{lesson.id} cannot be promoted to {label}: {rejection(exc)}") from None
     payload: dict[str, object] = {} if scope == lesson.scope else {"scope": store.scope_to_json(scope)}
     apply(db, ctx, lesson, EventType.PROMOTED, payload)
     ctx.print(f"promoted {lesson.id} ({render.scope_label(scope)}, level note, not pinned)")

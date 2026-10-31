@@ -318,6 +318,20 @@ def get_lesson(db: sqlite3.Connection, lesson_id: str) -> Lesson:
     return lesson
 
 
+_BUDGET_CHARS = {f"budget.{stage}": b.chars for stage, b in render.STAGE_BUDGETS.items()} | {
+    "budget.session_start": render.SESSION_START_BUDGET.chars
+}
+
+
+def rejection(exc: render.RejectedText) -> str:
+    """Why `render` refused a lesson, in words for the person who wrote it."""
+    chars = _BUDGET_CHARS.get(exc.rule)
+    if chars is None:
+        return f"{exc.field} breaks {exc.rule}"
+    stage = exc.rule.removeprefix("budget.").replace("_", " ")
+    return f"the lesson is over the {stage} budget of {chars} characters"
+
+
 def telemetry_db() -> sqlite3.Connection | None:
     """telemetry.db read-only, or None when it is missing or unreadable: telemetry is best-effort."""
     path = paths.home() / "telemetry.db"

@@ -12,7 +12,8 @@ the editor's word alone (the editor could be a script that rewrites mined text):
 lesson exactly as agents will see it and applies the edit only after the person presses `y`. When the
 new `instead` names a backticked command that never passed on this machine, it says so and needs a
 second `y`. Any other key cancels. The edit sends the lesson back to candidate, and the inbox shows it
-again so the person can approve the new wording at once.
+again so the person can approve the new wording at once. An edit that would not fit a stage budget once
+its header reaches its longest form is refused before the preview, so it never stops rendering later.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from scars import render, store
-from scars.commands import Context, UserError, lessons_db, require_human
+from scars.commands import Context, UserError, lessons_db, rejection, require_human
 from scars.commands.inspect import describe
 from scars.commands.lifecycle import apply, promote
 from scars.model import EventType, Lesson, SessionScope, Status, TrustClass
@@ -137,9 +138,10 @@ def edit(db: sqlite3.Connection, ctx: Context, lesson: Lesson) -> Edit:
             registered_repos=repos,
         )
         after = replace(lesson, text=text, trust_class=TrustClass.HUMAN, status=Status.CANDIDATE)
+        render.check_budgets(after, known_commands=known, registered_repos=repos)
         shown = render.render(after, known_commands=known, registered_repos=repos)
     except render.RejectedText as exc:
-        raise UserError(f"{exc.field} breaks {exc.rule}") from None
+        raise UserError(rejection(exc)) from None
     ctx.print("this is how agents will see the edited lesson:")
     ctx.print(shown)
     ctx.print("press y to save it as your own text (trust human); any other key cancels")

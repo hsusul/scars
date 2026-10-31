@@ -1,9 +1,24 @@
 import pytest
 
 from cli_helpers import NOW, connect, human, make_ctx, run, seed
-from scars import paths, store
+from scars import paths, render, store
 from scars.commands import harness_in, refusal
-from scars.model import EventType, Level, MachineScope, RepoScope, Status
+from scars.model import (
+    TEXT_CAP,
+    EventType,
+    LessonText,
+    Level,
+    MachineScope,
+    RepoId,
+    RepoScope,
+    SessionId,
+    SessionScope,
+    Stage,
+    Status,
+    Trigger,
+    TriggerKind,
+    TrustClass,
+)
 
 pytest_plugins = ("cli_fixtures",)
 
@@ -114,6 +129,43 @@ def test_promote_to_machine_scope(home, user_home):
         f"promoted {lesson_id} (machine, level note, not pinned)\n"
     )
     assert store.get_lesson(connect(home), lesson_id).scope == MachineScope()
+
+
+LONG_TEXT = LessonText(
+    avoid="starting a second full build while the first one still holds the lock",
+    instead=(
+        "wait for the first build to finish, or cancel it, "
+        "and start the next build only after the lock is gone"
+    ),
+    reason="two builds that share one derived data folder corrupt each other and both fail with a lock error",
+)
+
+
+def test_promote_refuses_a_scope_whose_header_pushes_the_lesson_over_budget(home, user_home):
+    db = connect(home)
+    store.add_repo(db, RepoId("r-web-frontend"), "web", "own")
+    lesson_id = store.create_lesson(
+        db,
+        text=LONG_TEXT,
+        scope=SessionScope(SessionId("s1")),
+        trust_class=TrustClass.HUMAN,
+        triggers=[Trigger(TriggerKind.ERROR, "Error: the build lock is held", Stage.REPAIR)],
+        fingerprint="fp-long",
+        actor="human",
+        at=NOW,
+    )
+    stored = store.get_lesson(db, lesson_id)
+    db.close()
+    assert max(len(v) for v in (LONG_TEXT.avoid, LONG_TEXT.instead, LONG_TEXT.reason)) <= TEXT_CAP
+    assert render.check_budgets(stored, known_commands=frozenset()) is None
+    assert run(make_ctx(user_home), "promote", lesson_id, "--repo", "r-web-frontend") == (
+        1,
+        "",
+        f"scars promote: {lesson_id} cannot be promoted to repo r-web-frontend: "
+        "the lesson is over the repair budget of 400 characters\n",
+    )
+    lesson = store.get_lesson(connect(home), lesson_id)
+    assert (lesson.status, lesson.revision, lesson.scope) == (Status.CANDIDATE, 1, SessionScope("s1"))
 
 
 def test_promote_to_an_unknown_repo_is_a_user_error(home, user_home):
