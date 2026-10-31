@@ -160,7 +160,7 @@ IMPERATIVE_RULES: tuple[Rule, ...] = (
     Rule(
         "lint.exec_hook",
         _pattern(
-            r"\bgit\b.*?\s(?:-c|--config-env|--exec-path|--upload-pack|--receive-pack)\b"
+            r"\bgit\b.*?\s(?:(?-i:-c)|--config-env|--exec-path|--upload-pack|--receive-pack)\b"
             r"|\b(?:core\.(?:pager|editor|sshcommand|askpass|hookspath|fsmonitor|gitproxy)|alias\.[\w-]"
             r"|(?:diff|merge|filter)\.[\w-]+\.(?:command|driver|clean|smudge|process|textconv)"
             r"|credential\.helper|sequence\.editor)"

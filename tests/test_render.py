@@ -686,6 +686,26 @@ def test_an_observed_command_is_accepted_exactly():
     assert text.instead == "run `npm run build`"
 
 
+@pytest.mark.parametrize(
+    "command", ["git -C app log --oneline", "git -C /tmp/repo status", "git log -C --stat"]
+)
+def test_git_dir_and_copy_flags_are_not_inline_config(command):
+    text = check_fields(
+        "git -C app logg",
+        f"run `{command}`",
+        MINED_WHY,
+        REPO,
+        known_commands=frozenset({command}),
+        trust_class=OWN,
+    )
+    assert text.instead == f"run `{command}`"
+
+
+@pytest.mark.parametrize("command", ["git -C app -c core.pager=sh log", "git -C app -c x=y log"])
+def test_inline_config_after_a_git_dir_flag_is_still_rejected(command):
+    assert reject("instead", f"run `{command}`", known=frozenset({command})) == "lint.exec_hook"
+
+
 def test_a_human_lesson_may_name_a_command_never_observed():
     text = check_fields(
         "a", "run `brew install poppler`", "c", REPO, known_commands=frozenset(), trust_class=HUMAN
