@@ -33,6 +33,8 @@ from scars.model import DelayedOutcome, Lesson, LessonId, Stage, ToolKind, Trigg
 
 WINDOW = 5
 IDLE_SECONDS = 24 * 3600
+DAY = 86400.0
+BACKFILL_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,7 @@ def run(lessons: sqlite3.Connection, telemetry_path: str, now: float, *, root_of
     except sqlite3.Error:
         return Result(0, 0)
     try:
+        store.ensure_telemetry_schema(tdb)
         return _run(lessons, tdb, now, root_of)
     except sqlite3.Error:
         return Result(0, 0)
@@ -211,7 +214,11 @@ def _run(lessons: sqlite3.Connection, tdb: sqlite3.Connection, now: float, root_
         if outcome is not None:
             decided.append((seq, str(outcome)))
     models: list[tuple[str, int]] = []
-    for seq, session_id, at in tdb.execute("select seq, session_id, at from hits where model_id is null"):
+    # Mined calls are kept for 30 days, so an older hit has nothing left to take its model from.
+    backfill_since = now - BACKFILL_DAYS * DAY
+    for seq, session_id, at in tdb.execute(
+        "select seq, session_id, at from hits where model_id is null and at >= ?", (backfill_since,)
+    ):
         model = _model_at(calls_of(session_id), at)
         if model:
             models.append((model, seq))

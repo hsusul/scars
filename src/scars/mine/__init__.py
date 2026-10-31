@@ -87,6 +87,11 @@ def _session_id(source: Source, path: Path) -> str:
     return path.stem
 
 
+def session_key(source: Source, path: Path) -> tuple[str, str]:
+    """The `(harness, session id)` a transcript file belongs to."""
+    return str(source.harness), _session_id(source, path)
+
+
 @dataclass(frozen=True)
 class _Read:
     offsets: tuple[store.Offset, ...]
@@ -353,16 +358,22 @@ def run(
     *,
     common_dir_of: Callable[[str], str | None] = hook.git_common_dir,
     repo_root_of: Callable[[str], str | None] = hook.repo_root,
+    skipped_sessions: frozenset[tuple[str, str]] = frozenset(),
 ) -> Summary:
     """Mine one batch into `home`/lessons.db and write outcomes into `home`/telemetry.db if it exists.
 
     `common_dir_of` maps a directory to its git common dir (which names the registered repo), and
     `repo_root_of` to its worktree root (against which path triggers resolve absolute paths).
+    `skipped_sessions` names the `(harness, session id)` keys whose transcripts were left out on
+    purpose (`scars mine --since`): their pending failures are kept as they are, neither advanced nor
+    expired, because the transcript was skipped rather than found idle. Every other session follows
+    the normal rules, even one that was read and produced no new calls.
     """
     db = store.init_lessons(home / "lessons.db")
     try:
         store.ensure_miner_schema(db)
-        return _run(db, home, sources, now, _Repos(db, common_dir_of, repo_root_of))
+        repos = _Repos(db, common_dir_of, repo_root_of)
+        return _run(db, home, sources, now, repos, skipped_sessions)
     finally:
         db.close()
 
@@ -373,6 +384,7 @@ def _run(
     sources: Iterable[Source],
     now: float,
     repos: _Repos,
+    skipped_sessions: frozenset[tuple[str, str]] = frozenset(),
 ) -> Summary:
     counts: Counter[str] = Counter()
     rejected: Counter[str] = Counter()
@@ -393,6 +405,9 @@ def _run(
     found: list[pairs.Pair] = []
     still_open: list[pairs.OpenFailure] = []
     for key in sorted(set(streams) | set(waiting)):
+        if key in skipped_sessions:
+            still_open.extend(waiting.get(key, ()))
+            continue
         result = pairs.pair_session(waiting.get(key, ()), streams.get(key, ()), now)
         found.extend(result.pairs)
         still_open.extend(result.still_open)

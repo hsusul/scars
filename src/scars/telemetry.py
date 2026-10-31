@@ -188,3 +188,45 @@ def _insert_hits(db: sqlite3.Connection, hits: Iterable[Hit]) -> None:
             for h in hits
         ],
     )
+
+
+_HIT_COLUMNS = (
+    "at, harness, harness_version, model_id, session_id, tool_use_id, event, stage, lesson_id, "
+    "lesson_revision, status_at_injection, trigger_key, outcome, injected_chars, latency_ms, error_class, arm"
+)
+
+
+def _hit_row(row: tuple[object, ...]) -> Hit:
+    values = list(row)
+    values[12] = HitOutcome(values[12])
+    return Hit(*values)  # type: ignore[arg-type]
+
+
+def hits_since(db: sqlite3.Connection, since: float) -> list[Hit]:
+    """Every hit at or after `since`, oldest first, for `scars doctor`. Unlike the hook's reads, this one
+    raises on a broken file: the caller is a human asking what is wrong."""
+    rows = db.execute(f"select {_HIT_COLUMNS} from hits where at >= ? order by at, seq", (since,))
+    return [_hit_row(r) for r in rows]
+
+
+def last_shown(db: sqlite3.Connection, lesson_id: LessonId | None = None) -> Hit | None:
+    """The latest `shown` hit, of one lesson or of any, for `scars why`."""
+    where = "outcome = 'shown' and lesson_id is not null"
+    params: tuple[object, ...] = ()
+    if lesson_id is not None:
+        where += " and lesson_id = ?"
+        params = (lesson_id,)
+    row = db.execute(
+        f"select {_HIT_COLUMNS} from hits where {where} order by at desc, seq desc limit 1", params
+    ).fetchone()
+    return _hit_row(row) if row else None
+
+
+def shown_counts(db: sqlite3.Connection, since: float) -> dict[LessonId, int]:
+    """How many times each lesson was shown since `since`, for `scars ls --firing`."""
+    rows = db.execute(
+        "select lesson_id, count(*) from hits where outcome = 'shown' and lesson_id is not null "
+        "and at >= ? group by lesson_id",
+        (since,),
+    )
+    return {LessonId(lesson_id): n for lesson_id, n in rows}

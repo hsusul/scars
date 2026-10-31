@@ -87,3 +87,9 @@ create table if not exists miner_file_context (  -- Codex session context in for
 create table precision_runs (lesson_id text not null, revision integer not null, matched_failing integer not null,
                              matched_passing integer not null, window_days integer not null, at real not null,
                              primary key (lesson_id, revision));
+
+-- Read-path indexes, added after the first release; `if not exists` lets ensure_miner_schema add them
+-- to an existing store.
+create index if not exists observations_lesson on observations(lesson_id);
+create index if not exists events_lesson on events(lesson_id, seq);
+create index if not exists mined_calls_at on mined_calls(at);

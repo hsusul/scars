@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "@SCARS_HOOK@ claude SessionStart", "timeout": 2}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "@SCARS_HOOK@ claude UserPromptSubmit", "timeout": 2}]}
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit",
+        "hooks": [{"type": "command", "command": "@SCARS_HOOK@ claude PreToolUse", "timeout": 2}]
+      }
+    ],
+    "PostToolUseFailure": [
+      {"hooks": [{"type": "command", "command": "@SCARS_HOOK@ claude PostToolUseFailure", "timeout": 2}]}
+    ]
+  }
+}

@@ -236,7 +236,12 @@ PAYLOAD_KEYS: dict[EventType, dict[str, PayloadKey]] = {
     EventType.OBSERVED: {"fix_program": PayloadKey(str)},
     EventType.PROMOTED: {"scope": PayloadKey(dict)},
     EventType.LEVEL_SET: {"level": PayloadKey(str, required=True)},
-    EventType.EDITED: {"text": PayloadKey(dict), "triggers": PayloadKey(list), "scope": PayloadKey(dict)},
+    EventType.EDITED: {
+        "text": PayloadKey(dict),
+        "triggers": PayloadKey(list),
+        "scope": PayloadKey(dict),
+        "trust_class": PayloadKey(str),
+    },
     EventType.SUPERSEDED: {"superseded_by": PayloadKey(str, required=True)},
 }
 """The payload keys each event accepts. Events not listed take an empty payload."""
@@ -303,6 +308,11 @@ def next_state(state: State | None, event: EventType, payload: object, *, at: fl
                 new = replace(new, text=_parse_text(payload["text"]))
             if "triggers" in payload:
                 new = replace(new, triggers=frozenset(_parse_triggers(payload["triggers"])))
+            if "trust_class" in payload:
+                # A human rewrite makes the text the human's, and nothing else may change trust.
+                if payload["trust_class"] != TrustClass.HUMAN.value:
+                    raise Rejected(f"an edit can only set trust class human, not {payload['trust_class']!r}")
+                new = replace(new, trust_class=TrustClass.HUMAN)
             if "scope" in payload:
                 scope = _parse_scope(payload["scope"])
                 if scope.kind == "machine" and state.scope.kind != "machine":
@@ -690,7 +700,8 @@ def apply_event(
 
     Payload keys by event: `observed` takes an optional `fix_program`, `promoted` an optional `scope`
     (required when the lesson is session-scoped), `level_set` needs `level`, `edited` takes optional
-    `text`, `triggers` and `scope` (never machine scope), and `superseded` needs `superseded_by`.
+    `text`, `triggers`, `scope` (never machine scope) and `trust_class` (only `human`), and `superseded`
+    needs `superseded_by`.
     """
     if event is EventType.PROPOSED:
         raise Rejected("use create_lesson to propose a lesson")
@@ -973,6 +984,13 @@ def ensure_miner_schema(db: sqlite3.Connection) -> None:
             db.execute(statement)
 
 
+def ensure_telemetry_schema(db: sqlite3.Connection) -> None:
+    """Add telemetry.db's later indexes to a file made before they existed. Idempotent."""
+    for statement in _statements(schema_sql("telemetry")):
+        if "if not exists" in statement:
+            db.execute(statement)
+
+
 def add_clone(db: sqlite3.Connection, common_dir: str, repo_id: RepoId, at: float | None = None) -> None:
     """Register a clone's git common dir for a registered repo, or move it to that repo."""
     db.execute(
@@ -1164,6 +1182,11 @@ def lesson_last_seen(db: sqlite3.Connection, lesson_id: LessonId) -> float | Non
     return row[0] if row else None
 
 
+def lessons_last_seen(db: sqlite3.Connection) -> dict[LessonId, float | None]:
+    """Every lesson's `last_seen_at` in one query, for listings that would otherwise ask per lesson."""
+    return {LessonId(i): at for i, at in db.execute("select id, last_seen_at from lessons")}
+
+
 def expiring_lessons(db: sqlite3.Connection, now: float) -> list[tuple[LessonId, int]]:
     """`(id, revision)` of every candidate and provisional lesson whose expiry time has passed."""
     rows = db.execute(
@@ -1243,3 +1266,84 @@ def commit_batch(
     except BaseException:
         _rollback(db)
         raise
+
+
+# ---------------------------------------------------------------- CLI reads
+
+
+def list_lessons(
+    db: sqlite3.Connection,
+    *,
+    statuses: Iterable[Status] | None = None,
+    repo_id: RepoId | None = None,
+) -> list[Lesson]:
+    """Lessons in any of `statuses` (all when None), narrowed to one repo's repo and path scopes."""
+    return _load(db, *_list_where(statuses, repo_id))
+
+
+def _list_where(statuses: Iterable[Status] | None, repo_id: RepoId | None) -> tuple[str, list[object]]:
+    where, params = "1", []
+    if statuses is not None:
+        wanted = sorted(str(s) for s in statuses)
+        where += f" and status in ({','.join('?' * len(wanted))})"
+        params += wanted
+    if repo_id is not None:
+        where += " and repo_id = ?"
+        params.append(repo_id)
+    return where, params
+
+
+def read_lessons(
+    db: sqlite3.Connection,
+    *,
+    statuses: Iterable[Status] | None = None,
+    repo_id: RepoId | None = None,
+) -> tuple[list[Lesson], list[tuple[str, str]]]:
+    """Like `list_lessons`, but a row that does not load (an empty text, an unknown enum value) comes
+    back as `(lesson id, reason)` instead of raising, so one broken row cannot hide the others."""
+    where, params = _list_where(statuses, repo_id)
+    try:
+        return _load(db, where, params), []
+    except (ValueError, TypeError):
+        pass
+    lessons: list[Lesson] = []
+    problems: list[tuple[str, str]] = []
+    for (lesson_id,) in db.execute(f"select id from lessons where {where} order by id", params).fetchall():
+        try:
+            lessons.extend(_load(db, "id = ?", (lesson_id,)))
+        except (ValueError, TypeError) as exc:
+            problems.append((str(lesson_id), str(exc)))
+    return lessons, problems
+
+
+@dataclass(frozen=True)
+class EventRow:
+    seq: int
+    lesson_id: str | None
+    type: str
+    actor: str
+    from_revision: int | None
+    to_revision: int | None
+    payload: str
+    """Canonical JSON, as stored."""
+    at: float
+
+
+def lesson_events(db: sqlite3.Connection, lesson_id: LessonId) -> list[EventRow]:
+    """One lesson's events in log order, for `scars why`."""
+    rows = db.execute(
+        "select seq, lesson_id, type, actor, from_revision, to_revision, payload, at from events "
+        "where lesson_id = ? order by seq",
+        (lesson_id,),
+    )
+    return [EventRow(*r) for r in rows]
+
+
+def observations(db: sqlite3.Connection, lesson_id: LessonId) -> list[Observation]:
+    """One lesson's observations, oldest first."""
+    rows = db.execute(
+        "select lesson_id, harness, session_id, failed_tool_use_id, failed_input, error_signature, "
+        "passing_input, at from observations where lesson_id = ? order by at, id",
+        (lesson_id,),
+    )
+    return [Observation(LessonId(r[0]), *r[1:]) for r in rows]

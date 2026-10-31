@@ -1,0 +1,5 @@
+{
+  "name": "scars-local",
+  "owner": {"name": "scars"},
+  "plugins": [{"name": "scars", "source": "./claude"}]
+}

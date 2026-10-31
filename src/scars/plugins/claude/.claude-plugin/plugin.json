@@ -1,0 +1,5 @@
+{
+  "name": "scars",
+  "version": "0.0.1",
+  "description": "Lessons from past agent sessions, delivered at session start, on prompts and after failed tool calls."
+}
