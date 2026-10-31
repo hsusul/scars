@@ -596,7 +596,7 @@ def _decide_with(
     if event.event is HookEventKind.TOOL_FAILED and event.error_text:
         from scars.signature import signature, tool_signature
 
-        error_sig = signature(event.error_text)
+        error_sig = signature(event.error_text, command=event.command)
         if error_sig is not None and event.tool_kind is ToolKind.OTHER and event.tool_name:
             tool_sig = tool_signature(event.tool_name, error_sig)
     if event.event is HookEventKind.TOOL_FAILED and error_sig is None:

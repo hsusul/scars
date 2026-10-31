@@ -899,6 +899,16 @@ def test_secret_in_an_error_or_a_path_is_not_stored_in_mined_calls(env):
     assert TOKEN not in stored
 
 
+def test_compound_stdout_is_not_stored_as_an_error_signature(env):
+    write(
+        env, "s1", Claude(env["repo"]).bash("t1", "cat AGENTS.md; rg missing src", "# Useful Commands").text()
+    )
+    summary = mine_now(env)
+    db = lessons_db(env)
+    assert (summary.calls, summary.failures, summary.pairs) == (1, 1, 0)
+    assert db.execute("select tool_use_id, error_signature from mined_calls").fetchall() == [("t1", None)]
+
+
 def test_secret_in_the_error_signature_writes_no_observation(env):
     t = (
         Claude(env["repo"])
