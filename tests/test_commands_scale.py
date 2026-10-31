@@ -101,9 +101,11 @@ LESSONS = 10_000
 HITS = 100_000
 
 
-def big_store(home):
+def big_store(home, monkeypatch):
     db = connect(home)
-    with store.transaction(db):
+    lesson_ids = (f"{i:08x}" for i in range(LESSONS))
+    with monkeypatch.context() as patch, store.transaction(db):
+        patch.setattr("secrets.token_hex", lambda _: next(lesson_ids))
         for i in range(LESSONS):
             add_lesson(db, i)
     ids = [r[0] for r in db.execute("select id from lessons")]
@@ -158,7 +160,7 @@ def add_lesson(db, i):
 
 def test_ls_and_doctor_on_10000_lessons_and_100000_hits(home, user_home, monkeypatch, capsys):
     started = time.perf_counter()
-    big_store(home)
+    big_store(home, monkeypatch)
     built = time.perf_counter() - started
     for name, ensure in (
         ("lessons.db", store.ensure_miner_schema),
