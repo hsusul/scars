@@ -26,6 +26,12 @@ files, except for the subcommands in `UNORDERED`, whose operands name distinct r
 A pass of the same tool and program in the same place that runs another target is counted as an
 `operand_mismatch` skip, and the failure keeps waiting for its fix within the same window.
 
+For a non-shell tool (built-in or MCP), the same target means the inputs differ in at most
+`render.TOOL_MAX_FIELDS` top-level fields when both are JSON objects (a field added, removed or changed
+counts once). A pass that differs in more is counted as a `structured_too_many_fields` skip and the failure
+keeps waiting, like an operand mismatch: it is another task, not a fix. Inputs that are not both JSON
+objects still pair, and the builder names why they yield no lesson.
+
 The same place means the same registered repo, or the same working directory when neither directory is
 in a registered repo. A lesson takes its scope and trust from the passing call's repo, so a failure in an
 upstream clone fixed by a call in an own repo would otherwise come out trusted as own code. A call whose
@@ -40,11 +46,13 @@ edit call would end its window before it could pair. A failed shell call whose c
 rejects never opens either: its program is unknown, so no later call can be shown to run the same one.
 """
 
+import json
 import posixpath
 from collections import Counter
 from collections.abc import Callable, Hashable, Iterable, Sequence
 from dataclasses import dataclass, replace
 
+from scars import render
 from scars.mine.calls import EDIT_TOOLS, Call, CallStatus
 from scars.model import ErrorSignature, ToolKind
 from scars.shell import Unsupported, parse
@@ -184,6 +192,29 @@ def same_target(failed: str, passing: str) -> bool:
     return a.operands == b.operands
 
 
+def input_object(text: str) -> dict[str, object] | None:
+    """A non-shell tool input as its top-level JSON object, or None when it is not one (or was cut)."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def differing_keys(failed: dict[str, object], passing: dict[str, object]) -> tuple[str, ...]:
+    """The top-level keys added, removed or changed, sorted. Values compare as JSON, so `1` and `true`
+    differ."""
+
+    def same(key: str) -> bool:
+        return key in failed and key in passing and _json(failed[key]) == _json(passing[key])
+
+    return tuple(sorted(k for k in failed.keys() | passing.keys() if not same(k)))
+
+
+def _json(value: object) -> str:
+    return json.dumps(value, sort_keys=True)
+
+
 @dataclass(frozen=True)
 class OpenFailure:
     tool_use_id: str
@@ -225,6 +256,8 @@ class Paired:
     """Open failures closed without a fix: an edit came first, the window ran out, or the session idled."""
     operand_mismatch: int = 0
     """Passes skipped as a fix because they ran the failed program on another target."""
+    too_many_fields: int = 0
+    """Passes of the failed non-shell tool skipped as a fix because too many input fields differ."""
 
 
 def open_failure(call: Call) -> OpenFailure | None:
@@ -250,8 +283,13 @@ def open_failure(call: Call) -> OpenFailure | None:
     )
 
 
-def _fixes(failure: OpenFailure, call: Call, place: Place) -> bool | None:
-    """True when the call fixes the failure, None when it would but runs another target, else False."""
+_OPERAND = "operand_mismatch"
+_FIELDS = "structured_too_many_fields"
+
+
+def _fixes(failure: OpenFailure, call: Call, place: Place) -> bool | str:
+    """True when the call fixes the failure, the skip name when it would but acts on another target,
+    else False."""
     candidate = (
         call.status is CallStatus.OK
         and call.tool == failure.tool
@@ -260,9 +298,17 @@ def _fixes(failure: OpenFailure, call: Call, place: Place) -> bool | None:
         and (where := place(failure.cwd)) is not None
         and where == place(call.cwd)
     )
-    if not candidate or call.tool_kind is not ToolKind.SHELL:
-        return candidate
-    return True if same_target(failure.input, call.input) else None
+    if not candidate:
+        return False
+    if call.tool_kind is ToolKind.SHELL:
+        return True if same_target(failure.input, call.input) else _OPERAND
+    failed, passing = input_object(failure.input), input_object(call.input)
+    too_many = (
+        failed is not None
+        and passing is not None
+        and len(differing_keys(failed, passing)) > render.TOOL_MAX_FIELDS
+    )
+    return _FIELDS if too_many else True
 
 
 def pair_session(
@@ -271,7 +317,8 @@ def pair_session(
     """Advance one session's open failures over its new calls, in order, and open the new failures."""
     active = list(waiting)
     pairs: list[Pair] = []
-    failures = unlessonable = dropped = mismatched = 0
+    failures = unlessonable = dropped = 0
+    mismatched: Counter[str] = Counter()
     for call in calls:
         kept: list[OpenFailure] = []
         for failure in active:
@@ -279,11 +326,11 @@ def pair_session(
                 dropped += 1
                 continue
             fixes = _fixes(failure, call, place)
-            if fixes:
+            if fixes is True:
                 pairs.append(Pair(failure, call))
                 continue
-            if fixes is None:
-                mismatched += 1
+            if fixes:
+                mismatched[fixes] += 1
             if failure.calls_since + 1 >= WINDOW:
                 dropped += 1
             else:
@@ -297,4 +344,12 @@ def pair_session(
             else:
                 active.append(opened)
     still = tuple(f for f in active if now - f.last_call_at < IDLE_SECONDS)
-    return Paired(tuple(pairs), still, failures, unlessonable, dropped + len(active) - len(still), mismatched)
+    return Paired(
+        tuple(pairs),
+        still,
+        failures,
+        unlessonable,
+        dropped + len(active) - len(still),
+        mismatched[_OPERAND],
+        mismatched[_FIELDS],
+    )

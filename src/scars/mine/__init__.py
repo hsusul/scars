@@ -200,7 +200,7 @@ def _open_from_store(p: store.PendingFailure, cwd: str | None) -> pairs.OpenFail
 def _pending_row(f: pairs.OpenFailure) -> store.PendingFailure | None:
     """The row to keep for an open failure, or None when its input or signature holds a secret. Such a
     failure could only pair into a candidate the secret scan rejects, so dropping it loses no lesson."""
-    texts = (f.input, f.signature, f.program, f.cwd)
+    texts = (f.input, f.signature, f.cwd, *([f.program] if f.program is not None else []))
     if any(_clean(t) is None for t in texts):
         return None
     return store.PendingFailure(
@@ -452,6 +452,8 @@ def _run(
         counts["failures"] += result.failures
         if result.operand_mismatch:
             skipped["operand_mismatch"] += result.operand_mismatch
+        if result.too_many_fields:
+            skipped["structured_too_many_fields"] += result.too_many_fields
     rows = [_mined_row(c) for c in new_calls]
     recent = [_recorded(r) for r in stored]
     recent += [_recorded(r) for r in rows if r.at >= since]
