@@ -140,7 +140,9 @@ def harness_report(hits: list[telemetry.Hit], harness: Harness) -> tuple[str, bo
     latencies = [h.latency_ms for h in mine if h.latency_ms is not None]
     errors = Counter(h.error_class or "unknown" for h in mine if h.outcome is HitOutcome.ERROR)
     classes = Counter(h.error_class for h in mine if h.error_class)
-    rate = sum(errors.values()) / len(mine)
+    # An ignored event does no work that could fail, so it would only dilute the rate.
+    handled = sum(h.outcome is not HitOutcome.IGNORED for h in mine)
+    rate = sum(errors.values()) / handled if handled else 0.0
     timing = (
         f"p50 {statistics.median(latencies):.1f} ms, p99 {pct(latencies, 0.99):.1f} ms"
         if latencies
@@ -283,6 +285,8 @@ def doctor(
     hits: list[telemetry.Hit] = []
     tele_path = scars_home / "telemetry.db"
     reports = None
+    if tele_path.exists() and (upgrade := _upgrade_telemetry(tele_path)) is not None:
+        out.append(upgrade)
     try:
         if tele_path.exists():
             tele = connect_readonly(tele_path, "hits")
@@ -309,6 +313,34 @@ def doctor(
     out.extend(_store_checks(ctx, scars_home, location))
     out.append(canary())
     return out
+
+
+def _upgrade_telemetry(path: Path) -> Check | None:
+    """Upgrade a telemetry.db older than this scars and report it. None when the file is current, or
+    unreadable, which the hits read reports."""
+    current = store.TELEMETRY_SCHEMA_VERSION
+    found = None
+    try:
+        db = connect_readonly(path, "hits")
+        try:
+            found = db.execute("pragma user_version").fetchone()[0]
+        finally:
+            db.close()
+        if not 0 < found < current:
+            return None
+        db = store.connect(path, synchronous="NORMAL")
+        try:
+            store.ensure_telemetry_schema(db)
+        finally:
+            db.close()
+    except (sqlite3.Error, OSError) as exc:
+        if found is None:
+            return None
+        detail = f"version {found} is older than this scars (version {current}); the upgrade failed: "
+        return Check("telemetry schema", False, detail + shown(str(exc)))
+    return Check(
+        "telemetry schema", True, f"version {found} was older than this scars (version {current}); upgraded"
+    )
 
 
 def cmd_doctor(_: argparse.Namespace, ctx: Context) -> int:

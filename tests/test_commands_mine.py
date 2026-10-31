@@ -1,16 +1,28 @@
 import io
 import json
 import os
+import sqlite3
 import time
 
 import pytest
 
-from cli_helpers import FAILURE_PAIR, NOW, SIG, claude_transcript, connect, git_repo, make_ctx, run
-from scars import hook, store
+from cli_helpers import (
+    FAILURE_PAIR,
+    NOW,
+    SIG,
+    claude_transcript,
+    connect,
+    first_telemetry,
+    git_repo,
+    make_ctx,
+    run,
+    telemetry_version,
+)
+from scars import hook, store, telemetry
 from scars.commands import UserError
 from scars.commands.import_guard import deny_reasons, draft
 from scars.commands.mining import parse_since
-from scars.model import TEXT_CAP, Harness, MachineScope, Status
+from scars.model import TEXT_CAP, Harness, HitOutcome, MachineScope, Status
 
 pytest_plugins = ("cli_fixtures",)
 
@@ -194,3 +206,32 @@ def test_import_guard_needs_a_readable_guard(home, tmp_path):
         "",
         f"scars import-guard: cannot read {tmp_path / 'none.sh'}: No such file or directory\n",
     )
+
+
+def _hit(at, outcome):
+    return telemetry.Hit(at, "codex", None, "m", "s", None, "tool_ok", None, None, None, None, None,
+                         outcome, None, 1.0, None, None)  # fmt: skip
+
+
+def test_mine_prunes_ignored_hits_older_than_seven_days(home, user_home):
+    tele = telemetry.connect(str(home / "telemetry.db"))
+    day = 86400
+    hits = [_hit(NOW - 8 * day, HitOutcome.IGNORED), _hit(NOW - 6 * day, HitOutcome.IGNORED)]
+    hits += [_hit(NOW - 8 * day, HitOutcome.NO_MATCH), _hit(NOW - 60, HitOutcome.IGNORED)]
+    assert telemetry.write(tele, telemetry.Writes(tuple(hits)))
+    tele.close()
+    assert run(make_ctx(user_home), "mine")[0] == 0
+    db = sqlite3.connect(home / "telemetry.db")
+    assert db.execute("select seq, outcome from hits order by seq").fetchall() == [
+        (2, "ignored"),
+        (3, "no_match"),
+        (4, "ignored"),
+    ]
+    db.close()
+
+
+def test_mine_upgrades_a_first_release_telemetry_db(home, user_home):
+    (home / "telemetry.db").unlink()
+    first_telemetry(home / "telemetry.db")
+    assert run(make_ctx(user_home), "mine")[0] == 0
+    assert telemetry_version(home / "telemetry.db") == 2

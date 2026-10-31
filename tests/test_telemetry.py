@@ -1,5 +1,7 @@
 import sqlite3
+from dataclasses import replace
 
+from cli_helpers import first_telemetry, telemetry_version
 from scars import store, telemetry
 from scars.model import HitOutcome
 
@@ -83,4 +85,60 @@ def test_a_failing_statement_rolls_back_every_write_and_leaves_the_connection_us
     assert counts(path) == [0, 0, 0]
     assert telemetry.write(db, telemetry.Writes((HIT,), shown=(("L-1", "k"),), session_id="s1")) is True
     assert counts(path) == [1, 1, 0]
+    db.close()
+
+
+def test_a_first_release_file_is_upgraded_once_by_the_cli_and_then_takes_ignored_hits(tmp_path):
+    path = tmp_path / "telemetry.db"
+    first_telemetry(path)
+    ignored = replace(HIT, outcome=HitOutcome.IGNORED, lesson_id=None, trigger_key=None)
+    hook_db = telemetry.connect(str(path))
+    assert telemetry.write(hook_db, telemetry.Writes((ignored,))) is False
+    hook_db.close()
+    assert telemetry_version(path) == 1
+
+    db = store.connect(path, synchronous="NORMAL")
+    assert store.ensure_telemetry_schema(db) == 1
+    assert store.ensure_telemetry_schema(db) == 2
+    db.close()
+    hook_db = telemetry.connect(str(path))
+    assert telemetry.write(hook_db, telemetry.Writes((ignored,))) is True
+    hook_db.close()
+
+    db = sqlite3.connect(path)
+    assert db.execute("select seq, harness, outcome from hits order by seq").fetchall() == [
+        (7, "codex", "no_match"),
+        (8, "claude", "ignored"),
+    ]
+    assert db.execute(
+        "select name from sqlite_master where tbl_name = 'hits' and type = 'index' order by name"
+    ).fetchall() == [
+        ("hits_at",),
+        ("hits_lesson",),
+        ("hits_session",),
+    ]
+    assert db.execute("pragma user_version").fetchone() == (2,)
+    db.close()
+
+
+def test_a_new_file_starts_at_the_current_version(tmp_path):
+    store.init_telemetry(tmp_path / "telemetry.db").close()
+    assert telemetry_version(tmp_path / "telemetry.db") == 2
+
+
+def test_a_failed_upgrade_leaves_the_first_release_file_unchanged(tmp_path):
+    path = tmp_path / "telemetry.db"
+    first_telemetry(path)
+    db = store.connect(path, synchronous="NORMAL")
+    db.execute("create table hits_old (x)")
+    try:
+        store.ensure_telemetry_schema(db)
+    except sqlite3.OperationalError as exc:
+        assert str(exc) == "there is already another table or index with this name: hits_old"
+    else:
+        raise AssertionError("the upgrade should have failed")
+    db.close()
+    assert telemetry_version(path) == 1
+    db = sqlite3.connect(path)
+    assert db.execute("select seq, outcome from hits").fetchall() == [(7, "no_match")]
     db.close()
