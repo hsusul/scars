@@ -438,9 +438,13 @@ def _common_dir_from_files(cwd: str) -> str | None:
         if parent == here:
             return None
         here = parent
-    if not os.path.isfile(os.path.join(git_dir, "HEAD")):
-        raise _AskGit
     common = os.path.join(git_dir, "commondir")
+    # git skips a directory without these and keeps looking above it.
+    holds_repo = os.path.isdir(os.path.join(git_dir, "objects")) and os.path.isdir(
+        os.path.join(git_dir, "refs")
+    )
+    if not os.path.isfile(os.path.join(git_dir, "HEAD")) or not (holds_repo or os.path.isfile(common)):
+        raise _AskGit
     if os.path.lexists(common):
         git_dir = os.path.join(git_dir, _first_line(common))
     return os.path.realpath(git_dir)

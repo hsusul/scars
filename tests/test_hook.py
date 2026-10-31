@@ -1076,6 +1076,23 @@ def test_the_common_dir_read_from_files_matches_git(tmp_path, monkeypatch):
     assert found == [git_answer(c) for c in cwds]
 
 
+@pytest.mark.parametrize("contents", [("HEAD",), ("HEAD", "objects/"), ("HEAD", "refs/")])
+def test_a_dot_git_directory_git_would_not_accept_is_skipped_as_git_skips_it(tmp_path, monkeypatch, contents):
+    for name in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES"):
+        monkeypatch.delenv(name, raising=False)
+    outer = git_repo(tmp_path / "outer")
+    fake = outer / "vendored" / ".git"
+    fake.mkdir(parents=True)
+    for name in contents:
+        if name.endswith("/"):
+            (fake / name).mkdir()
+        else:
+            (fake / name).write_text("ref: refs/heads/main\n")
+    cwd = outer / "vendored"
+    assert hook.git_common_dir(str(cwd)) == str(outer.resolve() / ".git")
+    assert git_answer(cwd) == str(outer.resolve() / ".git")
+
+
 def test_a_lesson_render_rejects_is_skipped_and_the_others_still_arrive(env):
     home, repo = env
     db = seed_store(home, repo)
