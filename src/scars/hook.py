@@ -345,8 +345,25 @@ def _under(path: str, cwd: str, home: str) -> bool:
 # ---------------------------------------------------------------- repo resolution
 
 
+GIT_LOCATION_ENV = ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES")
+
+
+class _AskGit(Exception):
+    """The files alone do not settle where git would find the repo."""
+
+
 def git_common_dir(cwd: str) -> str | None:
-    """`git rev-parse --git-common-dir` as an absolute path, or None outside a repo or without git."""
+    """`git rev-parse --git-common-dir` as an absolute path, or None outside a repo or without git.
+
+    It is read from the `.git` directory or file, and a worktree's `commondir` file, when those settle it,
+    because starting git costs about 15 ms of every run without a telemetry cache. git itself answers
+    when an environment variable moves the repo, when `cwd` is inside a git directory, and when a file
+    is not in the shape git writes.
+    """
+    try:
+        return _common_dir_from_files(cwd)
+    except _AskGit:
+        pass
     import subprocess  # Only a cache miss needs it; importing it costs about 2 ms of the hook budget.
 
     try:
@@ -361,6 +378,45 @@ def git_common_dir(cwd: str) -> str | None:
         return None
     out = result.stdout.strip()
     return out if result.returncode == 0 and out else None
+
+
+def _common_dir_from_files(cwd: str) -> str | None:
+    if not os.path.isabs(cwd) or any(name in os.environ for name in GIT_LOCATION_ENV):
+        raise _AskGit
+    here = os.path.realpath(cwd)
+    while True:
+        if os.path.isfile(os.path.join(here, "HEAD")) and os.path.isdir(os.path.join(here, "objects")):
+            raise _AskGit
+        dotgit = os.path.join(here, ".git")
+        if os.path.isdir(dotgit):
+            git_dir = dotgit
+            break
+        if os.path.isfile(dotgit):
+            line = _first_line(dotgit)
+            if not line.startswith("gitdir: "):
+                raise _AskGit
+            git_dir = os.path.join(here, line.removeprefix("gitdir: "))
+            break
+        if os.path.lexists(dotgit):
+            raise _AskGit
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+    if not os.path.isfile(os.path.join(git_dir, "HEAD")):
+        raise _AskGit
+    common = os.path.join(git_dir, "commondir")
+    if os.path.lexists(common):
+        git_dir = os.path.join(git_dir, _first_line(common))
+    return os.path.realpath(git_dir)
+
+
+def _first_line(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read(4096).strip()
+    except (OSError, UnicodeError) as exc:
+        raise _AskGit from exc
 
 
 def repo_root(cwd: str) -> str | None:

@@ -1019,6 +1019,62 @@ def test_a_cached_cwd_skips_git(env, monkeypatch):
     assert json.loads(out.getvalue()) == context("PostToolUseFailure", lesson_text(lesson_id))
 
 
+def test_without_telemetry_the_repo_is_found_without_starting_git(tmp_path, monkeypatch):
+    home, repo = make_env(tmp_path, telemetry=False)
+    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
+    monkeypatch.setenv("SCARS_HOME", str(home))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("the hook started a process"))
+    for tool_use_id in ("tu1", "tu2"):
+        out = io.StringIO()
+        payload = claude_failure(repo, tool_use_id=tool_use_id)
+        hook.run(Harness.CLAUDE, "PostToolUseFailure", io.StringIO(json.dumps(payload)), out)
+        assert json.loads(out.getvalue()) == context("PostToolUseFailure", lesson_text(lesson_id))
+
+
+def git_answer(cwd):
+    result = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def test_the_common_dir_read_from_files_matches_git(tmp_path, monkeypatch):
+    for name in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES"):
+        monkeypatch.delenv(name, raising=False)
+    main = git_repo(tmp_path / "main")
+    (main / "src" / "deep").mkdir(parents=True)
+    subprocess.run(
+        ["git", "-C", str(main), "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "x"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(tmp_path / "wt")], check=True)
+    (tmp_path / "wt" / "lib").mkdir()
+    (tmp_path / "link").symlink_to(main / "src")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    cwds = [
+        main,
+        main / "src" / "deep",
+        main / ".git",
+        tmp_path / "wt",
+        tmp_path / "wt" / "lib",
+        tmp_path / "link",
+        plain,
+    ]
+    found = [hook.git_common_dir(str(c)) for c in cwds]
+    assert found == [str(main.resolve() / ".git")] * 6 + [None]
+    assert found == [git_answer(c) for c in cwds]
+
+
 # ---------------------------------------------------------------- entry points and latency
 
 
