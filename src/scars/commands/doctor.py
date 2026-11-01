@@ -270,6 +270,7 @@ def _store_checks(ctx: Context, scars_home: Path, location: Callable[[Path], str
         try:
             problems = store.verify(db)
             refused = unrenderable(db, store.read_lessons(db)[0])
+            to_review = store.signature_reviews(db)
         finally:
             db.close()
     except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
@@ -287,6 +288,14 @@ def _store_checks(ctx: Context, scars_home: Path, location: Callable[[Path], str
         checks.append(Check("lessons render", False, listed + more))
     else:
         checks.append(Check("lessons render", True, "every active lesson renders"))
+    if to_review:
+        listed = "; ".join(
+            f"{shown(lesson_id)}: error trigger made by older signature rules" for lesson_id in to_review[:3]
+        )
+        more = f"; and {len(to_review) - 3} more" if len(to_review) > 3 else ""
+        checks.append(Check("signature rules", False, listed + more))
+    else:
+        checks.append(Check("signature rules", True, "every error trigger follows the current rules"))
     return checks
 
 

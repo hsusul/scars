@@ -15,6 +15,9 @@
    never counts a sighting twice.
 5. Commit offsets, processed ids, the open failures and the new mined calls in one transaction.
 
+Before anything else, a store whose signatures older signature rules computed is brought to the current
+rules (see `_upgrade_signatures`).
+
 Before step 3, every candidate or provisional lesson that is not `human`, not pinned and no longer passes
 the render rules (text mined before a rule change) is retired with the rule it breaks, so the inbox never
 holds it and a pair that sights it again creates a fresh candidate rather than a twin. The miner never
@@ -47,7 +50,17 @@ from scars import hook, policy, render, store
 from scars.match import InvalidTrigger, Precision, RecordedCall
 from scars.mine import build, calls, claude, codex, outcomes, pairs
 from scars.mine.replay import CallIndex
-from scars.model import ErrorSignature, EventType, Harness, RepoId, Status, Trigger, TrustClass
+from scars.model import (
+    ErrorSignature,
+    EventType,
+    Harness,
+    RepoId,
+    Status,
+    Trigger,
+    TriggerKind,
+    TrustClass,
+)
+from scars.signature import RULES_VERSION
 
 DAY = 86400.0
 
@@ -64,6 +77,18 @@ def default_sources(user_home: Path) -> tuple[Source, ...]:
         Source(Harness.CLAUDE, user_home / ".claude" / "projects", "*/*.jsonl"),
         Source(Harness.CODEX, user_home / ".codex" / "sessions", "**/rollout-*.jsonl"),
     )
+
+
+@dataclass(frozen=True)
+class SignatureUpgrade:
+    """What one run did to a store whose signatures the rules of `from_version` computed."""
+
+    from_version: int
+    pending_dropped: int
+    calls_unpaired: int
+    retired: int
+    to_review: int
+    """Promoted or human lessons with an error trigger, kept as they are and named by `scars doctor`."""
 
 
 @dataclass(frozen=True)
@@ -86,6 +111,8 @@ class Summary:
     """Candidates dropped by a render rule, by rule name. Never the text."""
     skipped: dict[str, int] = field(default_factory=dict)
     """Pairs that yield no lesson for a structural reason, by reason."""
+    signature_upgrade: SignatureUpgrade | None = None
+    """Set on the run that moved the store to the current signature rules."""
 
 
 _PARSERS = {Harness.CLAUDE: claude.parse, Harness.CODEX: codex.parse}
@@ -385,6 +412,41 @@ def _retire_unrenderable(db: sqlite3.Connection, now: float) -> dict[str, int]:
     return dict(sorted(retired.items()))
 
 
+def _upgrade_signatures(db: sqlite3.Connection, now: float) -> SignatureUpgrade | None:
+    """Bring a store whose signatures older rules computed to `RULES_VERSION` in one transaction, or None
+    when it already follows them.
+
+    The store keeps no tool output, so no stored signature can be recomputed and no old error trigger
+    confirmed. Pending failures are dropped, stored failed calls lose their signature, and every mined
+    candidate or provisional lesson with an error trigger is retired, so a pair sighted again under the
+    new rules mines a fresh one. A promoted or human lesson is a person's decision: it is kept and marked
+    for review.
+    """
+    found = store.signature_rules_version(db)
+    if found >= RULES_VERSION:
+        return None
+    with store.transaction(db):
+        dropped = store.drop_pending_failures(db)
+        unpaired = store.unpair_failed_calls(db)
+        waiting = store.list_lessons(db, statuses=(Status.CANDIDATE, Status.PROVISIONAL, Status.PROMOTED))
+        keyed = [le for le in waiting if any(t.kind is TriggerKind.ERROR for t in le.triggers)]
+        kept = [le for le in keyed if le.status is Status.PROMOTED or le.trust_class is TrustClass.HUMAN]
+        for lesson in keyed:
+            if lesson not in kept:
+                store.apply_event(
+                    db,
+                    lesson_id=lesson.id,
+                    event=EventType.RETIRED,
+                    expected_revision=lesson.revision,
+                    actor=policy.ACTOR,
+                    payload={"reason": "signature rules changed"},
+                    at=now,
+                )
+        store.mark_for_review(db, [(le.id, le.revision) for le in kept])
+        store.set_signature_rules_version(db, RULES_VERSION)
+    return SignatureUpgrade(found, dropped, unpaired, len(keyed) - len(kept), len(kept))
+
+
 def run(
     home: Path,
     sources: Iterable[Source],
@@ -423,6 +485,7 @@ def _run(
     counts: Counter[str] = Counter()
     rejected: Counter[str] = Counter()
     skipped: Counter[str] = Counter()
+    upgrade = _upgrade_signatures(db, now)
     retired = _retire_unrenderable(db, now)
     read = _read(sources, store.miner_offsets(db), store.miner_file_contexts(db), now)
     all_ids = [c.tool_use_id for stream in read.streams.values() for c in stream]
@@ -502,7 +565,8 @@ def _run(
         malformed_lines=read.malformed,
         rejected=dict(sorted(rejected.items())),
         skipped=dict(sorted(skipped.items())),
+        signature_upgrade=upgrade,
     )
 
 
-__all__ = ["Source", "Summary", "default_sources", "run"]
+__all__ = ["SignatureUpgrade", "Source", "Summary", "default_sources", "run"]

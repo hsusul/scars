@@ -16,6 +16,7 @@ from pathlib import Path
 from scars import mine, paths, review, store
 from scars.commands import Context, UserError
 from scars.mine import Source, Summary
+from scars.signature import RULES_VERSION
 
 _AGO = re.compile(r"^(\d+)([dh])$")
 
@@ -60,6 +61,12 @@ def summary_lines(s: Summary) -> list[str]:
         f"read {s.sessions_read} transcripts: {s.calls} calls, {s.failures} failures, {s.pairs} pairs",
         f"lessons: {s.candidates_created} new, {s.observations} observations, {s.expired} expired",
     ]
+    if (u := s.signature_upgrade) is not None:
+        lines.append(
+            f"signature rules changed (version {u.from_version} to {RULES_VERSION}): "
+            f"{u.pending_dropped} pending failures dropped, {u.calls_unpaired} failed calls unpaired, "
+            f"{u.retired} lessons retired, {u.to_review} to review (scars doctor names them)"
+        )
     if s.retired_unrenderable:
         rules = ", ".join(f"{k} {v}" for k, v in s.retired_unrenderable.items())
         lines.append(f"retired because they no longer render: {rules}")

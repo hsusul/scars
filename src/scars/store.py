@@ -36,7 +36,7 @@ from scars.model import (
     TriggerKind,
     TrustClass,
 )
-from scars.signature import TOOL_PREFIX
+from scars.signature import RULES_VERSION, TOOL_PREFIX
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -97,7 +97,13 @@ def _statements(sql: str) -> list[str]:
     return out
 
 
-def _init(path: Path, schema: str, synchronous: str, version: int = SCHEMA_VERSION) -> sqlite3.Connection:
+def _init(
+    path: Path,
+    schema: str,
+    synchronous: str,
+    version: int = SCHEMA_VERSION,
+    stamp: tuple[str, ...] = (),
+) -> sqlite3.Connection:
     from pathlib import Path
 
     path = Path(path)
@@ -110,7 +116,7 @@ def _init(path: Path, schema: str, synchronous: str, version: int = SCHEMA_VERSI
     db.execute("begin immediate")
     try:
         if db.execute("pragma user_version").fetchone()[0] == 0:
-            for statement in _statements(schema_sql(schema)):
+            for statement in (*_statements(schema_sql(schema)), *stamp):
                 db.execute(statement)
             db.execute(f"pragma user_version = {int(version)}")
         db.execute("commit")
@@ -124,9 +130,11 @@ def _init(path: Path, schema: str, synchronous: str, version: int = SCHEMA_VERSI
 def init_lessons(path: Path) -> sqlite3.Connection:
     """Create lessons.db (mode 0600, parent 0700) with the schema if it is new, and return a connection.
 
-    Safe to call on an existing store: the schema is applied once, under the write lock.
+    Safe to call on an existing store: the schema is applied once, under the write lock. A new store holds
+    no signatures yet, so it records the current signature rules.
     """
-    return _init(path, "lessons", "FULL")
+    stamp = f"insert into signature_rules (id, version) values (1, {int(RULES_VERSION)})"
+    return _init(path, "lessons", "FULL", stamp=(stamp,))
 
 
 def init_telemetry(path: Path) -> sqlite3.Connection:
@@ -1247,6 +1255,49 @@ def expiring_lessons(db: sqlite3.Connection, now: float) -> list[tuple[LessonId,
         (now,),
     )
     return [(LessonId(i), r) for i, r in rows]
+
+
+OLDEST_SIGNATURE_RULES = 1
+
+
+def signature_rules_version(db: sqlite3.Connection) -> int:
+    """The signature rules the stored signatures follow; the oldest when the store never recorded them."""
+    row = db.execute("select version from signature_rules").fetchone()
+    return OLDEST_SIGNATURE_RULES if row is None else int(row[0])
+
+
+def set_signature_rules_version(db: sqlite3.Connection, version: int) -> None:
+    db.execute("insert or replace into signature_rules (id, version) values (1, ?)", (version,))
+
+
+def drop_pending_failures(db: sqlite3.Connection) -> int:
+    return db.execute("delete from pending_failures").rowcount
+
+
+def unpair_failed_calls(db: sqlite3.Connection) -> int:
+    """Clear every stored failed call's signature, so no lesson or precision run pairs with it."""
+    return db.execute(
+        "update mined_calls set error_signature = null "
+        "where status = 'failed' and error_signature is not null"
+    ).rowcount
+
+
+def mark_for_review(db: sqlite3.Connection, lessons: Iterable[tuple[LessonId, int]]) -> None:
+    """Record `(lesson id, revision)` pairs as needing review until the lesson next changes."""
+    db.executemany("insert or replace into signature_review (lesson_id, revision) values (?,?)", lessons)
+
+
+def signature_reviews(db: sqlite3.Connection) -> list[LessonId]:
+    """Active lessons kept through a signature rules change and unchanged since, by id. A read-only
+    connection to a store no miner has upgraded has no review table and so none to show."""
+    found = db.execute("select 1 from sqlite_master where type = 'table' and name = 'signature_review'")
+    if found.fetchone() is None:
+        return []
+    rows = db.execute(
+        "select r.lesson_id from signature_review r join lessons l on l.id = r.lesson_id "
+        "and l.revision = r.revision where l.status in ('candidate','provisional','promoted') order by 1"
+    )
+    return [LessonId(r[0]) for r in rows]
 
 
 def commit_batch(
