@@ -60,7 +60,10 @@ def test_doctor_and_errors_go_through_the_boundary_too(home, user_home, monkeypa
     stub_doctor(monkeypatch)
     monkeypatch.setattr(doctor, "harness_report", lambda hits, harness: (f"{harness} \u2028{TOKEN}", True))
     out = run(make_ctx(user_home), "doctor")[1]
-    assert out.splitlines()[:2] == ["[hidden: sanitizer.non_ascii]", "[hidden: sanitizer.non_ascii]"]
+    assert out.splitlines()[:2] == [
+        "[hidden: sanitizer.non_ascii]",
+        "FAIL  hooks: no harness has scars hooks installed",
+    ]
 
     def leaky(*_):
         raise UserError(f"boom {ESC}")

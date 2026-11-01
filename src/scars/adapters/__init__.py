@@ -110,11 +110,10 @@ def event(
 ) -> HookEvent:
     """Build the normalized event with every free-text field capped at 4 KB.
 
-    `harness_version` is empty: neither harness puts its version in hook stdin or in the hook's
+    `harness_version` is empty: Claude Code does not put its version in hook stdin or in the hook's
     environment (Claude Code 2.1.299 exports `CLAUDE_PROJECT_DIR`, `CLAUDE_PLUGIN_ROOT`,
-    `CLAUDE_PLUGIN_DATA`, `CLAUDE_EFFORT` and `CLAUDE_CODE_REMOTE`; Codex 0.162.1 exports `PLUGIN_ROOT` and
-    `PLUGIN_DATA`), and running `claude --version` would cost more than the whole hook budget. The hit
-    row stores NULL until a harness exports one.
+    `CLAUDE_PLUGIN_DATA`, `CLAUDE_EFFORT` and `CLAUDE_CODE_REMOTE`), and running `claude --version`
+    would cost more than the whole hook budget. The hit row stores NULL until a harness exports one.
     """
     return HookEvent(
         harness=harness,

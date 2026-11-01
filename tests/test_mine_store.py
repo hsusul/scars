@@ -130,13 +130,6 @@ def test_transaction_commits_its_writes_together_or_not_at_all(tmp_path):
     assert store.verify(db) == []
 
 
-def test_file_contexts_are_saved_with_the_batch(tmp_path):
-    db = store.init_lessons(tmp_path / "lessons.db")
-    ctx = store.FileContext("/t/r.jsonl", "/w/app", "gpt-test")
-    store.commit_batch(db, offsets=[], seen=[], pending=[], calls=[], prune_before=0, contexts=[ctx])
-    assert store.miner_file_contexts(db) == {"/t/r.jsonl": ctx}
-
-
 def test_ensure_miner_schema_adds_the_calls_table_to_an_older_store(tmp_path):
     db = store.init_lessons(tmp_path / "lessons.db")
     db.execute("drop table mined_calls")
@@ -144,4 +137,4 @@ def test_ensure_miner_schema_adds_the_calls_table_to_an_older_store(tmp_path):
     store.ensure_miner_schema(db)
     store.ensure_miner_schema(db)
     assert store.mined_calls_since(db, 0) == []
-    assert store.miner_file_contexts(db) == {}
+    assert db.execute("select * from miner_file_context").fetchall() == []

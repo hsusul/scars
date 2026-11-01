@@ -8,8 +8,8 @@ Each check prints `ok` or `FAIL` with a reason, and any failure makes the exit c
 - no harness has scars hooks configured,
 - the hook shim uses a different store,
 - a harness's hook errored on more than 1% of its runs in the last 24 hours,
-- an installed harness's sandbox settings let agent commands write the store (see `claude_sandbox` and
-  `codex_sandbox`; settings doctor cannot read are reported as `unknown`, which does not fail),
+- Claude Code's sandbox settings let agent commands write the store (see `claude_sandbox`; settings
+  doctor cannot read are reported as `unknown`, which does not fail),
 - the canary: a synthetic Claude Code `PostToolUseFailure` payload, run through the hook in this process
   against a temporary home holding one built-in lesson, must return that lesson within 100 ms.
 
@@ -35,7 +35,6 @@ import statistics
 import subprocess
 import tempfile
 import time
-import tomllib
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -178,9 +177,7 @@ def _plugin_state(ctx: Context, scars_home: Path) -> dict[Harness, str]:
         claude = "installed"
     else:
         claude = "files written, not installed in Claude Code (claude plugin install scars@scars-local)"
-    codex_config = ctx.user_home / ".codex" / "hooks.json"
-    codex = "installed" if _mentions(codex_config, "scars-hook") else "not installed (run scars init)"
-    return {Harness.CLAUDE: claude, Harness.CODEX: codex}
+    return {Harness.CLAUDE: claude}
 
 
 def _hook_store(ctx: Context, scars_home: Path) -> Check:
@@ -311,45 +308,6 @@ def claude_sandbox(ctx: Context, store: Path) -> Check | None:
         key, entry, path = allows[0]
         return Check(name, False, f"{key} {shown(entry)} in {path} lets Bash commands write {store}")
     return Check(name, True, f"on, and no write rule reaches {store}")
-
-
-def codex_sandbox(ctx: Context, store: Path) -> Check | None:
-    """Whether Codex's default sandbox mode, as `~/.codex/config.toml` sets it, keeps agent commands from
-    writing `store`. None when Codex is not installed."""
-    name = "codex sandbox"
-    path = ctx.user_home / ".codex" / "config.toml"
-    if not path.parent.is_dir():
-        return None
-    try:
-        config = tomllib.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return Check(name, None, f"no {path}")
-    except (OSError, ValueError) as exc:
-        return Check(name, None, f"cannot parse {path}: {shown(str(exc))}")
-    key, mode = "sandbox_mode", config.get("sandbox_mode")
-    profile = config.get("profile")
-    if isinstance(profile, str) and "sandbox_mode" in _section(config, "profiles", profile):
-        key, mode = f"profiles.{profile}.sandbox_mode", config["profiles"][profile]["sandbox_mode"]
-    match mode:
-        case None if "default_permissions" in config:
-            return Check(name, None, f"{path} sets default_permissions, which doctor does not read")
-        case None:
-            return Check(name, None, f"no sandbox_mode in {path}")
-        case "read-only":
-            return Check(name, True, f"{key} is read-only in {path}")
-        case "danger-full-access":
-            return Check(name, False, f"{key} is danger-full-access in {path}, so agents can write {store}")
-        case "workspace-write":
-            roots = _strings(_section(config, "sandbox_workspace_write").get("writable_roots"))
-            if roots is None:
-                detail = f"sandbox_workspace_write.writable_roots in {path} is not a list of strings"
-                return Check(name, None, detail)
-            for root in roots:
-                if _reaches(root, store, ctx.user_home):
-                    return Check(name, False, f"writable root {shown(root)} in {path} contains {store}")
-            detail = f"{key} is workspace-write in {path}, and no writable root contains {store}"
-            return Check(name, True, detail)
-    return Check(name, None, f"{key} {shown(str(mode))} in {path} is not a mode doctor knows")
 
 
 def _canary_payload(session: str, cwd: str) -> str:
@@ -503,7 +461,8 @@ def doctor(
         out.append(Check("hooks", False, "no harness has scars hooks installed"))
     else:
         out.append(_hook_store(ctx, scars_home))
-    out.extend(c for c in (claude_sandbox(ctx, scars_home), codex_sandbox(ctx, scars_home)) if c is not None)
+    if (sandbox := claude_sandbox(ctx, scars_home)) is not None:
+        out.append(sandbox)
     off = paths.is_off() or paths.off_value(ctx.env.get("SCARS_OFF"))
     out.append(Check("kill switch", not off, "on: hooks do nothing (scars on)" if off else "off"))
     out.append(Check("delivery", True, DELIVERY[paths.delivery_mode()]))
