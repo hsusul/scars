@@ -55,6 +55,7 @@ def make_ctx(
         edit=edit,
         clock=clock,
         user_home=user_home,
+        system_root=user_home.parent / "system",
         platform=platform,
     )
 

@@ -144,6 +144,8 @@ class Context:
     """Lets the person rewrite a text and returns it. None runs `$EDITOR`."""
     clock: Callable[[], float] = time.time
     user_home: Path = field(default_factory=Path.home)
+    system_root: Path = Path("/")
+    """Where system-wide files such as a harness's managed settings are looked up."""
     platform: str = sys.platform
 
     def print(self, *parts: object) -> None:
