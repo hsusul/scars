@@ -1,4 +1,4 @@
-"""The typed tool call both transcript readers produce, and the incremental file reader they share."""
+"""Typed Claude Code tool calls and the incremental transcript file reader."""
 
 import json
 import os
@@ -22,8 +22,8 @@ class CallStatus(StrEnum):
     OK = "ok"
     FAILED = "failed"
     UNKNOWN = "unknown"
-    """The transcript shows no outcome, as for a Codex call without a visible exit code. Such a call
-    counts toward the pairing window but is neither a failure nor a fix."""
+    """The transcript shows no outcome. Such a call counts toward the pairing window but is neither a
+    failure nor a fix."""
 
 
 @dataclass(frozen=True)
@@ -32,7 +32,7 @@ class Call:
     session_id: str
     tool_use_id: str
     tool: str
-    """The harness tool name. Shell calls are `Bash` and Codex edits are `apply_patch` in both harnesses."""
+    """The Claude Code tool name; shell calls are `Bash`."""
     tool_kind: ToolKind
     input: str
     """The shell command for shell calls, else the tool input as compact JSON, capped at 4 KB. For
@@ -61,21 +61,11 @@ class Line:
 
 
 @dataclass(frozen=True)
-class Context:
-    """Session context a transcript sets for the calls after it: Codex `session_meta` and `turn_context`."""
-
-    cwd: str = ""
-    model_id: str | None = None
-
-
-@dataclass(frozen=True)
 class Parsed:
     calls: tuple[Call, ...]
     resume_offset: int | None
     """Where the next batch must start reading, when a call's start was read but its result was not yet
     written; None means after the last complete line."""
-    context: Context | None = None
-    """The context in force at the resume point, for the next batch to start from. None for Claude."""
 
 
 UNRESOLVED_HORIZON = 24 * 3600

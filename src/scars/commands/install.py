@@ -10,13 +10,13 @@ Steps, in order:
 3. Show the exact hook configuration files with a diff against what is on disk, and write each group
    only after a yes: the Claude Code plugin as a local marketplace under `~/.scars/plugins/` (Claude
    Code's own settings file is never touched; init prints the two `claude plugin` commands instead), the
-   Codex hooks merged into `~/.codex/hooks.json`, and on macOS the launchd job that runs `scars mine`
-   every 2 hours. `--yes` answers yes.
+   removal of legacy scars hooks from `~/.codex/hooks.json`, and on macOS the launchd job that runs
+   `scars mine` every 2 hours. `--yes` answers yes.
 4. Mine history and list the top 5 waiting lessons with how often each would have fired in the last 30
    days: the mined failures in that window with the lesson's error signature.
 
-Both harness configs run a shim, `~/.scars/bin/scars-hook`, which execs the installed `scars-hook` by
-absolute path, so the hook command in them stays the same across upgrades and reinstalls. When the
+The Claude Code plugin runs a shim, `~/.scars/bin/scars-hook`, which execs the installed `scars-hook` by
+absolute path, so the hook command stays the same across upgrades and reinstalls. When the
 installed `scars-hook`, or the `scars` package it imports, lives inside a git checkout, init refuses
 unless `--allow-dev-install` is given: an agent working in that checkout could edit the code every hook
 run executes. Checking the package matters for editable installs, whose script lives elsewhere.
@@ -24,7 +24,7 @@ run executes. Checking the package matters for editable installs, whose script l
 Every write is idempotent: a file that already has the planned content is reported unchanged. A write
 goes to the real file behind any symlink, through a temp file in the same directory that is fsynced and
 renamed into place, and keeps the existing file's mode. A read-only file is replaced only after the
-person confirms it, never under `--yes`. The Codex merge accepts only the documented shape of
+person confirms it, never under `--yes`. The legacy Codex cleanup accepts only the documented shape of
 `hooks.json` (any other shape stops init before it changes anything) and removes only handlers whose
 command is exactly one scars renders; everything else in the file is kept. JSON that would not survive
 a round trip (duplicate keys, numbers that are not finite or that a float would round) counts as another
@@ -268,93 +268,70 @@ def git_checkout_of(path: str) -> Path | None:
     return None
 
 
-def codex_shape_problem(config: dict[str, object]) -> str | None:
-    """Where `config` leaves the documented `hooks.json` shape, or None when it follows it.
+def remove_codex_entries(existing: object, hook_path: str) -> dict[str, object]:
+    """Remove only the exact commands the former Codex installer emitted.
 
-    The shape: an object whose optional `hooks` maps each event to a list of groups, each group an
-    object with a `hooks` list of handler objects. Anything else might be another tool's format that a
-    merge would silently damage, so init refuses it instead of guessing.
+    Validate the legacy shape before rebuilding it; unknown or lossy JSON must never be rewritten.
+    Empty groups and events that were already empty are kept.
     """
-    hooks = config.get("hooks", {})
+    if not isinstance(existing, dict):
+        raise ValueError("not a JSON object")
+    hooks = existing.get("hooks", {})
     if not isinstance(hooks, dict):
-        return "hooks is not an object"
+        raise ValueError("hooks is not an object")
+    commands = {
+        f"{shlex.quote(hook_path)} codex {event}"
+        for event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse")
+    }
+    out: dict[str, list[dict[str, object]]] = {}
+    changed = False
     for event, groups in hooks.items():
         if not isinstance(groups, list):
-            return f"hooks.{event} is not a list"
+            raise ValueError(f"hooks.{event} is not a list")
+        kept: list[dict[str, object]] = []
         for i, group in enumerate(groups):
             where = f"hooks.{event}[{i}]"
             if not isinstance(group, dict):
-                return f"{where} is not an object"
-            if not isinstance(group.get("hooks"), list):
-                return f"{where}.hooks is not a list"
-            for j, handler in enumerate(group["hooks"]):
+                raise ValueError(f"{where} is not an object")
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                raise ValueError(f"{where}.hooks is not a list")
+            others: list[dict[str, object]] = []
+            for j, handler in enumerate(handlers):
                 if not isinstance(handler, dict):
-                    return f"{where}.hooks[{j}] is not an object"
-    return None
-
-
-def _commands(config: dict[str, object]) -> set[str]:
-    hooks = config["hooks"]
-    assert isinstance(hooks, dict)
-    return {h["command"] for groups in hooks.values() for g in groups for h in g["hooks"]}
-
-
-def merge_codex(existing: dict[str, object], ours: dict[str, object]) -> dict[str, object]:
-    """`existing` (already checked by `codex_shape_problem`) with scars's handlers replaced by `ours`.
-
-    A handler is scars's only when its command equals, exactly, a command in `ours`. A group is dropped
-    only when removing scars's handlers emptied it; empty groups and events that were already empty stay.
-    """
-    scars = _commands(ours)
-    hooks = existing.get("hooks", {})
-    assert isinstance(hooks, dict)
-    out: dict[str, list[object]] = {}
-    for event, groups in hooks.items():
-        kept: list[object] = []
-        for group in groups:
-            others = [
-                h for h in group["hooks"] if not (isinstance(c := h.get("command"), str) and c in scars)
-            ]
-            if len(others) == len(group["hooks"]):
+                    raise ValueError(f"{where}.hooks[{j}] is not an object")
+                command = handler.get("command")
+                if not (isinstance(command, str) and command in commands):
+                    others.append(handler)
+            if len(others) == len(handlers):
                 kept.append(group)
-            elif others:
-                kept.append({**group, "hooks": others})
+            else:
+                changed = True
+                if others:
+                    kept.append({**group, "hooks": others})
         out[event] = kept
-    ours_hooks = ours["hooks"]
-    assert isinstance(ours_hooks, dict)
-    for event, groups in ours_hooks.items():
-        out.setdefault(event, []).extend(groups)
-    return {**existing, "hooks": out}
+    return {**existing, "hooks": out} if changed else existing
 
 
-def _unknown_shape(path: Path, problem: str) -> UserError:
-    return UserError(
-        f"{path} is not in the shape scars knows ({problem}); nothing was changed. "
-        "Fix it or move it away, then run scars init again"
-    )
-
-
-def codex_file(user_home: Path, hook_path: str) -> PlannedFile:
+def legacy_codex_cleanup(user_home: Path, hook_path: str) -> PlannedFile | None:
     path = user_home / ".codex" / "hooks.json"
-    existing: dict[str, object] = {}
-    raw: str | None = None
-    if path.exists():
-        try:
-            raw = path.read_text(encoding=UTF8)
-            loaded = load_json_exactly(raw)
-        except UnsafeJson as exc:
-            raise _unknown_shape(path, str(exc)) from None
-        except (ValueError, OSError):
-            raise UserError(
-                f"cannot parse {path}; fix it or move it away, then run scars init again"
-            ) from None
-        if not isinstance(loaded, dict):
-            raise UserError(f"{path} is not a JSON object; fix it or move it away")
-        if (problem := codex_shape_problem(loaded)) is not None:
-            raise _unknown_shape(path, problem)
-        existing = loaded
-    merged = _json(merge_codex(existing, hooks_config("codex/hooks.json", hook_path)))
-    return PlannedFile(path, merged, planned_over=(raw,))
+    try:
+        raw = path.read_text(encoding=UTF8)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError):
+        raise UserError(f"cannot read {path}; fix it or move it away, then run scars init again") from None
+    try:
+        existing = load_json_exactly(raw)
+        cleaned = remove_codex_entries(existing, hook_path)
+    except (ValueError, RecursionError) as exc:
+        raise UserError(
+            f"{path} is not in the shape scars knows ({exc}); nothing was changed. "
+            "Fix it or move it away, then run scars init again"
+        ) from None
+    if cleaned == existing:
+        return None
+    return PlannedFile(path, _json(cleaned), planned_over=(raw,))
 
 
 def launchd_file(user_home: Path, scars_path: str, scars_home: Path, env: dict[str, str]) -> PlannedFile:
@@ -485,7 +462,15 @@ def register_repos(ctx: Context, scars_home: Path, yes: bool) -> None:
 # ---------------------------------------------------------------- install
 
 
-def _offer(ctx: Context, title: str, planned: list[PlannedFile], yes: bool) -> bool:
+def _offer(
+    ctx: Context,
+    title: str,
+    planned: list[PlannedFile],
+    yes: bool,
+    *,
+    question: str | None = None,
+    written: str = "written",
+) -> bool:
     """Show the diff of `planned` and write it after consent. True when the files are in place."""
     diffs = [(f, f.diff()) for f in planned]
     if not any(d for _, d in diffs):
@@ -494,7 +479,7 @@ def _offer(ctx: Context, title: str, planned: list[PlannedFile], yes: bool) -> b
     ctx.print(f"{title}: these files would change")
     for f, d in diffs:
         ctx.print(d.rstrip("\n") if d else f"unchanged {f.path}")
-    if not (yes or ctx.confirm(f"write the {title}?")):
+    if not (yes or ctx.confirm(question or f"write the {title}?")):
         ctx.print(f"{title}: not written")
         return False
     for f in planned:
@@ -516,7 +501,7 @@ def _offer(ctx: Context, title: str, planned: list[PlannedFile], yes: bool) -> b
             return False
     for f in planned:
         f.write()
-    ctx.print(f"{title}: written")
+    ctx.print(f"{title}: {written}")
     return True
 
 
@@ -525,7 +510,7 @@ class Plan:
     """Every file init may write, built before anything is touched so a refusal changes nothing."""
 
     claude: list[PlannedFile]
-    codex: list[PlannedFile]
+    legacy_hooks: PlannedFile | None
     launchd: PlannedFile | None
 
 
@@ -542,7 +527,7 @@ def plan(ctx: Context, scars_home: Path, hook_path: str) -> Plan:
         job = _recorded(launchd_file(ctx.user_home, installed_script("scars"), scars_home, env))
     return Plan(
         claude=[shim, *map(_recorded, claude_files(scars_home, command))],
-        codex=[shim, codex_file(ctx.user_home, command)],
+        legacy_hooks=legacy_codex_cleanup(ctx.user_home, command),
         launchd=job,
     )
 
@@ -553,8 +538,15 @@ def install(ctx: Context, scars_home: Path, files_: Plan, yes: bool) -> None:
         ctx.print("to turn it on in Claude Code, run:")
         ctx.print(f"  claude plugin marketplace add {shlex.quote(paths.text(str(plugins)))}")
         ctx.print("  claude plugin install scars@scars-local")
-    if _offer(ctx, "Codex hooks", files_.codex, yes):
-        ctx.print("Codex asks you to review and trust the new hooks the next time it starts")
+    if files_.legacy_hooks is not None:
+        _offer(
+            ctx,
+            "Codex hooks",
+            [files_.legacy_hooks],
+            yes,
+            question="remove the scars entries from Codex hooks?",
+            written="scars entries removed",
+        )
     if files_.launchd is None:
         ctx.print("miner schedule: launchd is macOS only; run `scars mine` every 2 hours from cron instead")
         return

@@ -1066,20 +1066,6 @@ class Offset:
 
 
 @dataclass(frozen=True)
-class FileContext:
-    """Session context a transcript set before its saved offset (Codex `session_meta` and `turn_context`),
-    restored when the next batch reads on from that offset."""
-
-    path: str
-    cwd: str
-    model_id: str | None
-
-
-def miner_file_contexts(db: sqlite3.Connection) -> dict[str, FileContext]:
-    return {r[0]: FileContext(*r) for r in db.execute("select path, cwd, model_id from miner_file_context")}
-
-
-@dataclass(frozen=True)
 class PendingFailure:
     """A failed call still waiting, across batches, for the call that fixes it."""
 
@@ -1107,7 +1093,7 @@ class MinedCall:
     command: str | None
     paths: tuple[str, ...]
     status: str
-    """`ok`, `failed`, or `unknown` when the transcript shows no outcome (a Codex call with no exit code)."""
+    """`ok`, `failed`, or `unknown` when the transcript shows no outcome."""
     error_signature: str | None
     cwd: str
     model_id: str | None
@@ -1308,21 +1294,15 @@ def commit_batch(
     pending: Iterable[PendingFailure],
     calls: Iterable[MinedCall],
     prune_before: float,
-    contexts: Iterable[FileContext] = (),
 ) -> None:
     """Advance the miner in one transaction: new file offsets, processed tool results, the full set of
     still-pending failures (replacing the old set), new mined calls, and calls older than `prune_before`
-    removed, and the session context saved with each offset. A crash leaves either the old state or the
-    new one, so a batch is never half-consumed."""
+    removed. A crash leaves either the old state or the new one, so a batch is never half-consumed."""
     db.execute("begin immediate")
     try:
         db.executemany(
             "insert or replace into miner_offsets (path, offset, inode, mtime) values (?,?,?,?)",
             [(o.path, o.offset, o.inode, o.mtime) for o in offsets],
-        )
-        db.executemany(
-            "insert or replace into miner_file_context (path, cwd, model_id) values (?,?,?)",
-            [(c.path, c.cwd, c.model_id) for c in contexts],
         )
         db.executemany("insert or ignore into seen_tool_use (tool_use_id) values (?)", [(s,) for s in seen])
         db.execute("delete from pending_failures")

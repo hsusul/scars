@@ -453,14 +453,10 @@ def test_a_forked_session_starts_with_the_pinned_lessons(env):
     home, repo = env
     pinned = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR, status="pinned")
     text = lesson_text(pinned, reviewed="reviewed 2027-01-15")
-    for harness in ("claude", "codex"):
-        fork = session_start(repo, "fork", session=f"fork-{harness}")
-        assert json.loads(run_hook(home, harness, "SessionStart", fork).stdout) == context(
-            "SessionStart", text
-        )
+    fork = session_start(repo, "fork", session="fork-claude")
+    assert json.loads(run_hook(home, "claude", "SessionStart", fork).stdout) == context("SessionStart", text)
     assert [(h[0], h[3], h[5], h[8]) for h in hits(home)] == [
         ("claude", "session_start", pinned, "shown"),
-        ("codex", "session_start", pinned, "shown"),
     ]
 
 
@@ -488,42 +484,8 @@ def test_user_prompt_submit_delivers_a_pinned_prompt_lesson(env):
     assert json.loads(shown.stdout) == context(
         "UserPromptSubmit", lesson_text(lesson_id, reviewed="reviewed 2027-01-15")
     )
-    assert (
-        run_hook(home, "codex", "UserPromptSubmit", {**payload, "prompt": "fix the express module"}).stdout
-        == ""
-    )
     assert [(h[0], h[3], h[4], h[5], h[8]) for h in hits(home)] == [
         ("claude", "prompt", "plan", lesson_id, "shown"),
-        ("codex", "prompt", "plan", None, "no_match"),
-    ]
-
-
-def test_codex_post_tool_use_with_a_nonzero_exit_delivers_repair(env):
-    home, repo = env
-    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
-    payload = {
-        "session_id": "thr_1",
-        "transcript_path": None,
-        "cwd": str(repo),
-        "hook_event_name": "PostToolUse",
-        "model": "gpt-5.5-codex",
-        "permission_mode": "default",
-        "turn_id": "turn_1",
-        "tool_name": "Bash",
-        "tool_use_id": "call_1",
-        "tool_input": {"command": "npm test"},
-        "tool_response": "Wall time: 0.5 seconds\nProcess exited with code 1\nOutput:\n" + SIGNATURE,
-    }
-    result = run_hook(home, "codex", "PostToolUse", payload)
-    assert json.loads(result.stdout) == context("PostToolUse", lesson_text(lesson_id))
-    assert rows(home, "select harness, model_id, event, outcome from hits") == [
-        ("codex", "gpt-5.5-codex", "tool_failed", "shown")
-    ]
-    success = {**payload, "tool_use_id": "call_2", "tool_response": "all good"}
-    assert run_hook(home, "codex", "PostToolUse", success).stdout == ""
-    assert rows(home, "select harness, session_id, model_id, event, outcome, lesson_id from hits") == [
-        ("codex", "thr_1", "gpt-5.5-codex", "tool_failed", "shown", lesson_id),
-        ("codex", "thr_1", None, "unknown", "ignored", None),
     ]
 
 
@@ -535,29 +497,11 @@ def test_a_cursor_event_is_ignored_and_recorded_without_reading_lessons(env):
     assert hits(home) == [IGNORED_HIT]
 
 
-def test_codex_session_start_compact_reinjects_pinned_lessons(env):
-    home, repo = env
-    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR, status="pinned")
-    text = lesson_text(lesson_id, reviewed="reviewed 2027-01-15")
-    start = session_start(repo, "startup", session="thr_1", model="gpt-5.5-codex")
-    assert json.loads(run_hook(home, "codex", "SessionStart", start).stdout) == context("SessionStart", text)
-    again = run_hook(home, "codex", "SessionStart", {**start, "source": "resume"})
-    assert again.stdout == ""
-    compact = run_hook(home, "codex", "SessionStart", {**start, "source": "compact"})
-    assert json.loads(compact.stdout) == context("SessionStart", text)
-    assert [(h[3], h[8]) for h in hits(home)] == [
-        ("session_start", "shown"),
-        ("session_start", "no_match"),
-        ("compact", "shown"),
-    ]
-
-
 def test_pre_tool_use_in_phase_1_is_silent_for_an_ordinary_command(env):
     home, repo = env
     add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
-    for harness in ("claude", "codex"):
-        assert run_hook(home, harness, "PreToolUse", pre_tool(repo, "npm test")).stdout == ""
-    assert [h[0] for h in hits(home)] == ["claude", "codex"]
+    assert run_hook(home, "claude", "PreToolUse", pre_tool(repo, "npm test")).stdout == ""
+    assert [h[0] for h in hits(home)] == ["claude"]
     assert {h[3:] for h in hits(home)} == {GATE_NO_MATCH}
 
 
@@ -584,19 +528,19 @@ def test_a_promoted_block_lesson_never_denies_in_phase_1(env):
     ("harness", "command", "reason"),
     [
         ("claude", "scars promote L-1a2b3c4d", run_reason("promote")),
-        ("codex", "uv run scars pin L-1", run_reason("pin")),
+        ("claude", "uv run scars pin L-1", run_reason("pin")),
         ("claude", "cd /tmp && bash -c 'scars off'", run_reason("off")),
         ("claude", "bash -c \"sh -c 'scars off'\"", run_reason("off")),
         ("claude", "'sc''ars' off", run_reason("off")),
         ("claude", 'sc"ars" mute L-1', run_reason("mute")),
         ("claude", "python3 -m scars level L-1 warn", run_reason("level")),
-        ("codex", "~/.scars/versions/0.1/bin/scars inbox", run_reason("inbox")),
+        ("claude", "~/.scars/versions/0.1/bin/scars inbox", run_reason("inbox")),
         ("claude", "/usr/local/bin/scars retire L-1", run_reason("retire")),
         ("claude", "./.venv/bin/scars unpin L-1", run_reason("unpin")),
         ("claude", "echo $(scars promote L-1)", run_reason("promote")),
         ("claude", "echo " + "a" * 4096 + " && scars promote L-1", run_reason("promote")),
         ("claude", "touch ~/.scars/OFF", SHELL_HOME_REASON),
-        ("codex", "echo a > ~/.scars/x", SHELL_HOME_REASON),
+        ("claude", "echo a > ~/.scars/x", SHELL_HOME_REASON),
         ("claude", "cp evil.db $HOME/.scars/lessons.db", SHELL_HOME_REASON),
         ("claude", "rm ${HOME}/.scars/OFF", SHELL_HOME_REASON),
         ("claude", "rm $SCARS_HOME/OFF", SHELL_HOME_REASON),
@@ -656,16 +600,13 @@ def test_reading_scars_commands_and_mere_mentions_are_allowed(env, command):
     assert [h[3:] for h in hits(home)] == [GATE_NO_MATCH]
 
 
-def test_agent_edits_under_the_scars_home_are_denied_for_both_harnesses(env):
+def test_agent_edits_under_the_scars_home_are_denied(env):
     home, repo = env
     write = pre_tool(repo, tool="Write", file_path=str(home / "lessons.db"))
     assert run_hook(home, "claude", "PreToolUse", write).stdout == deny_json(EDIT_REASON)
-    patch = f"*** Begin Patch\n*** Add File: {home}/OFF\n+x\n*** End Patch\n"
-    codex_edit = {**pre_tool(repo, patch), "tool_name": "apply_patch"}
-    assert run_hook(home, "codex", "PreToolUse", codex_edit).stdout == deny_json(EDIT_REASON)
     elsewhere = pre_tool(repo, tool="Edit", file_path=str(repo / "a.py"))
     assert run_hook(home, "claude", "PreToolUse", elsewhere).stdout == ""
-    assert [h[3:] for h in hits(home)] == [GATE_DENY, GATE_DENY, GATE_NO_MATCH]
+    assert [h[3:] for h in hits(home)] == [GATE_DENY, GATE_NO_MATCH]
 
 
 def test_edit_through_a_relative_path_or_symlink_into_the_home_is_denied(tmp_path):
@@ -1115,7 +1056,7 @@ def test_an_agent_deny_still_prints_in_baseline_mode_and_in_the_off_arm(env):
     (home / "BASELINE").unlink()
     (home / "ARMS").touch()
     off = pre_tool(repo, "scars promote L-1", session=ARM_OFF_SESSION)
-    assert run_hook(home, "codex", "PreToolUse", off).stdout == deny_json(run_reason("promote"))
+    assert run_hook(home, "claude", "PreToolUse", off).stdout == deny_json(run_reason("promote"))
     assert rows(home, "select session_id, outcome, trigger_key, arm from hits order by seq") == [
         ("s1", "blocked", "agent_deny", "baseline"),
         (ARM_OFF_SESSION, "blocked", "agent_deny", "off"),
@@ -1451,3 +1392,11 @@ def test_latency_with_1000_lessons(env):
     print(f"  no match: p50 {no_match[0]:.1f}, p99 {no_match[1]:.1f}")
     print(f"  match:    p50 {matched[0]:.1f}, p99 {matched[1]:.1f}")
     assert no_match[1] < 1000 and matched[1] < 1000
+
+
+@pytest.mark.parametrize("event", ["SessionStart", "PreToolUse"])
+def test_old_codex_hook_exits_zero_without_output(env, event):
+    home, repo = env
+    result = run_hook(home, "codex", event, session_start(repo, "startup"))
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+    assert hits(home) == []

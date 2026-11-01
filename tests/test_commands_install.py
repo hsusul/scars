@@ -53,6 +53,85 @@ def transcript(user, cwd, name="s1"):
     path.write_text(claude_transcript(str(cwd), time.time() - 3600, FAILURE_PAIR))
 
 
+@pytest.mark.parametrize("yes", [False, True])
+def test_init_removes_scars_entries_from_codex_hooks(machine, yes):
+    user, scars_home = machine
+    path = user / ".codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    shim = shlex.quote(str(scars_home / "bin" / "scars-hook"))
+    foreign = {"type": "command", "command": "python3 ~/guard.py"}
+    path.write_text(
+        json.dumps(
+            {
+                "other": 1,
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": f"{shim} codex SessionStart"},
+                                foreign,
+                            ]
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    args = ("--yes",) if yes else ()
+    code, out, err = run(make_ctx(user, lines="y\ny\ny\n", clock=time.time), "init", *args)
+    assert (code, err) == (0, "")
+    assert "Codex hooks: these files would change\n" in out
+    assert "Codex hooks: scars entries removed\n" in out
+    if not yes:
+        assert "remove the scars entries from Codex hooks? [y/N] " in out
+    assert json.loads(path.read_text()) == {
+        "other": 1,
+        "hooks": {"SessionStart": [{"hooks": [foreign]}]},
+    }
+    after = path.read_bytes()
+    code, out, err = run(make_ctx(user, clock=time.time), "init", "--yes")
+    assert (code, err) == (0, "")
+    assert "codex" not in out.lower()
+    assert path.read_bytes() == after
+
+
+def test_init_declines_codex_cleanup_without_changing_bytes(machine):
+    user, scars_home = machine
+    path = user / ".codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    shim = shlex.quote(str(scars_home / "bin" / "scars-hook"))
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": f"{shim} codex SessionStart"},
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    before = path.read_bytes()
+    code, out, err = run(make_ctx(user, lines="y\nn\nn\n", clock=time.time), "init")
+    assert (code, err) == (0, "")
+    assert "remove the scars entries from Codex hooks? [y/N] Codex hooks: not written\n" in out
+    assert path.read_bytes() == before
+
+
+def legacy_config(scars_home):
+    shim = shlex.quote(str(scars_home / "bin" / "scars-hook"))
+    return json.dumps(
+        {
+            "other": 1,
+            "hooks": {"PreToolUse": [{"hooks": [{"command": f"{shim} codex PreToolUse"}]}]},
+        }
+    )
+
+
 def test_claude_plugin_hooks_match_the_documented_shape():
     config = install.hooks_config("claude/hooks/hooks.json", HOOK)
     assert list(config) == ["hooks"]
@@ -72,17 +151,7 @@ def test_claude_plugin_hooks_match_the_documented_shape():
     )
 
 
-def test_codex_hooks_match_the_documented_shape():
-    events = install.hooks_config("codex/hooks.json", HOOK)["hooks"]
-    assert list(events) == ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"]
-    for event, [group] in events.items():
-        assert group.get("matcher") == (
-            None if event in ("SessionStart", "UserPromptSubmit") else "Bash|apply_patch"
-        )
-        assert group["hooks"] == [{"type": "command", "command": f"{QUOTED} codex {event}", "timeout": 2}]
-
-
-def test_codex_merge_keeps_other_hooks_and_replaces_only_exact_scars_commands():
+def test_codex_cleanup_keeps_other_hooks_and_removes_only_exact_scars_commands():
     guard = {"type": "command", "command": "python3 ~/guard.py"}
     mentions = {"type": "command", "command": "echo scars-hook is great"}
     existing = {
@@ -101,8 +170,7 @@ def test_codex_merge_keeps_other_hooks_and_replaces_only_exact_scars_commands():
             ],
         },
     }
-    ours = install.hooks_config("codex/hooks.json", HOOK)
-    merged = install.merge_codex(existing, ours)
+    merged = install.remove_codex_entries(existing, HOOK)
     assert merged["description"] == "mine"
     assert merged["hooks"]["Stop"] == []
     assert merged["hooks"]["PreToolUse"] == [
@@ -110,10 +178,9 @@ def test_codex_merge_keeps_other_hooks_and_replaces_only_exact_scars_commands():
         {"matcher": "Edit", "hooks": []},
         {"hooks": [mentions]},
         {"matcher": "Bash", "hooks": [guard]},
-        *ours["hooks"]["PreToolUse"],
     ]
-    assert list(merged["hooks"]) == ["Stop", "PreToolUse", "SessionStart", "UserPromptSubmit", "PostToolUse"]
-    assert install.merge_codex(merged, ours) == merged
+    assert list(merged["hooks"]) == ["Stop", "PreToolUse"]
+    assert install.remove_codex_entries(merged, HOOK) == merged
 
 
 @pytest.mark.parametrize(
@@ -153,15 +220,13 @@ def test_init_yes_is_idempotent(machine, work):
     code, out, err = run(make_ctx(user, clock=time.time), "init", "--yes")
     plist = user / "Library" / "LaunchAgents" / "dev.scars.miner.plist"
     assert (code, err) == (0, "")
-    assert out.splitlines()[:9] == [
+    assert out.splitlines()[:7] == [
         f"store: {scars_home}",
         "repos: all 1 found are registered",
         "Claude Code plugin: unchanged",
         "to turn it on in Claude Code, run:",
         f"  claude plugin marketplace add {scars_home}/plugins",
         "  claude plugin install scars@scars-local",
-        "Codex hooks: unchanged",
-        "Codex asks you to review and trust the new hooks the next time it starts",
         "miner schedule: unchanged",
     ]
     assert "read 0 transcripts: 0 calls, 0 failures, 0 pairs" in out
@@ -201,7 +266,7 @@ def test_init_asks_per_repo_and_per_file_group(machine, work):
         in out
     )
     assert "write the Claude Code plugin? [y/N] Claude Code plugin: written\n" in out
-    assert "write the Codex hooks? [y/N] Codex hooks: not written\n" in out
+    assert "codex" not in out.lower()
     assert "write the miner schedule? [y/N] miner schedule: not written\n" in out
     assert (scars_home / "plugins" / "claude" / "hooks" / "hooks.json").exists()
     assert not (user / ".codex" / "hooks.json").exists()
@@ -224,8 +289,9 @@ def test_init_refuses_a_broken_codex_config(machine):
     (user / ".codex").mkdir(parents=True)
     (user / ".codex" / "hooks.json").write_text("{not json")
     assert run(make_ctx(user, clock=time.time), "init", "--yes")[2] == (
-        f"scars init: cannot parse {user}/.codex/hooks.json; "
-        "fix it or move it away, then run scars init again\n"
+        f"scars init: {user}/.codex/hooks.json is not in the shape scars knows "
+        "(Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); "
+        "nothing was changed. Fix it or move it away, then run scars init again\n"
     )
 
 
@@ -236,19 +302,16 @@ def mode(path):
     return oct(os.stat(path).st_mode & 0o777)
 
 
-def test_init_writes_a_stable_shim_and_points_both_harnesses_at_it(machine):
+def test_init_writes_a_stable_shim_and_points_claude_at_it(machine):
     user, scars_home = machine
     assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
     shim = scars_home / "bin" / "scars-hook"
     assert (shim.read_bytes(), mode(shim)) == (SHIM_BODY.encode(), "0o755")
     quoted = shlex.quote(str(shim))
     claude = json.loads((scars_home / "plugins" / "claude" / "hooks" / "hooks.json").read_text())
-    codex = json.loads((user / ".codex" / "hooks.json").read_text())
-    for config, harness in ((claude, "claude"), (codex, "codex")):
-        commands = [h["command"] for e, gs in config["hooks"].items() for g in gs for h in g["hooks"]]
-        events = list(config["hooks"])
-        assert commands == [f"{quoted} {harness} {e}" for e in events]
-    assert mode(user / ".codex" / "hooks.json") == "0o600"
+    commands = [h["command"] for gs in claude["hooks"].values() for g in gs for h in g["hooks"]]
+    assert commands == [f"{quoted} claude {e}" for e in claude["hooks"]]
+    assert not (user / ".codex").exists()
     assert mode(scars_home / "plugins" / "claude" / "hooks" / "hooks.json") == "0o600"
     assert mode(user / "Library" / "LaunchAgents" / "dev.scars.miner.plist") == "0o644"
 
@@ -338,6 +401,9 @@ def test_doctor_rejects_a_shim_that_does_not_use_its_store(machine, monkeypatch,
     monkeypatch.setattr(doctor, "store_location_problem", lambda _: None)
     monkeypatch.setattr(doctor, "run_canary", lambda: doctor.Check("canary", True, "lesson returned in 7 ms"))
     assert run(make_ctx(user), "init", "--yes")[0] == 0
+    registry = user / ".claude" / "plugins" / "installed_plugins.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text('{"plugins": {"scars@scars-local": []}}')
     assert run(make_ctx(user), "doctor")[0] == 0
     (scars_home / "bin" / "scars-hook").write_text(body)
     code, out, err = run(make_ctx(user), "doctor")
@@ -412,15 +478,8 @@ def test_init_reads_and_writes_configs_as_utf8_whatever_the_locale(work):
     assert f"store: {scars_home}\n" in result.stdout
     merged = json.loads(codex.read_text(encoding="utf-8"))
     assert merged["hooks"]["Stop"][0] == other
-    shim = shlex.quote(str(scars_home / "bin" / "scars-hook"))
-    assert merged["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == f"{shim} codex PreToolUse"
-    assert sorted(merged["hooks"]) == [
-        "PostToolUse",
-        "PreToolUse",
-        "SessionStart",
-        "Stop",
-        "UserPromptSubmit",
-    ]
+    assert merged == {"hooks": {"Stop": [other]}}
+    assert "Codex" not in result.stdout
     if sys.platform == "darwin":
         plist = user / "Library" / "LaunchAgents" / "dev.scars.miner.plist"
         assert plistlib.loads(plist.read_bytes())["EnvironmentVariables"] == {"SCARS_HOME": str(scars_home)}
@@ -458,10 +517,8 @@ def test_init_writes_utf8_configs_for_a_home_decoded_as_surrogate_escapes(machin
     assert (code, err) == (0, "")
     scars_home = f"{user}/sch\u00fctz"
     assert f"store: {scars_home}\n" in out
-    raw = (user / ".codex" / "hooks.json").read_bytes().decode("utf-8")
-    command = json.loads(raw)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert not (user / ".codex").exists()
     shim = shlex.quote(f"{scars_home}/bin/scars-hook")
-    assert command == f"{shim} codex PreToolUse"
     plugin = json.loads((user / "sch\u00fctz" / "plugins" / "claude" / "hooks" / "hooks.json").read_bytes())
     assert plugin["hooks"]["SessionStart"][0]["hooks"][0]["command"] == f"{shim} claude SessionStart"
     job = plistlib.loads((user / "Library" / "LaunchAgents" / "dev.scars.miner.plist").read_bytes())
@@ -522,11 +579,11 @@ def test_init_refuses_json_that_would_not_survive_a_round_trip(machine, text, de
 
 
 def test_init_does_not_overwrite_a_codex_config_edited_while_it_asked(machine, work):
-    user, _ = machine
+    user, scars_home = machine
     transcript(user, git_repo(work / "lib", remote="https://example.com/x/lib.git"))
     path = user / ".codex" / "hooks.json"
     path.parent.mkdir(parents=True)
-    path.write_text("{}")
+    path.write_text(legacy_config(scars_home))
     edited = '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}'
 
     class EditsDuringPrompt(Tty):
@@ -545,58 +602,58 @@ def test_init_does_not_overwrite_a_codex_config_edited_while_it_asked(machine, w
     assert run(make_ctx(user, lines="s\ny\ny\n", platform="linux", clock=time.time), "init")[0] == 0
     merged = json.loads(path.read_text())
     assert merged["hooks"]["Stop"] == json.loads(edited)["hooks"]["Stop"]
-    assert "PreToolUse" in merged["hooks"]
+    assert merged == json.loads(edited)
 
 
 def test_init_writes_through_a_symlinked_codex_config(machine, work):
-    user, _ = machine
+    user, scars_home = machine
     real = work / "dotfiles" / "codex-hooks.json"
     real.parent.mkdir()
-    real.write_text('{"other": 1}')
+    real.write_text(legacy_config(scars_home))
     link = user / ".codex" / "hooks.json"
     link.parent.mkdir(parents=True)
     link.symlink_to(real)
     assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
     assert link.is_symlink() and os.readlink(link) == str(real)
-    merged = json.loads(real.read_text())
-    assert (merged["other"], sorted(merged["hooks"])) == (
-        1,
-        ["PostToolUse", "PreToolUse", "SessionStart", "UserPromptSubmit"],
-    )
+    assert json.loads(real.read_text()) == {"other": 1, "hooks": {"PreToolUse": []}}
 
 
 def test_init_keeps_the_mode_of_an_existing_config(machine):
-    user, _ = machine
+    user, scars_home = machine
     path = user / ".codex" / "hooks.json"
     path.parent.mkdir(parents=True)
-    path.write_text("{}")
+    path.write_text(legacy_config(scars_home))
     path.chmod(0o640)
     assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
-    assert (mode(path), "PreToolUse" in json.loads(path.read_text())["hooks"]) == ("0o640", True)
-    path.write_text("{}")
+    assert (mode(path), json.loads(path.read_text())["hooks"]["PreToolUse"]) == ("0o640", [])
+    path.write_text(legacy_config(scars_home))
     path.chmod(0o600)
     assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
-    assert (mode(path), "PreToolUse" in json.loads(path.read_text())["hooks"]) == ("0o600", True)
+    assert (mode(path), json.loads(path.read_text())["hooks"]["PreToolUse"]) == ("0o600", [])
 
 
 def test_init_leaves_a_read_only_config_alone_unless_confirmed(machine):
-    user, _ = machine
+    user, scars_home = machine
     path = user / ".codex" / "hooks.json"
     path.parent.mkdir(parents=True)
-    path.write_text("{}")
+    path.write_text(legacy_config(scars_home))
+    original = path.read_bytes()
     path.chmod(0o444)
     out = run(make_ctx(user, platform="linux", clock=time.time), "init", "--yes")[1]
     assert (
         f"Codex hooks: not written: {path} is read-only; run scars init without --yes to replace it\n" in out
     )
-    assert path.read_text() == "{}"
+    assert path.read_bytes() == original
     out = run(make_ctx(user, lines="y\nn\n", platform="linux", clock=time.time), "init")[1]
-    assert f"write the Codex hooks? [y/N] {path} is read-only; replace it anyway? [y/N] " in out
+    assert (
+        f"remove the scars entries from Codex hooks? [y/N] {path} is read-only; replace it anyway? [y/N] "
+        in out
+    )
     assert "Codex hooks: not written\n" in out
-    assert path.read_text() == "{}"
+    assert path.read_bytes() == original
     out = run(make_ctx(user, lines="y\ny\n", platform="linux", clock=time.time), "init")[1]
-    assert "Codex hooks: written\n" in out
-    assert (mode(path), "PreToolUse" in json.loads(path.read_text())["hooks"]) == ("0o444", True)
+    assert "Codex hooks: scars entries removed\n" in out
+    assert (mode(path), json.loads(path.read_text())["hooks"]["PreToolUse"]) == ("0o444", [])
 
 
 def test_concurrent_writes_of_one_file_never_fail_or_leave_temp_files(tmp_path):
@@ -637,9 +694,10 @@ def test_two_inits_at_once_both_succeed(work):
     outputs = [p.communicate(timeout=60) for p in procs]
     results = [(p.returncode, err) for p, (_, err) in zip(procs, outputs, strict=True)]
     assert results == [(0, ""), (0, "")]
-    codex = json.loads((user / ".codex" / "hooks.json").read_text())
-    assert sorted(codex["hooks"]) == ["PostToolUse", "PreToolUse", "SessionStart", "UserPromptSubmit"]
-    assert [len(groups) for groups in codex["hooks"].values()] == [1, 1, 1, 1]
+    assert not (user / ".codex").exists()
+    plugin = json.loads((user / ".scars" / "plugins" / "claude" / "hooks" / "hooks.json").read_text())
+    assert list(plugin["hooks"]) == ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUseFailure"]
+    assert [len(groups) for groups in plugin["hooks"].values()] == [1, 1, 1, 1]
     leftovers = [p for p in user.rglob("*") if "scars-tmp" in p.name]
     assert leftovers == []
 
@@ -739,3 +797,30 @@ def test_init_top_list_counts_tool_failures_in_its_repo(home, user_home, tmp_pat
         f"  {shell}  provisional  AVOID pytest --frobnicate\n"
         "    would have fired 2 times in the last 30 days\n"
     ) in out
+
+
+@pytest.mark.parametrize("content", ['{ "other": 1 }\n', '{ "hooks": { "Stop": [] } }\n'])
+def test_init_leaves_codex_without_scars_entries_byte_identical(machine, content):
+    user, _ = machine
+    path = user / ".codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(content)
+    before = path.read_bytes()
+    code, out, err = run(make_ctx(user, clock=time.time), "init", "--yes")
+    assert (code, err) == (0, "")
+    assert "codex" not in out.lower()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("event", ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"])
+def test_legacy_cleanup_recognizes_each_old_command_and_keeps_similar_foreign_hooks(event):
+    command = f"{QUOTED} codex {event}"
+    foreign = [
+        {"command": f"{command} --other"},
+        {"command": f"echo {command}"},
+        {"command": f"/other/scars-hook codex {event}"},
+        {"command": False},
+    ]
+    existing = {"hooks": {event: [{"hooks": [{"command": command}, *foreign]}]}}
+    assert install.remove_codex_entries(existing, HOOK) == {"hooks": {event: [{"hooks": foreign}]}}
+    assert existing == {"hooks": {event: [{"hooks": [{"command": command}, *foreign]}]}}

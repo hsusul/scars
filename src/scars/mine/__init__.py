@@ -3,8 +3,7 @@
 `run` mines one batch:
 
 1. Read the new complete lines of every transcript from its saved offset (from 0 when the file was
-   replaced or shrank), into one call stream per session in invocation order, starting from the Codex
-   context saved with the offset.
+   replaced or shrank), into one call stream per session in invocation order.
 2. Drop calls whose tool use id an earlier batch already processed: resumed sessions copy history.
 3. Pair failures with their fixes (see `pairs`), continuing the failures left open by earlier batches.
 4. Build each pair's candidate (see `build`), in order of the fixing call's time. A new fingerprint
@@ -48,7 +47,7 @@ from pathlib import Path
 
 from scars import hook, policy, render, store
 from scars.match import InvalidTrigger, Precision, RecordedCall
-from scars.mine import build, calls, claude, codex, outcomes, pairs
+from scars.mine import build, calls, claude, outcomes, pairs
 from scars.mine.replay import CallIndex
 from scars.model import (
     ErrorSignature,
@@ -73,10 +72,7 @@ class Source:
 
 
 def default_sources(user_home: Path) -> tuple[Source, ...]:
-    return (
-        Source(Harness.CLAUDE, user_home / ".claude" / "projects", "*/*.jsonl"),
-        Source(Harness.CODEX, user_home / ".codex" / "sessions", "**/rollout-*.jsonl"),
-    )
+    return (Source(Harness.CLAUDE, user_home / ".claude" / "projects", "*/*.jsonl"),)
 
 
 @dataclass(frozen=True)
@@ -115,24 +111,14 @@ class Summary:
     """Set on the run that moved the store to the current signature rules."""
 
 
-_PARSERS = {Harness.CLAUDE: claude.parse, Harness.CODEX: codex.parse}
-
-
-def _session_id(source: Source, path: Path) -> str:
-    if source.harness is Harness.CODEX:
-        return codex.session_id_from_name(str(path))
-    return path.stem
-
-
 def session_key(source: Source, path: Path) -> tuple[str, str]:
     """The `(harness, session id)` a transcript file belongs to."""
-    return str(source.harness), _session_id(source, path)
+    return str(source.harness), path.stem
 
 
 @dataclass(frozen=True)
 class _Read:
     offsets: tuple[store.Offset, ...]
-    contexts: tuple[store.FileContext, ...]
     streams: dict[tuple[str, str], list[calls.Call]]
     sessions: int
     malformed: int
@@ -145,11 +131,9 @@ def _clean(text: str | None) -> str | None:
 def _read(
     sources: Iterable[Source],
     saved: dict[str, store.Offset],
-    saved_contexts: dict[str, store.FileContext],
     now: float,
 ) -> _Read:
     offsets: list[store.Offset] = []
-    contexts: list[store.FileContext] = []
     streams: dict[tuple[str, str], list[calls.Call]] = {}
     sessions = malformed = 0
     for source in sources:
@@ -169,21 +153,16 @@ def _read(
                 chunk = calls.read_from(key, start)
             except OSError:
                 continue
-            session_id = _session_id(source, path)
-            ctx = saved_contexts.get(key) if start else None
-            context = calls.Context(ctx.cwd, ctx.model_id) if ctx else None
-            parsed = _PARSERS[source.harness](chunk.lines, session_id, context, now)
+            session_id = path.stem
+            parsed = claude.parse(chunk.lines, session_id, now=now)
             resume = chunk.end if parsed.resume_offset is None else parsed.resume_offset
             offsets.append(store.Offset(key, resume, state.inode, state.mtime))
-            if parsed.context is not None:
-                cwd, model = _clean(parsed.context.cwd) or "", _clean(parsed.context.model_id)
-                contexts.append(store.FileContext(key, cwd, model))
             malformed += chunk.malformed
             if chunk.lines:
                 sessions += 1
             if parsed.calls:
                 streams.setdefault((str(source.harness), session_id), []).extend(parsed.calls)
-    return _Read(tuple(offsets), tuple(contexts), streams, sessions, malformed)
+    return _Read(tuple(offsets), streams, sessions, malformed)
 
 
 def _mined_row(call: calls.Call) -> store.MinedCall:
@@ -487,7 +466,7 @@ def _run(
     skipped: Counter[str] = Counter()
     upgrade = _upgrade_signatures(db, now)
     retired = _retire_unrenderable(db, now)
-    read = _read(sources, store.miner_offsets(db), store.miner_file_contexts(db), now)
+    read = _read(sources, store.miner_offsets(db), now)
     all_ids = [c.tool_use_id for stream in read.streams.values() for c in stream]
     seen = set(store.seen_tool_uses(db, all_ids))
     streams: dict[tuple[str, str], list[calls.Call]] = {}
@@ -546,7 +525,6 @@ def _run(
         pending=[r for r in map(_pending_row, still_open) if r is not None],
         calls=[r for r in rows if r.at >= since],
         prune_before=since,
-        contexts=read.contexts,
     )
     expired = policy.expire(db, now)
     result = outcomes.run(db, str(home / "telemetry.db"), now, root_of=repos.root)

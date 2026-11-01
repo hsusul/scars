@@ -678,164 +678,6 @@ def test_a_new_store_records_the_current_signature_rules(env):
     assert mine_now(env).signature_upgrade is None
 
 
-# ---------------------------------------------------------------- Codex
-
-
-def codex_lines(cwd: str) -> list[dict[str, object]]:
-    def at(n: int) -> str:
-        return iso(START + n)
-
-    def item(n: int, item_id: str, command: list[str], code: int | None, output: str) -> dict[str, object]:
-        return {
-            "timestamp": at(n),
-            "type": "event_msg",
-            "payload": {
-                "type": "item_completed",
-                "item": {
-                    "type": "CommandExecution",
-                    "id": item_id,
-                    "command": command,
-                    "cwd": cwd,
-                    "exit_code": code,
-                    "aggregated_output": output,
-                },
-            },
-        }
-
-    return [
-        {"timestamp": at(0), "type": "session_meta", "payload": {"id": "sess", "cwd": cwd}},
-        {"timestamp": at(1), "type": "turn_context", "payload": {"model": "gpt-test", "cwd": cwd}},
-        item(2, "exec-1", ["/bin/zsh", "-lc", "pytest --frobnicate tests"], 2, FAIL_TEXT),
-        item(3, "exec-2", ["/bin/zsh", "-lc", "pytest tests"], 0, "1 passed"),
-        {
-            "timestamp": at(4),
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "name": "exec_command",
-                "call_id": "c1",
-                "arguments": json.dumps({"cmd": "make lint --strict", "workdir": cwd}),
-            },
-        },
-        {
-            "timestamp": at(5),
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "call_id": "c1",
-                "output": "Exit code: 2\nWall time: 0.1 seconds\nOutput:\nmake: unknown option strict",
-            },
-        },
-        {
-            "timestamp": at(6),
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "name": "exec_command",
-                "call_id": "c2",
-                "arguments": json.dumps({"cmd": "make lint"}),
-            },
-        },
-        {
-            "timestamp": at(7),
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "call_id": "c2",
-                "output": "make: no exit code shown",
-            },
-        },
-    ]
-
-
-def test_codex_rollout_pairs_on_visible_exit_codes_only(env, tmp_path):
-    sessions = tmp_path / "codex" / "2027" / "01" / "15"
-    sessions.mkdir(parents=True)
-    name = "rollout-2027-01-15T00-00-00-0000000a-0000-4000-8000-000000000001.jsonl"
-    (sessions / name).write_text("".join(json.dumps(r) + "\n" for r in codex_lines(env["repo"])))
-    source = Source(Harness.CODEX, tmp_path / "codex", "**/rollout-*.jsonl")
-    summary = mine_now(env, sources=[source])
-    assert (summary.calls, summary.failures, summary.pairs, summary.candidates_created) == (4, 2, 1, 1)
-    db = lessons_db(env)
-    assert db.execute("select harness, session_id, failed_tool_use_id from observations").fetchall() == [
-        ("codex", "0000000a-0000-4000-8000-000000000001", "exec-1")
-    ]
-    assert db.execute("select status, model_id from mined_calls where tool_use_id = 'c2'").fetchall() == [
-        ("unknown", "gpt-test")
-    ]
-    assert db.execute("select tool_use_id from pending_failures").fetchall() == [("c1",)]
-
-
-def test_codex_static_fixture(env, tmp_path):
-    root = tmp_path / "codex"
-    root.mkdir()
-    for f in (FIXTURES / "codex").glob("rollout-*.jsonl"):
-        copy_fixture(f, root / f.name, env["repo"])
-    summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
-    assert (summary.pairs, summary.candidates_created) == (1, 1)
-
-
-def test_codex_reader_trusts_only_visible_exit_codes():
-    from scars.mine import codex
-    from scars.mine.calls import CallStatus, Line
-
-    def item(n, code):
-        return {
-            "timestamp": iso(START + n),
-            "type": "event_msg",
-            "payload": {
-                "type": "item_completed",
-                "item": {
-                    "type": "CommandExecution",
-                    "id": f"e{n}",
-                    "command": "ls",
-                    "cwd": "/r",
-                    "exit_code": code,
-                    "aggregated_output": "ls: x: No such file",
-                },
-            },
-        }
-
-    def output(n, text):
-        return [
-            {
-                "timestamp": iso(START + n),
-                "type": "response_item",
-                "payload": {
-                    "type": "function_call",
-                    "name": "shell",
-                    "call_id": f"f{n}",
-                    "arguments": json.dumps({"command": ["bash", "-lc", "ls"]}),
-                },
-            },
-            {
-                "timestamp": iso(START + n),
-                "type": "response_item",
-                "payload": {"type": "function_call_output", "call_id": f"f{n}", "output": text},
-            },
-        ]
-
-    records = [
-        item(1, None),
-        item(2, 0),
-        item(3, 1),
-        *output(4, "no header here"),
-        *output(5, json.dumps({"output": "ls: x: No such file", "metadata": {"exit_code": 1}})),
-        *output(6, "Process exited with code 0\nOutput:\nok"),
-    ]
-    parsed = codex.parse([Line(i, r) for i, r in enumerate(records)], "s")
-    assert [(c.tool_use_id, c.status, c.output) for c in parsed.calls] == [
-        ("e1", CallStatus.UNKNOWN, ""),
-        ("e2", CallStatus.OK, ""),
-        ("e3", CallStatus.FAILED, "ls: x: No such file"),
-        ("f4", CallStatus.UNKNOWN, ""),
-        ("f5", CallStatus.FAILED, "ls: x: No such file"),
-        ("f6", CallStatus.OK, ""),
-    ]
-    assert {c.input for c in parsed.calls} == {"ls"}
-    assert parsed.resume_offset is None
-
-
 # ---------------------------------------------------------------- outcome pass wiring
 
 
@@ -1052,38 +894,6 @@ def test_a_crash_between_observed_and_the_observation_does_not_double_count(env,
     assert db.execute("select type from events order by seq").fetchall() == [
         ("proposed",),
         ("observed",),
-    ]
-
-
-def codex_record(n: int, kind: str, payload: dict[str, object]) -> str:
-    return json.dumps({"timestamp": iso(START + n), "type": kind, "payload": payload}) + "\n"
-
-
-def command_item(n: int, item_id: str, command: str, code: int, output: str = "") -> str:
-    item = {"type": "CommandExecution", "id": item_id, "command": command, "exit_code": code}
-    return codex_record(
-        n, "event_msg", {"type": "item_completed", "item": {**item, "aggregated_output": output}}
-    )
-
-
-def test_codex_context_carries_over_to_the_next_batch(env, tmp_path):
-    root = tmp_path / "codex"
-    root.mkdir()
-    path = root / "rollout-2027-01-15T00-00-00-0000000a-0000-4000-8000-000000000003.jsonl"
-    path.write_text(
-        codex_record(0, "session_meta", {"id": "s", "cwd": env["repo"]})
-        + codex_record(1, "turn_context", {"model": "gpt-test", "cwd": env["repo"]})
-        + command_item(2, "e1", "pytest --frobnicate tests", 2, FAIL_TEXT)
-    )
-    source = Source(Harness.CODEX, root, "**/rollout-*.jsonl")
-    assert mine_now(env, sources=[source]).failures == 1
-    with path.open("a") as f:
-        f.write(command_item(3, "e2", "pytest tests", 0))
-    summary = mine_now(env, sources=[source])
-    assert (summary.pairs, summary.candidates_created) == (1, 1)
-    db = lessons_db(env)
-    assert db.execute("select cwd, model_id from mined_calls where tool_use_id = 'e2'").fetchall() == [
-        (env["repo"], "gpt-test")
     ]
 
 
@@ -1318,43 +1128,6 @@ def test_a_claude_call_runs_in_its_invocation_cwd_not_the_result_records(env):
         (env["upstream"],),
     ]
     assert the_lesson(env).trust_class is TrustClass.THIRD_PARTY_REPO
-
-
-def test_a_codex_file_url_cwd_is_decoded_to_a_path(env, tmp_path):
-    from urllib.parse import quote
-
-    spaced = Path(env["loose"]) / "my app"
-    spaced.mkdir()
-    url = "file://" + quote(str(spaced))
-    root = tmp_path / "codex"
-    root.mkdir()
-    (root / "rollout-2027-01-15T00-00-00-0000000a-0000-4000-8000-000000000009.jsonl").write_text(
-        codex_record(0, "session_meta", {"id": "s", "cwd": url})
-        + codex_record(1, "turn_context", {"model": "gpt-test", "cwd": url})
-        + command_item(2, "e1", "pytest --frobnicate tests", 2, FAIL_TEXT)
-        + command_item(3, "e2", "pytest tests", 0)
-    )
-    summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
-    assert (summary.pairs, summary.candidates_created) == (1, 1)
-    assert lessons_db(env).execute("select cwd from mined_calls order by tool_use_id").fetchall() == [
-        (str(spaced),),
-        (str(spaced),),
-    ]
-
-
-@pytest.mark.parametrize(("host", "pairs"), [("localhost", 1), ("build-box", 0)])
-def test_a_codex_file_url_on_another_host_is_an_unknown_directory(env, tmp_path, host, pairs):
-    url = f"file://{host}{env['loose']}"
-    root = tmp_path / "codex"
-    root.mkdir()
-    (root / "rollout-2027-01-15T00-00-00-0000000a-0000-4000-8000-00000000000a.jsonl").write_text(
-        codex_record(0, "session_meta", {"id": "s", "cwd": url})
-        + codex_record(1, "turn_context", {"model": "gpt-test", "cwd": url})
-        + command_item(2, "e1", "pytest --frobnicate tests", 2, FAIL_TEXT)
-        + command_item(3, "e2", "pytest tests", 0)
-    )
-    summary = mine_now(env, sources=[Source(Harness.CODEX, root, "**/rollout-*.jsonl")])
-    assert (summary.pairs, summary.candidates_created) == (pairs, pairs)
 
 
 def test_cd_into_a_literal_dir_then_one_command_is_that_command_run_there(env):
@@ -1787,3 +1560,49 @@ def test_a_second_session_sights_the_same_tool_lesson(env):
     assert (summary.pairs, summary.candidates_created, summary.observations) == (2, 1, 2)
     (lesson,) = store.inbox_candidates(lessons_db(env))
     assert lesson.sessions_seen == 2
+
+
+def test_legacy_codex_rows_remain_readable_while_mining_a_claude_fixture(env):
+    from scars.commands.mining import summary_lines
+
+    legacy = basic_pair(env["repo"], prefix="legacy")
+    legacy.bash("legacy-open", "pytest --frobnicate tests", FAIL_TEXT)
+    write(env, "legacy", legacy.text())
+    assert mine_now(env) == Summary(
+        sessions_read=1, calls=4, failures=2, pairs=1, candidates_created=1, observations=1
+    )
+    db = lessons_db(env)
+    for table in ("observations", "pending_failures", "mined_calls"):
+        db.execute(f"update {table} set harness = 'codex'")
+    db.execute("update mined_calls set status = 'unknown' where tool_use_id = 'legacy2'")
+    db.execute("insert into miner_file_context values ('old-rollout.jsonl', '/old/cwd', 'old-model')")
+    db.close()
+    copy_fixture(FIXTURES / "claude" / "pair.jsonl", env["projects"] / "p" / "fixture.jsonl", env["repo"])
+    summary = mine_now(env)
+    assert summary_lines(summary) == [
+        "read 1 transcripts: 3 calls, 1 failures, 1 pairs",
+        "lessons: 0 new, 1 observations, 0 expired",
+    ]
+    db = lessons_db(env)
+    assert db.execute("select harness from observations order by id").fetchall() == [("codex",), ("claude",)]
+    assert {c.harness for c in store.mined_calls_since(db, START)} == {"codex", "claude"}
+    assert [p.harness for p in store.pending_failures(db)] == ["codex"]
+    assert db.execute("select * from miner_file_context").fetchall() == [
+        ("old-rollout.jsonl", "/old/cwd", "old-model")
+    ]
+    assert store.verify(db) == []
+    db.close()
+
+
+def test_default_sources_ignore_codex_sessions(env, tmp_root):
+    user = tmp_root / "user"
+    claude = user / ".claude" / "projects" / "fixture"
+    codex = user / ".codex" / "sessions"
+    claude.mkdir(parents=True)
+    codex.mkdir(parents=True)
+    copy_fixture(FIXTURES / "claude" / "pair.jsonl", claude / "fixture.jsonl", env["repo"])
+    (codex / "rollout-old.jsonl").write_text(basic_pair(env["repo"], prefix="ignored").text())
+    assert mine.default_sources(user) == (Source(Harness.CLAUDE, user / ".claude" / "projects", "*/*.jsonl"),)
+    assert mine_now(env, sources=list(mine.default_sources(user))) == Summary(
+        sessions_read=1, calls=3, failures=1, pairs=1, candidates_created=1, observations=1
+    )

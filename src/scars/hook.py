@@ -48,7 +48,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, TextIO
 
 from scars import paths, telemetry
-from scars.adapters import Ignored, MalformedInput, claude, codex, context_output, deny_output, full_command
+from scars.adapters import Ignored, MalformedInput, claude, context_output, deny_output, full_command
 from scars.model import (
     PRIVILEGED_COMMANDS,
     Harness,
@@ -73,7 +73,7 @@ GIT_TIMEOUT_SECONDS = 1.0
 STDIN_LIMIT_BYTES = 1 << 20
 STDIN_DEADLINE_MS = 500
 
-ADAPTERS: dict[Harness, ModuleType] = {Harness.CLAUDE: claude, Harness.CODEX: codex}
+ADAPTERS: dict[Harness, ModuleType] = {Harness.CLAUDE: claude}
 ARMS_KEY = b"scars session arms"
 SILENT_ARMS = frozenset({"baseline", "off"})
 AGENT_DENIED_SUBCOMMANDS = PRIVILEGED_COMMANDS | {"inbox"}

@@ -1,9 +1,0 @@
-{
-  "cases": [
-    {
-      "name": "prompt",
-      "stdin": {"session_id": "thr_123", "transcript_path": "/workspace/.codex/rollout.jsonl", "cwd": "/workspace", "hook_event_name": "UserPromptSubmit", "model": "gpt-5.5-codex", "permission_mode": "default", "turn_id": "turn_1", "prompt": "fix the build in apps/web"},
-      "event": {"harness": "codex", "harness_version": "", "event": "prompt", "session_id": "thr_123", "tool_use_id": null, "cwd": "/workspace", "tool_kind": null, "command": null, "paths": [], "error_text": null, "prompt": "fix the build in apps/web", "model_id": "gpt-5.5-codex", "tool_name": null}
-    }
-  ]
-}
