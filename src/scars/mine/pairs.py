@@ -9,6 +9,8 @@ The same target means the first simple command of each call has the same subcomm
 file or other target operands and the same value for every option that selects the target. A leading
 pattern or script operand may differ for programs in `PATTERN_OPTIONS`. A pass of the same program on
 another file, PR, branch, make target, directory, repo or namespace is a different task, not a fix.
+After a missing-path error, exactly one operand may instead change to another literal path. Both
+operands must contain a slash or a file extension, with no glob or expansion characters.
 The subcommand is the first words that are neither
 options nor option values, as many as `SUBCOMMAND_DEPTH` gives for the program (or for the program and its
 first such word), compared in order. Make targets and `xcodebuild` actions are operands.
@@ -49,6 +51,7 @@ rejects never opens either: its program is unknown, so no later call can be show
 
 import json
 import posixpath
+import re
 from collections import Counter
 from collections.abc import Callable, Hashable, Iterable, Sequence
 from dataclasses import dataclass, replace
@@ -219,16 +222,36 @@ def target(command: str) -> Target | None:
     return Target(program, tuple(subcommand), tuple(operands), {k: tuple(v) for k, v in selectors.items()})
 
 
-def same_target(failed: str, passing: str) -> bool:
-    """Whether two shell commands act on the same target, so only options that do not select it differ."""
+_MISSING_PATH = re.compile(
+    r"\b(?:no such file or directory|cannot access)\b"
+    r"|(?:<path>|\b[\w.-]+\.\w+\b).*?\b(?:does not exist|not found)\b"
+    r"|\b(?:does not exist|not found)\b.*?(?:<path>|\b[\w.-]+\.\w+\b)",
+    re.I,
+)
+
+
+def _literal_path(value: str) -> bool:
+    return not any(c in value for c in "*?[]$`~{}") and (
+        "/" in value or re.search(r"\.\w+$", value) is not None
+    )
+
+
+def same_target(failed: str, passing: str, error: ErrorSignature | None = None) -> bool:
+    """Whether commands share a target, allowing one literal path correction after a missing-path error."""
     a, b = target(failed), target(passing)
     if a is None or b is None or (a.program, a.subcommand) != (b.program, b.subcommand):
         return False
     if any(a.selectors[name] != b.selectors[name] for name in a.selectors.keys() & b.selectors.keys()):
         return False
     if (a.program, *a.subcommand) in UNORDERED:
-        return Counter(a.operands) == Counter(b.operands)
-    return a.operands == b.operands
+        if Counter(a.operands) == Counter(b.operands):
+            return True
+    elif a.operands == b.operands:
+        return True
+    if error is None or not _MISSING_PATH.search(error) or len(a.operands) != len(b.operands):
+        return False
+    changed = [(x, y) for x, y in zip(a.operands, b.operands, strict=True) if x != y]
+    return len(changed) == 1 and all(_literal_path(value) for value in changed[0])
 
 
 def input_object(text: str) -> dict[str, object] | None:
@@ -340,7 +363,7 @@ def _fixes(failure: OpenFailure, call: Call, place: Place) -> bool | str:
     if not candidate:
         return False
     if call.tool_kind is ToolKind.SHELL:
-        return True if same_target(failure.input, call.input) else _OPERAND
+        return True if same_target(failure.input, call.input, failure.signature) else _OPERAND
     failed, passing = input_object(failure.input), input_object(call.input)
     too_many = (
         failed is not None
