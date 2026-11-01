@@ -269,6 +269,60 @@ def test_compound_stdout_does_not_deliver_an_error_lesson(env, monkeypatch):
     assert (decision.outcome, decision.shown) == (HitOutcome.NO_MATCH, [])
 
 
+def test_shell_error_cannot_deliver_a_promoted_tool_lesson(env, monkeypatch):
+    from scars import telemetry
+    from scars.model import HitOutcome
+
+    home, repo = env
+    db = seed_store(home, repo)
+    lesson_id = store.create_lesson(
+        db,
+        text=LessonText('Read with mode="bad"', 'mode="good"', MINED_WHY),
+        scope=RepoScope(REPO),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=(Trigger(TriggerKind.ERROR, "[tool Read] invalid mode", Stage.REPAIR),),
+        fingerprint="read-mode",
+        actor="miner",
+        at=T0,
+    )
+    db.execute(
+        "insert into observations (lesson_id, harness, session_id, failed_tool_use_id, failed_input, "
+        "error_signature, passing_input, at) values (?,?,?,?,?,?,?,?)",
+        (lesson_id, "claude", "old", "read-failed", '{"mode":"bad"}', "invalid mode", 'mode="good"', T0),
+    )
+    store.apply_event(
+        db,
+        lesson_id=lesson_id,
+        event=EventType.PROMOTED,
+        expected_revision=1,
+        actor="human",
+        payload={},
+        at=T0 + 60,
+    )
+    shell_id = add_lesson(db, fingerprint="shell", triggers=REPAIR)
+    db.close()
+    monkeypatch.setenv("SCARS_HOME", str(home))
+
+    payload = claude_failure(repo, error="[tool Read] invalid mode")
+    event = claude.parse("PostToolUseFailure", payload)
+    decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=T0)
+    assert (decision.outcome, decision.shown, decision.output) == (HitOutcome.NO_MATCH, [], None)
+
+    payload.update(tool_name="Read", tool_input={"mode": "bad"}, error="invalid mode")
+    event = claude.parse("PostToolUseFailure", payload)
+    decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=T0)
+    assert (decision.outcome, [s.lesson_id for s in decision.shown]) == (HitOutcome.SHOWN, [lesson_id])
+    assert decision.output["hookSpecificOutput"]["additionalContext"].splitlines()[1:4] == [
+        'AVOID: Read with mode="bad"',
+        'INSTEAD: mode="good"',
+        "WHY: AVOID failed, INSTEAD passed",
+    ]
+
+    event = claude.parse("PostToolUseFailure", claude_failure(repo))
+    decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=T0)
+    assert (decision.outcome, [s.lesson_id for s in decision.shown]) == (HitOutcome.SHOWN, [shell_id])
+
+
 def test_claude_repair_shows_the_lesson_records_it_and_dedupes_until_compaction(env):
     home, repo = env
     lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)

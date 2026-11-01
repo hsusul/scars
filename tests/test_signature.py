@@ -88,6 +88,22 @@ def test_output_carrying_a_scars_header_is_never_a_signature(output):
 
 
 @pytest.mark.parametrize(
+    "output",
+    [
+        "[tool Read] invalid mode",
+        "[tool Read] unsupported mode",
+        "Exit code 1\n  [tool Read] invalid mode",
+        "\x1b[31m[tool Read] invalid mode\x1b[0m",
+        "[tool\tRead] invalid mode",
+    ],
+)
+def test_raw_signature_cannot_use_the_tool_namespace(output):
+    assert signature(output) is None
+    assert signature("invalid mode") == "invalid mode"
+    assert tool_signature("Read", ErrorSignature("invalid mode")) == "[tool Read] invalid mode"
+
+
+@pytest.mark.parametrize(
     ("output", "expected"),
     [
         ("# Contributing...\ncat: x: No such file or directory", "cat: x: No such file or directory"),

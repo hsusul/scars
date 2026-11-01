@@ -36,6 +36,7 @@ from scars.model import (
     TriggerKind,
     TrustClass,
 )
+from scars.signature import TOOL_PREFIX
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -902,7 +903,7 @@ def active_for_stage(
 
     With `pinned_only`, only pinned lessons. With `trigger_kinds`, only lessons with a trigger of one of
     those kinds at `stage`; with `error_signature` too, an `error` trigger counts only when its spec is
-    exactly that signature or `tool_error_signature`, which is the only way an error trigger fires. Each
+    exactly that raw signature or `tool_error_signature`. A raw signature cannot use the tool prefix. Each
     lesson keeps all its triggers. With `trigger_kinds` None the stage selects without triggers, so no
     trigger is required.
     """
@@ -916,7 +917,10 @@ def active_for_stage(
         params += [stage.value, *kinds]
         if error_signature is not None:
             fires += " and (t.kind <> 'error' or t.spec in (?, ?))"
-            params += [error_signature, tool_error_signature or error_signature]
+            params += [
+                None if error_signature.startswith(TOOL_PREFIX) else error_signature,
+                tool_error_signature,
+            ]
         where += f" and exists (select 1 from triggers t where t.lesson_id = lessons.id and {fires})"
     return _load(db, where, params)
 
