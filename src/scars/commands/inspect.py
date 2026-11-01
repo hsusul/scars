@@ -62,7 +62,7 @@ def row(lesson: Lesson) -> str:
     pin = "pin" if lesson.pinned else "-"
     return (
         f"{shown(lesson.id):<11} {lesson.status:<11} {lesson.level:<4} {pin:<3} {lesson.sessions_seen:>4}  "
-        f"{shown(render.scope_label(lesson.scope))}  {avoid}"
+        f"{shown(render.scope_label(lesson.scope))}  trust {lesson.trust_class}  {avoid}"
     )
 
 
@@ -107,7 +107,7 @@ def cmd_ls(args: argparse.Namespace, ctx: Context) -> int:
         ctx.print("no lessons")
         return 0
     if lessons:
-        ctx.print(f"{'ID':<11} {'STATUS':<11} {'LEVEL':<4} PIN {'SEEN':>4}  SCOPE  AVOID")
+        ctx.print(f"{'ID':<11} {'STATUS':<11} {'LEVEL':<4} PIN {'SEEN':>4}  SCOPE  TRUST  AVOID")
     for lesson in lessons:
         ctx.print(row(lesson))
     shown_ids = {le.id for le in lessons}

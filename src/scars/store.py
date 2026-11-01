@@ -41,7 +41,8 @@ from scars.signature import RULES_VERSION, TOOL_PREFIX
 if TYPE_CHECKING:
     from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+"""2 allows the `model` trust class, which a version 1 lessons table rejects."""
 TELEMETRY_SCHEMA_VERSION = 2
 """2 allows the `ignored` hit outcome, which a version 1 hits table rejects."""
 EXPIRY_SECONDS = 14 * 86400
@@ -314,6 +315,8 @@ def next_state(state: State | None, event: EventType, payload: object, *, at: fl
                 new = replace(new, level=Level(payload.get("level")))
             except ValueError:
                 raise Rejected(f"invalid level {payload.get('level')!r}") from None
+            if state.trust_class is TrustClass.MODEL and new.level is not Level.NOTE:
+                raise Rejected("model lessons must keep level note")
         case EventType.EDITED:
             new = replace(new, pinned=False, level=Level.NOTE)
             if "text" in payload:
@@ -321,10 +324,11 @@ def next_state(state: State | None, event: EventType, payload: object, *, at: fl
             if "triggers" in payload:
                 new = replace(new, triggers=frozenset(_parse_triggers(payload["triggers"])))
             if "trust_class" in payload:
-                # A human rewrite makes the text the human's, and nothing else may change trust.
-                if payload["trust_class"] != TrustClass.HUMAN.value:
-                    raise Rejected(f"an edit can only set trust class human, not {payload['trust_class']!r}")
-                new = replace(new, trust_class=TrustClass.HUMAN)
+                if payload["trust_class"] not in (TrustClass.HUMAN.value, TrustClass.MODEL.value):
+                    raise Rejected(
+                        f"an edit can only set trust class human or model, not {payload['trust_class']!r}"
+                    )
+                new = replace(new, trust_class=TrustClass(payload["trust_class"]))
             if "scope" in payload:
                 scope = _parse_scope(payload["scope"])
                 if scope.kind == "machine" and state.scope.kind != "machine":
@@ -717,7 +721,7 @@ def apply_event(
 
     Payload keys by event: `observed` takes an optional `fix_program`, `promoted` an optional `scope`
     (required when the lesson is session-scoped), `level_set` needs `level`, `edited` takes optional
-    `text`, `triggers`, `scope` (never machine scope) and `trust_class` (only `human`), and `superseded`
+    `text`, `triggers`, `scope` (never machine scope) and `trust_class` (`human` or `model`), and `superseded`
     needs `superseded_by`.
     """
     if event is EventType.PROPOSED:
@@ -992,11 +996,46 @@ def promoted_at(db: sqlite3.Connection, lesson_ids: Iterable[LessonId]) -> dict[
 
 
 def ensure_miner_schema(db: sqlite3.Connection) -> None:
-    """Create the miner's later tables (`mined_calls`, `miner_file_context`) in a store made before they
-    existed. Idempotent."""
+    """Bring lessons.db up to `SCHEMA_VERSION` and create the miner's later tables (`mined_calls`,
+    `miner_file_context`) in a store made before they existed. Idempotent. Only the CLI calls this; the
+    hook never upgrades."""
+    if 0 < db.execute("pragma user_version").fetchone()[0] < SCHEMA_VERSION:
+        _rebuild_lessons(db)
     for statement in _statements(schema_sql("lessons")):
         if "if not exists" in statement:
             db.execute(statement)
+
+
+def _rebuild_lessons(db: sqlite3.Connection) -> None:
+    """Recreate `lessons` from the current DDL, keeping every row: SQLite cannot alter a CHECK.
+
+    Other tables reference `lessons`, so the new table is built beside it and renamed into place with
+    foreign keys off. Renaming the old table away instead would repoint those references at it.
+    """
+    db.execute("pragma foreign_keys = off")
+    db.execute("begin immediate")
+    try:
+        found = db.execute("pragma user_version").fetchone()[0]
+        if 0 < found < SCHEMA_VERSION:
+            ddl = _statements(schema_sql("lessons"))
+            table = next(s for s in ddl if "create table lessons " in s)
+            db.execute(table.replace("create table lessons ", "create table lessons_new ", 1))
+            columns = ", ".join(row[1] for row in db.execute("pragma table_info(lessons)"))
+            db.execute(f"insert into lessons_new ({columns}) select {columns} from lessons")
+            db.execute("drop table lessons")
+            db.execute("alter table lessons_new rename to lessons")
+            for statement in ddl:
+                if " on lessons(" in statement:
+                    db.execute(statement)
+            if db.execute("pragma foreign_key_check").fetchone() is not None:
+                raise sqlite3.IntegrityError("the lessons rebuild left a broken foreign key")
+            db.execute(f"pragma user_version = {SCHEMA_VERSION}")
+        db.execute("commit")
+    except BaseException:
+        _rollback(db)
+        raise
+    finally:
+        db.execute("pragma foreign_keys = on")
 
 
 def ensure_telemetry_schema(db: sqlite3.Connection) -> int:

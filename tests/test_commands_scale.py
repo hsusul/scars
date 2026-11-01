@@ -90,8 +90,8 @@ def test_ls_reads_last_seen_with_the_lesson_rows(home, user_home, monkeypatch):
     monkeypatch.setattr(store, "lessons_last_seen", lambda db: calls.append(1) or whole_table(db))
     assert run(make_ctx(user_home), "ls", "--stale") == (
         0,
-        "ID          STATUS      LEVEL PIN SEEN  SCOPE  AVOID\n"
-        f"{stale:<11} provisional note -      1  repo app  pytest --frobnicate\n",
+        "ID          STATUS      LEVEL PIN SEEN  SCOPE  TRUST  AVOID\n"
+        f"{stale:<11} provisional note -      1  repo app  trust own_code  pytest --frobnicate\n",
         "",
     )
     assert calls == [1]
@@ -177,7 +177,7 @@ def test_ls_and_doctor_on_10000_lessons_and_100000_hits(home, user_home, monkeyp
         timings[" ".join(argv)] = time.perf_counter() - started
         if argv == ["ls"]:
             assert (code, out.count("\n")) == (0, LESSONS + 1)
-            assert out.startswith("ID          STATUS      LEVEL PIN SEEN  SCOPE  AVOID\n")
+            assert out.startswith("ID          STATUS      LEVEL PIN SEEN  SCOPE  TRUST  AVOID\n")
         elif argv == ["ls", "--stale"]:
             # Every lesson's hits fall on days that include one inside the 30-day window.
             assert (code, out) == (0, "no lessons\n")

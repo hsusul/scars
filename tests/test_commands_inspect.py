@@ -1,4 +1,4 @@
-from cli_helpers import DAY, NOW, SIG, connect, human, make_ctx, run, seed
+from cli_helpers import DAY, NOW, SIG, connect, human, make_ctx, model_edit, run, seed
 from scars import render, store, telemetry
 from scars.model import EventType, HitOutcome
 
@@ -42,15 +42,34 @@ def test_ls_lists_active_lessons(home, user_home):
     human(home, a, EventType.PINNED)
     lines = sorted(
         [
-            f"{a:<11} promoted    note pin    1  repo app  pytest --frobnicate",
-            f"{b:<11} candidate   note -      1  repo app  npm tset",
+            f"{a:<11} promoted    note pin    1  repo app  trust own_code  pytest --frobnicate",
+            f"{b:<11} candidate   note -      1  repo app  trust own_code  npm tset",
         ]
     )
     assert run(make_ctx(user_home), "ls") == (
         0,
-        "ID          STATUS      LEVEL PIN SEEN  SCOPE  AVOID\n" + "\n".join(lines) + "\n",
+        "ID          STATUS      LEVEL PIN SEEN  SCOPE  TRUST  AVOID\n" + "\n".join(lines) + "\n",
         "",
     )
+
+
+def test_ls_and_why_show_model_trust(home, user_home):
+    lesson_id = seed(home)
+    model_edit(home, lesson_id)
+    human(home, lesson_id, EventType.PROMOTED)
+    code, out, err = run(make_ctx(user_home), "ls")
+    assert (code, out.splitlines()[1], err) == (
+        0,
+        f"{lesson_id:<11} promoted    note -      1  repo app  trust model  building in the wrong directory",
+        "",
+    )
+    code, out, err = run(make_ctx(user_home), "why", lesson_id)
+    assert (code, out.splitlines()[0], err) == (
+        0,
+        f"{lesson_id}  promoted  level note  not pinned  repo app  trust model  seen in 1 session",
+        "",
+    )
+    assert "edited by autolearn (revision 2 -> 3)" in out
 
 
 def test_ls_names_each_lesson_that_cannot_render_and_the_rule_it_breaks(home, user_home):
@@ -124,7 +143,10 @@ def test_ls_and_why_mask_the_value_of_an_argument_named_as_a_secret(home, user_h
         home, avoid="pytest --frobnicate --token abc123", passing="pytest DB_PASSWORD=hunter2 tests"
     )
     listed = run(make_ctx(user_home), "ls")[1]
-    assert f"{lesson_id:<11} provisional note -      1  repo app  pytest --frobnicate --token ***\n" in listed
+    assert (
+        f"{lesson_id:<11} provisional note -      1  repo app  trust own_code  "
+        "pytest --frobnicate --token ***\n" in listed
+    )
     why = run(make_ctx(user_home), "why", lesson_id)[1]
     assert "  avoid:   pytest --frobnicate --token ***\n" in why
     assert "    failed: pytest --frobnicate --token *** tests\n" in why

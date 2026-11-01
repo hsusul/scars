@@ -7,10 +7,12 @@ from scars.model import EventType, HitOutcome, Status, TrustClass
 pytest_plugins = ("cli_fixtures",)
 
 
-def test_an_edit_may_set_trust_class_human_and_nothing_else(home):
+def test_an_edit_may_set_trust_class_human_or_model_and_nothing_else(home):
     lesson_id = seed(home, trust=TrustClass.THIRD_PARTY_REPO)
     db = connect(home)
-    with pytest.raises(store.Rejected, match="an edit can only set trust class human, not 'own_code'"):
+    with pytest.raises(
+        store.Rejected, match="an edit can only set trust class human or model, not 'own_code'"
+    ):
         store.apply_event(
             db,
             lesson_id=lesson_id,
