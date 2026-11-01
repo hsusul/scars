@@ -5,10 +5,10 @@ stands for the terminal. Exit codes: 0 on success, 1 on a user error (one line o
 `doctor` check, 2 for a command that is not built yet.
 
 `HOME`, `SCARS_HOME` and the arguments must be UTF-8; anything else is a user error before the command
-starts. A crash in a read command (`ls`, `why`, `test`, `doctor`) prints one line naming the exception
-type and exits 1: its traceback could quote stored text, so it goes to `<scars home>/logs/cli.log`, and
-only when `SCARS_DEBUG` is set. Output never fails on encoding: what the terminal cannot show is written
-as a backslash escape.
+starts. A crash in a read command (`ls`, `why`, `test`, `doctor`, `learn`) prints one line naming the
+exception type and exits 1: its traceback could quote stored text, so it goes to
+`<scars home>/logs/cli.log`, and only when `SCARS_DEBUG` is set. Output never fails on encoding: what the
+terminal cannot show is written as a backslash escape.
 """
 
 import argparse
@@ -78,6 +78,10 @@ def _bench(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cmd", help="hook command before `<harness> <event>` (default: scars-hook)")
 
 
+def _learn(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--dry-run", action="store_true", help="print each verdict and write nothing")
+
+
 def _import_guard(p: argparse.ArgumentParser) -> None:
     p.add_argument("path", nargs="?", help="guard script (default ~/.claude/hooks/guard-bash.sh)")
 
@@ -123,6 +127,13 @@ PHASE_1_COMMANDS = (
     Command("off", "turn every scars hook off on the next tool call", "lifecycle:cmd_off"),
     Command("on", "turn scars hooks back on", "lifecycle:cmd_on"),
     Command("mine", "read new transcript bytes and update lessons", "mining:cmd_mine", _mine),
+    Command(
+        "learn",
+        "ask claude to judge and rewrite candidates seen in 2 or more sessions",
+        "learn:cmd_learn",
+        _learn,
+        guarded=True,
+    ),
     Command(
         "import-guard",
         "turn an existing guard hook's deny reasons into pinned lessons",

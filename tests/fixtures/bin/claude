@@ -1,0 +1,36 @@
+#!/bin/sh
+# A stand-in for the claude CLI. SCARS_STUB_VERDICT picks the envelope it prints; SCARS_STUB_ARGS, when
+# set, names a file that receives the arguments, each followed by a NUL byte. `claude auth status`
+# reports logged out only for the error envelope, which is what a logged-out CLI prints.
+if [ "$1" = auth ] && [ "$2" = status ]; then
+  if [ "$SCARS_STUB_VERDICT" = error ]; then
+    printf '%s\n' '{"loggedIn": false, "authMethod": "none"}'
+    exit 1
+  fi
+  printf '%s\n' '{"loggedIn": true, "authMethod": "claude.ai"}'
+  exit 0
+fi
+if [ -n "$SCARS_STUB_ARGS" ]; then
+  printf '%s\0' "$@" > "$SCARS_STUB_ARGS"
+fi
+case "$SCARS_STUB_VERDICT" in
+  keep)
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"verdict":"keep","why":"stale simulator ids recur across sessions","avoid":"Passing a simulator device id copied from an earlier session","instead":"Omit the device argument so the tool picks the booted simulator","reason":"Simulator ids change between sessions, so an old one no longer exists"}}'
+    ;;
+  reject)
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":{"verdict":"reject","why":"The fix only read a different file","avoid":"","instead":"","reason":""}}'
+    ;;
+  malformed)
+    printf '%s\n' 'this is not json {'
+    ;;
+  error)
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","result":"","usage":{"input_tokens":0,"output_tokens":0}}'
+    ;;
+  sleep)
+    exec sleep 70
+    ;;
+  *)
+    echo "SCARS_STUB_VERDICT must be keep, reject, malformed, error or sleep" >&2
+    exit 64
+    ;;
+esac
