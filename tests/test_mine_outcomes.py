@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from scars.mine.outcomes import HitRow, LessonFacts, decide
@@ -130,5 +132,24 @@ def test_a_tool_lesson_counts_only_failures_of_its_own_tool():
     closed = [read(2), read(3), read(4), read(5), read(6)]
     assert decide(REPAIR, facts, [sim(0), sim(1), *closed], False) is DelayedOutcome.IGNORED_THEN_FAILED
     other = sim(1, tool="mcp__other__control")
-    assert decide(REPAIR, facts, [sim(0), other, *closed], False) is DelayedOutcome.UNKNOWN
+    assert decide(REPAIR, facts, [sim(0), other, *closed], True) is DelayedOutcome.UNKNOWN
     assert decide(REPAIR, facts, [sim(0), sim(1, status="ok"), *closed], False) is DelayedOutcome.HEEDED
+
+
+@pytest.mark.parametrize("ended", [False, True])
+def test_repair_tool_lesson_waits_for_a_retry_of_the_same_tool(ended):
+    facts = LessonFacts("[tool Read] E: broken", ())
+    failed_read = replace(read(0), status="failed", error_signature=SIG)
+    searches = [replace(read(i), tool="WebSearch", paths=()) for i in range(1, 6)]
+
+    expected = DelayedOutcome.UNKNOWN if ended else None
+    assert decide(REPAIR, facts, [failed_read, *searches], ended) is expected
+    assert (
+        decide(REPAIR, facts, [failed_read, searches[0], read(2), *searches[2:]], ended)
+        is DelayedOutcome.HEEDED
+    )
+    retry = replace(read(2), status="failed", error_signature=SIG)
+    assert (
+        decide(REPAIR, facts, [failed_read, searches[0], retry, *searches[2:]], ended)
+        is DelayedOutcome.IGNORED_THEN_FAILED
+    )

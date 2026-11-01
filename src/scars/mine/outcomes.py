@@ -11,8 +11,9 @@ against the worktree root of each call's working directory. Then the first rule 
    reference call, or, for a plan hit, the reference call itself. A structured tool lesson's signature is
    qualified by its tool, so only a failed call of that tool counts.
 2. `fired_unneeded`: a plan hit whose reference call succeeded.
-3. `heeded`: a repair hit whose next call of the same tool kind succeeded or no longer matches the
-   lesson's pre-trigger. A lesson without a pre-trigger is heeded only by a success.
+3. `heeded`: a repair hit whose next call of the same tool succeeded or no longer matches the
+   lesson's pre-trigger. Shell calls match by kind; other calls also match by tool name. A lesson
+   without a pre-trigger is heeded only by a success.
 4. `no_attempt`: a plan hit whose session ended with no call matching the pre-trigger.
 5. `unknown`: the session ended before any rule could be decided, or the window closed and no rule holds.
 
@@ -143,8 +144,16 @@ def decide(
             return DelayedOutcome.IGNORED_THEN_FAILED
         if len(calls) - index - 1 < WINDOW and not ended:
             return None
-        kind = calls[index].tool_kind
-        following = next((c for c in calls[index + 1 :] if c.tool_kind == kind), None)
+        reference = calls[index]
+        following = next(
+            (
+                c
+                for c in calls[index + 1 :]
+                if c.tool_kind == reference.tool_kind
+                and (reference.tool_kind == ToolKind.SHELL or c.tool == reference.tool)
+            ),
+            None,
+        )
         if following is None:
             return DelayedOutcome.UNKNOWN if ended else None
         if following.status == "ok" or (facts.pre_triggers and not _matches_pre(facts, following, root_of)):
