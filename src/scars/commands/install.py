@@ -61,7 +61,8 @@ from scars import hook, paths, store
 from scars.commands import Context, UserError, mining, shown
 from scars.commands import inbox as inbox_cmd
 from scars.mine import default_sources, known_dir
-from scars.model import RepoId, TriggerKind
+from scars.model import ErrorSignature, PathScope, RepoId, RepoScope, ToolKind, TriggerKind
+from scars.signature import tool_signature
 
 DAY = 86400.0
 DISCOVERY_DAYS = 30
@@ -561,14 +562,27 @@ def install(ctx: Context, scars_home: Path, files_: Plan, yes: bool) -> None:
 
 
 def fired_counts(
-    db: sqlite3.Connection, lesson_ids: list[tuple[str, str | None]], since: float
+    db: sqlite3.Connection, lesson_ids: list[tuple[str, str | None, RepoId | None]], since: float
 ) -> dict[str, int]:
     calls = store.mined_calls_since(db, since)
     failed: dict[str, int] = {}
+    tool_failed: dict[tuple[RepoId | None, str], int] = {}
+    repos: dict[str, RepoId | None] = {}
     for c in calls:
         if c.status == "failed" and c.error_signature:
             failed[c.error_signature] = failed.get(c.error_signature, 0) + 1
-    return {lid: failed.get(sig, 0) if sig else 0 for lid, sig in lesson_ids}
+            if c.tool_kind == ToolKind.OTHER:
+                if c.cwd not in repos:
+                    common = hook.git_common_dir(c.cwd)
+                    repos[c.cwd] = (
+                        store.repo_for_common_dir(db, (common, os.path.realpath(common))) if common else None
+                    )
+                key = (repos[c.cwd], tool_signature(c.tool, ErrorSignature(c.error_signature)))
+                tool_failed[key] = tool_failed.get(key, 0) + 1
+    return {
+        lid: failed.get(sig, 0) + tool_failed.get((repo, sig), 0) if sig else 0
+        for lid, sig, repo in lesson_ids
+    }
 
 
 def show_top(ctx: Context, scars_home: Path) -> None:
@@ -579,7 +593,11 @@ def show_top(ctx: Context, scars_home: Path) -> None:
             ctx.print("no lessons waiting yet; scars mine keeps looking")
             return
         sigs = [
-            (r.lesson.id, next((t.spec for t in r.lesson.triggers if t.kind is TriggerKind.ERROR), None))
+            (
+                r.lesson.id,
+                next((t.spec for t in r.lesson.triggers if t.kind is TriggerKind.ERROR), None),
+                r.lesson.scope.repo_id if isinstance(r.lesson.scope, RepoScope | PathScope) else None,
+            )
             for r in top
         ]
         fired = fired_counts(db, sigs, ctx.clock() - 30 * DAY)
