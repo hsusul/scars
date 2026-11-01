@@ -107,6 +107,40 @@ def test_repo_for_common_dir_takes_the_first_registered_clone(db):
     assert store.repo_for_common_dir(db, ["/nowhere/.git"]) is None
 
 
+def test_active_for_stage_keeps_raw_and_tool_error_signatures_apart(db):
+    tool = staged(
+        db,
+        "tool",
+        (Trigger(TriggerKind.ERROR, "[tool Read] invalid mode", Stage.REPAIR),),
+        [EventType.PROMOTED],
+    )
+    shell = staged(
+        db,
+        "shell",
+        (Trigger(TriggerKind.ERROR, "invalid mode", Stage.REPAIR),),
+        [EventType.PROMOTED],
+    )
+
+    def ids(raw, qualified=None):
+        return sorted(
+            lesson.id
+            for lesson in store.active_for_stage(
+                db,
+                REPO,
+                stage=Stage.REPAIR,
+                pinned_only=False,
+                trigger_kinds={TriggerKind.ERROR},
+                error_signature=raw,
+                tool_error_signature=qualified,
+            )
+        )
+
+    assert ids("[tool Read] invalid mode") == []
+    assert ids("invalid mode") == [shell]
+    assert ids("invalid mode", "[tool Read] invalid mode") == sorted([shell, tool])
+    assert ids("invalid mode", "[tool Write] invalid mode") == [shell]
+
+
 def test_repo_names_lists_display_names(db):
     assert store.repo_names(db) == ("demo", "other")
 

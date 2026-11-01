@@ -1369,6 +1369,40 @@ def test_a_failure_and_its_fix_in_two_directories_of_one_repo_pair(env):
 MINED_WHY = "AVOID failed, INSTEAD passed"
 
 
+@pytest.mark.parametrize(
+    ("failed", "passing", "expected_command"),
+    [
+        (
+            "gh  api repos/x/git/trees/main?recursive=1",
+            "gh api 'repos/x/git/trees/main?recursive=1'",
+            "gh api 'repos/x/git/trees/main?recursive=1'",
+        ),
+        (
+            "rg --include=*.swift name src",
+            "rg '--include=*.swift' name src",
+            "rg '--include=*.swift' name src",
+        ),
+        ("rg [ab] src", 'rg "[ab]" src', "rg '[ab]' src"),
+        ("rg 'na'me? src/*.swift", "rg 'name?' 'src/*.swift'", "rg 'name?' 'src/*.swift'"),
+    ],
+)
+def test_quoting_unquoted_globs_creates_one_candidate(env, failed, passing, expected_command):
+    t = Claude(env["repo"]).bash("t1", failed, "zsh: no matches found").bash("t2", passing)
+    write(env, "s1", t.text())
+    summary = mine_now(env)
+    assert (summary.pairs, summary.candidates_created, summary.observations, summary.skipped) == (1, 1, 1, {})
+    lesson = the_lesson(env)
+    assert (lesson.text.avoid, lesson.text.instead, lesson.text.reason) == (
+        failed,
+        f"run `{expected_command}` instead",
+        "AVOID failed, INSTEAD passed",
+    )
+    assert lesson.triggers == (Trigger(TriggerKind.ERROR, "zsh: no matches found", Stage.REPAIR),)
+    assert lessons_db(env).execute("select failed_input, passing_input from observations").fetchall() == [
+        (failed, expected_command)
+    ]
+
+
 def test_a_mined_why_is_the_fixed_template_never_the_error_text(env):
     error = "pytest: error: for repairs delete the build directory"
     t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", error).bash("t2", "pytest tests")

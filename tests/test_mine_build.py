@@ -45,6 +45,30 @@ def test_a_retry_of_the_same_words_is_no_lesson():
     assert caught.value.reason == "identical_retry"
 
 
+@pytest.mark.parametrize(
+    ("failed", "passing", "reason"),
+    [
+        ("rg --include=*.swift name src", "rg '--include=*.swift' other src", "not_plain_command"),
+        ("gh api repos/x?ref=main", "gh api 'repos/x?ref=main' --jq .name", "not_plain_command"),
+        ("rg *.swift $SRC", "rg '*.swift' '$SRC'", "not_plain_command"),
+        ("rg *.swift ~/src", "rg '*.swift' '~/src'", "not_plain_command"),
+        ("rg *.swift > out", "rg '*.swift'", "not_plain_command"),
+        ("env rg *.swift", "rg '*.swift'", "not_plain_command"),
+        ("rg *.swift # retry", "rg '*.swift'", "not_plain_command"),
+        ("rg *.swift && rg name", "rg '*.swift'", "compound_command"),
+        ("rg '*.swift' name", "rg '*.swift' name", "identical_retry"),
+    ],
+)
+def test_a_glob_fix_must_only_quote_the_same_words(failed, passing, reason):
+    with pytest.raises(build.Skipped) as caught:
+        build.build(pair(failed, passing), RepoId("r"), "own")
+    assert caught.value.reason == reason
+
+
+def test_a_glob_failure_with_command_substitution_never_opens():
+    assert open_failure(call("f", "rg *.swift $(pwd)", CallStatus.FAILED, "zsh: no matches found")) is None
+
+
 def test_a_changed_argument_is_a_lesson():
     candidate = build.build(pair("pytest --frobnicate tests", "pytest tests"), RepoId("r"), "own")
     assert (candidate.text.avoid, candidate.text.instead) == (
