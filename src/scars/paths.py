@@ -76,3 +76,16 @@ def off_value(value: str | None) -> bool:
 
 def is_off() -> bool:
     return off_value(os.environ.get("SCARS_OFF")) or os.path.exists(os.path.join(home_path(), "OFF"))
+
+
+BASELINE = "BASELINE"
+ARMS = "ARMS"
+
+
+def delivery_mode() -> str | None:
+    """`BASELINE` or `ARMS`, the first of those files the scars home holds, or None to deliver as usual."""
+    home = home_path()
+    for name in (BASELINE, ARMS):
+        if os.path.exists(os.path.join(home, name)):
+            return name
+    return None

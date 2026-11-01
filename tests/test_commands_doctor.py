@@ -51,6 +51,7 @@ def test_healthy_doctor(home, user_home, monkeypatch):
         f"ok    hook store: {home}\n"
         f"unknown  codex sandbox: no {user_home}/.codex/config.toml\n"
         "ok    kill switch: off\n"
+        "ok    delivery: lessons are shown\n"
         f"ok    store location: {home}\n"
         "ok    event chain: hash chain and replay match the lessons\n"
         "ok    lessons render: every active lesson renders\n"
@@ -133,12 +134,27 @@ def test_each_failing_check_makes_doctor_exit_1(home, user_home, monkeypatch):
         "codex: no hook runs in the last 24 hours; hooks not installed (run scars init)",
         "FAIL  hooks: no harness has scars hooks installed",
         "FAIL  kill switch: on: hooks do nothing (scars on)",
+        "ok    delivery: lessons are shown",
         f"FAIL  store location: {home}: it is on an external disk",
         f"FAIL  event chain: {lesson_id}: avoid is tampered in lessons but pytest --frobnicate from events",
         f"FAIL  lessons render: {lesson_id}: mined.program_mismatch in instead",
         "ok    signature rules: every error trigger follows the current rules",
         "FAIL  canary: no lesson",
     ]
+
+
+def test_doctor_names_the_log_only_baseline_and_the_arms(home, user_home, monkeypatch):
+    stub(monkeypatch)
+    seed(home)
+    (home / "ARMS").touch()
+    out = run(make_ctx(user_home), "doctor")[1]
+    assert (
+        "ok    delivery: arms (ARMS): each session is on or off by its id; off sessions record matches "
+        "and show nothing\n" in out
+    )
+    (home / "BASELINE").touch()
+    out = run(make_ctx(user_home), "doctor")[1]
+    assert "ok    delivery: log-only baseline (BASELINE): hooks record matches and show nothing\n" in out
 
 
 def test_missing_store(tmp_path, monkeypatch, user_home):

@@ -22,7 +22,10 @@ One run, in order:
    filtered in SQL by stage, pin and trigger kind (and by exact error signature for repair). Matching and
    rendering are imported only when some lesson is left. Matching runs under a 50 ms deadline; lessons
    are rendered with their own observed passing commands and fitted to the stage budget.
-6. The output is printed and flushed.
+6. The output is printed and flushed, unless the run is silent: `BASELINE` in the scars home makes every
+   run silent (arm `baseline`), and `ARMS` makes the runs of half the sessions silent (arm `off`, the
+   others `on`; see `session_arm`). A silent run computes the same decision and records a shown lesson
+   as `log_only`; only an agent deny still prints. Without either file the arm is `SCARS_ARM` or none.
 7. One telemetry transaction writes a hit row per shown lesson (or one `no_match` or `blocked` row), the
    new shown rows, a freshly resolved cache row and, on compaction, the new epoch, which moves even when
    lessons.db is unavailable. An event the adapter ignores gets one `ignored` row and reads no lessons.
@@ -71,6 +74,8 @@ STDIN_LIMIT_BYTES = 1 << 20
 STDIN_DEADLINE_MS = 500
 
 ADAPTERS: dict[Harness, ModuleType] = {Harness.CLAUDE: claude, Harness.CODEX: codex}
+ARMS_KEY = b"scars session arms"
+SILENT_ARMS = frozenset({"baseline", "off"})
 AGENT_DENIED_SUBCOMMANDS = PRIVILEGED_COMMANDS | {"inbox"}
 AGENT_DENY_KEY = "agent_deny"
 
@@ -683,6 +688,30 @@ def _decide_with(
     return decision
 
 
+# ---------------------------------------------------------------- arms
+
+
+def session_arm(session_id: str) -> str:
+    """`on` or `off`, each for half the sessions, the same for every run of one session.
+
+    It is a keyed hash of the whole id, so ids of any shape (sequential, UUIDs, a shared prefix) split
+    evenly and no part of an id's format decides its arm.
+    """
+    from hashlib import blake2b
+
+    digest = blake2b(session_id.encode("utf-8", "surrogatepass"), key=ARMS_KEY, digest_size=1).digest()
+    return "on" if digest[0] & 1 else "off"
+
+
+def run_arm(session_id: str) -> str | None:
+    match paths.delivery_mode():
+        case paths.BASELINE:
+            return "baseline"
+        case paths.ARMS:
+            return session_arm(session_id)
+    return os.environ.get("SCARS_ARM") or None
+
+
 # ---------------------------------------------------------------- telemetry rows
 
 
@@ -697,6 +726,7 @@ def _hit(
     trigger_key: str | None = None,
     error_class: str | None = None,
     session_id: str = "",
+    arm: str | None = None,
 ) -> telemetry.Hit:
     return telemetry.Hit(
         at=now,
@@ -715,12 +745,12 @@ def _hit(
         injected_chars=shown.chars if shown else 0,
         latency_ms=latency_ms,
         error_class=error_class,
-        arm=os.environ.get("SCARS_ARM") or None,
+        arm=arm,
     )
 
 
 def _hits(
-    event: HookEvent, decision: Decision, *, now: float, latency_ms: float
+    event: HookEvent, decision: Decision, *, now: float, latency_ms: float, arm: str | None
 ) -> tuple[telemetry.Hit, ...]:
     def hit(shown: Shown | None) -> telemetry.Hit:
         return _hit(
@@ -732,6 +762,7 @@ def _hits(
             shown=shown,
             trigger_key=decision.trigger_key,
             error_class=decision.error_class,
+            arm=arm,
         )
 
     return tuple(hit(s) for s in decision.shown) if decision.shown else (hit(None),)
@@ -819,13 +850,15 @@ def run(
         except Ignored:
             tele = telemetry.connect(_telemetry_path())
             session = payload.get("session_id")
+            session = session if isinstance(session, str) else ""
             hit = _hit(
                 harness,
                 None,
                 HitOutcome.IGNORED,
                 now=time.time(),
                 latency_ms=elapsed_ms(),
-                session_id=session if isinstance(session, str) else "",
+                session_id=session,
+                arm=run_arm(session),
             )
             telemetry.write(tele, telemetry.Writes((hit,)))
             return
@@ -839,6 +872,7 @@ def run(
                 now=time.time(),
                 latency_ms=elapsed_ms(),
                 error_class=error_class,
+                arm=run_arm(""),
             )
             telemetry.write(tele, telemetry.Writes((hit,)))
             raise
@@ -851,25 +885,36 @@ def run(
         )
         now = time.time()
         command = full_command(payload) if event.tool_kind is ToolKind.SHELL else None
+        arm = run_arm(event.session_id)
         try:
             decision = decide(event, event_name, state, now=now, command=command)
         except Exception as exc:
             error_class = "lessons_unavailable" if isinstance(exc, LessonsUnavailable) else type(exc).__name__
             hit = _hit(
-                harness, event, HitOutcome.ERROR, now=now, latency_ms=elapsed_ms(), error_class=error_class
+                harness,
+                event,
+                HitOutcome.ERROR,
+                now=now,
+                latency_ms=elapsed_ms(),
+                error_class=error_class,
+                arm=arm,
             )
             writes = telemetry.Writes(
                 (hit,), session_id=event.session_id, epoch=state.epoch, bump_epoch=compaction
             )
             telemetry.write(tele, writes)
             raise
+        if arm in SILENT_ARMS and decision.outcome is not HitOutcome.BLOCKED:
+            decision.output = None
+            if decision.outcome is HitOutcome.SHOWN:
+                decision.outcome = HitOutcome.LOG_ONLY
         if decision.output is not None:
             _print(stdout, json.dumps(decision.output))
         dedupe = decision.outcome is HitOutcome.SHOWN
         telemetry.write(
             tele,
             telemetry.Writes(
-                hits=_hits(event, decision, now=now, latency_ms=elapsed_ms()),
+                hits=_hits(event, decision, now=now, latency_ms=elapsed_ms(), arm=arm),
                 shown=tuple((s.lesson_id, s.trigger_key) for s in decision.shown) if dedupe else (),
                 session_id=event.session_id,
                 epoch=state.epoch,

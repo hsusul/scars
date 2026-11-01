@@ -366,6 +366,15 @@ def _canary_payload(session: str, cwd: str) -> str:
     )
 
 
+DELIVERY = {
+    None: "lessons are shown",
+    paths.BASELINE: "log-only baseline (BASELINE): hooks record matches and show nothing",
+    paths.ARMS: (
+        "arms (ARMS): each session is on or off by its id; off sessions record matches and show nothing"
+    ),
+}
+
+
 def run_canary(budget_ms: float = CANARY_BUDGET_MS) -> Check:
     """Run the hook in this process against a temporary home with one canary lesson."""
     saved = {k: os.environ.get(k) for k in ("SCARS_HOME", "SCARS_OFF", "SCARS_ARM")}
@@ -497,6 +506,7 @@ def doctor(
     out.extend(c for c in (claude_sandbox(ctx, scars_home), codex_sandbox(ctx, scars_home)) if c is not None)
     off = paths.is_off() or paths.off_value(ctx.env.get("SCARS_OFF"))
     out.append(Check("kill switch", not off, "on: hooks do nothing (scars on)" if off else "off"))
+    out.append(Check("delivery", True, DELIVERY[paths.delivery_mode()]))
     out.extend(_store_checks(ctx, scars_home, location))
     out.append(canary())
     return out

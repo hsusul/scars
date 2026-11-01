@@ -58,7 +58,7 @@ class Hit:
     latency_ms: float | None
     error_class: str | None
     arm: str | None
-    """The eval arm from `SCARS_ARM`, or None outside an eval."""
+    """`baseline`, `on` or `off` from the mode file in the scars home, else `SCARS_ARM`, else None."""
 
 
 @dataclass(frozen=True)
