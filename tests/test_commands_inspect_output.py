@@ -84,8 +84,8 @@ def test_ls_and_test_hide_values_that_fail_the_text_rules(home, user_home):
     code, out, err = run(make_ctx(user_home), "ls")
     assert (code, out, err) == (
         0,
-        "ID          STATUS      LEVEL PIN SEEN  SCOPE  AVOID\n"
-        f"{lesson_id:<11} candidate   note -      1  repo app  [hidden: sanitizer.non_ascii]\n"
+        "ID          STATUS      LEVEL PIN SEEN  SCOPE  TRUST  AVOID\n"
+        f"{lesson_id:<11} candidate   note -      1  repo app  trust human  [hidden: sanitizer.non_ascii]\n"
         f"cannot render: lesson {lesson_id} breaks sanitizer.non_ascii in avoid\n",
         "",
     )
@@ -112,7 +112,9 @@ def test_ls_and_why_work_on_a_store_they_cannot_write(read_only_home, user_home)
     scars_home, lesson_id = read_only_home
     code, out, err = run(make_ctx(user_home), "ls")
     assert (code, err) == (0, "")
-    assert f"{lesson_id:<11} provisional note -      1  repo app  pytest --frobnicate\n" in out
+    assert (
+        f"{lesson_id:<11} provisional note -      1  repo app  trust own_code  pytest --frobnicate\n" in out
+    )
     code, out, err = run(make_ctx(user_home), "why", lesson_id)
     assert (code, err) == (0, "")
     assert out.startswith(f"{lesson_id}  provisional  level note")

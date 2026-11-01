@@ -165,6 +165,31 @@ def human(
     db.close()
 
 
+MODEL_TEXT = LessonText(
+    "building in the wrong directory",
+    "check the workspace root",
+    "relative paths depend on the working directory",
+)
+
+
+def model_edit(home: Path, lesson_id: LessonId) -> None:
+    """Rewrite a lesson as the autolearn policy will: model prose, trust class `model`."""
+    db = connect(home)
+    lesson = store.get_lesson(db, lesson_id)
+    assert lesson is not None
+    text = {"avoid": MODEL_TEXT.avoid, "instead": MODEL_TEXT.instead, "reason": MODEL_TEXT.reason}
+    store.apply_event(
+        db,
+        lesson_id=lesson_id,
+        event=EventType.EDITED,
+        expected_revision=lesson.revision,
+        actor="autolearn",
+        payload={"trust_class": "model", "text": text},
+        at=NOW - 7200,
+    )
+    db.close()
+
+
 def iso(t: float) -> str:
     from datetime import UTC, datetime
 

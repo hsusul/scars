@@ -34,6 +34,7 @@ class TrustClass(StrEnum):
     THIRD_PARTY_REPO = "third_party_repo"
     WEB = "web"
     HUMAN = "human"
+    MODEL = "model"
 
 
 class Stage(StrEnum):
