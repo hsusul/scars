@@ -1,6 +1,8 @@
 import pytest
 
-from scars.signature import signature
+from scars.match import ErrorPattern, parse_spec
+from scars.model import ErrorSignature, TriggerKind
+from scars.signature import signature, tool_signature
 
 
 @pytest.mark.parametrize(
@@ -26,6 +28,40 @@ from scars.signature import signature
 )
 def test_signature_normalizes_variable_parts(output, expected):
     assert signature(output) == expected
+
+
+def test_signature_strips_whitespace_at_the_cut_for_an_error_trigger():
+    output = (
+        "Error: the requested operation could not complete because required dependency "
+        "is unavailable in the current environment before retry"
+    )
+    expected = (
+        "Error: the requested operation could not complete because required dependency "
+        "is unavailable in the current environment"
+    )
+
+    sig = signature(output)
+
+    assert sig == expected
+    assert parse_spec(TriggerKind.ERROR, sig) == ErrorPattern(ErrorSignature(expected))
+
+
+def test_tool_signature_at_the_cut_is_accepted_as_an_error_trigger():
+    output = (
+        "Error: the requested operation could not complete because required dependency "
+        "is unavailable in the current environment before retry"
+    )
+    expected = (
+        "[tool X] Error: the requested operation could not complete because required dependency "
+        "is unavailable in the current environment"
+    )
+    sig = signature(output)
+    assert sig is not None
+
+    qualified = tool_signature("X", sig)
+
+    assert qualified == expected
+    assert parse_spec(TriggerKind.ERROR, qualified) == ErrorPattern(ErrorSignature(expected))
 
 
 @pytest.mark.parametrize(
