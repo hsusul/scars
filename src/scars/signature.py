@@ -6,6 +6,7 @@ from scars.model import ErrorSignature
 
 HEADER_PREFIX = "[scars "
 """How every rendered lesson starts. Text holding it, in any case, is never mined."""
+TOOL_PREFIX = "[tool "
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _NOISE = [
@@ -41,6 +42,7 @@ def signature(text: str, *, command: str | None = None) -> ErrorSignature | None
     """Normalize tool error output to a signature, or None when no lesson could address it.
 
     Output that quotes a rendered lesson is None, so a lesson cannot seed another from its own text.
+    A raw signature cannot start with the reserved tool prefix.
     Prefer error-shaped lines to stdout. A compound or unsupported shell command needs such a line;
     a single command or non-shell tool keeps the first usable line as its fallback.
     """
@@ -58,6 +60,8 @@ def signature(text: str, *, command: str | None = None) -> ErrorSignature | None
         if _SKIP_LINE.match(normalized) or not re.search(r"[A-Za-z]{3,}", normalized):
             continue
         result = normalized[:_MAX].strip()
+        if result.startswith(TOOL_PREFIX):
+            return None
         if _ERROR_LINE.search(line):
             return None if _UNLESSONABLE.search(result) else ErrorSignature(result)
         if fallback is None:
@@ -72,9 +76,6 @@ def signature(text: str, *, command: str | None = None) -> ErrorSignature | None
         if len(commands) > 1 or any(c.cwd is not None or not c.cwd_known for c in commands):
             return None
     return None if fallback is None or _UNLESSONABLE.search(fallback) else ErrorSignature(fallback)
-
-
-TOOL_PREFIX = "[tool "
 
 
 def tool_signature(tool: str, sig: ErrorSignature) -> ErrorSignature:

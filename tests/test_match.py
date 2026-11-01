@@ -1,4 +1,5 @@
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -343,6 +344,35 @@ def test_error_trigger_compares_the_precomputed_signature():
     assert matches(trigger, failed, MatchContext(error_signature=ErrorSignature("KeyError: 'name'"))) is True
     assert matches(trigger, failed, MatchContext(error_signature=ErrorSignature("KeyError: 'nam'"))) is False
     assert matches(trigger, failed, MatchContext()) is False
+
+
+def test_tool_error_trigger_rejects_a_raw_signature():
+    trigger = Trigger(TriggerKind.ERROR, "[tool Read] invalid mode", Stage.REPAIR)
+    failed = event(HookEventKind.TOOL_FAILED, command="npm test")
+    ctx = MatchContext(error_signature=ErrorSignature("[tool Read] invalid mode"))
+    assert matches(trigger, failed, ctx) is False
+
+    read = replace(failed, tool_kind=ToolKind.OTHER, tool_name="Read", command=None)
+    ctx = MatchContext(
+        error_signature=ErrorSignature("invalid mode"),
+        tool_error_signature=ErrorSignature("[tool Read] invalid mode"),
+    )
+    assert matches(trigger, read, ctx) is True
+    assert matches(Trigger(TriggerKind.ERROR, "invalid mode", Stage.REPAIR), failed, ctx) is True
+
+
+@pytest.mark.parametrize(
+    ("tool_kind", "tool_name"),
+    [(ToolKind.SHELL, "Bash"), (ToolKind.OTHER, "Write"), (ToolKind.OTHER, None)],
+)
+def test_tool_error_trigger_requires_the_event_tool_name(tool_kind, tool_name):
+    trigger = Trigger(TriggerKind.ERROR, "[tool Read] invalid mode", Stage.REPAIR)
+    failed = replace(event(HookEventKind.TOOL_FAILED), tool_kind=tool_kind, tool_name=tool_name)
+    ctx = MatchContext(
+        error_signature=ErrorSignature("invalid mode"),
+        tool_error_signature=ErrorSignature("[tool Read] invalid mode"),
+    )
+    assert matches(trigger, failed, ctx) is False
 
 
 @pytest.mark.parametrize(
