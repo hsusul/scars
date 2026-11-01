@@ -302,6 +302,82 @@ def test_a_changed_pattern_without_file_operands_still_pairs():
     assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 0)
 
 
+@pytest.mark.parametrize(
+    ("failed_command", "fix"),
+    [
+        ("git --no-pager log -n 5", "git log -n 3"),
+        ("git -P log", "git log"),
+        ("git --paginate status", "git status"),
+        ("git --no-optional-locks status", "git status"),
+        ("git --bare log -n 1", "git log -n 2"),
+        ("git --literal-pathspecs log a", "git log a"),
+        ("uv run pytest tests/a.py -k x", "uv run pytest tests/a.py -k y"),
+        ("python -m pytest -k a", "python -m pytest -k b"),
+        ("python3 -m pytest -k a", "python3 -m pytest -k b"),
+        ("uv --directory app run pytest tests/a.py -k x", "uv --directory app run pytest tests/a.py -k y"),
+        ("uv --directory app run python -m pytest -k a", "uv --directory app run python -m pytest -k b"),
+        (
+            "uv --directory app run --with pytest-x pytest -k a",
+            "uv --directory app run --with pytest-x pytest -k b",
+        ),
+        ("poetry run pytest tests/a.py -k a", "poetry run pytest tests/a.py -k b"),
+        ("poetry run python3 -m pytest -k a", "poetry run python3 -m pytest -k b"),
+        ("pnpm -C app exec pytest -k a", "pnpm -C app exec pytest -k b"),
+    ],
+)
+def test_a_global_flag_or_a_runner_pairs_on_the_inner_target(failed_command, fix):
+    result = pair_session(
+        (),
+        [failed("f", START, command=failed_command), call("fix", START + 1, command=fix)],
+        START + 2,
+    )
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 0)
+
+
+@pytest.mark.parametrize(
+    ("failed_command", "other", "fix"),
+    [
+        ("git --no-pager log a", "git log b", "git log a"),
+        ("git -P log a", "git -P show a", "git log a"),
+        ("uv run pytest tests/a.py", "uv run pytest tests/b.py", "uv run pytest tests/a.py -k x"),
+        ("uv --directory a run pytest", "uv --directory b run pytest", "uv --directory a run pytest -k x"),
+        ("uv --directory a run pytest", "uv --directory a run ruff", "uv --directory a run pytest -k x"),
+        ("poetry run pytest tests/a.py", "poetry run pytest tests/b.py", "poetry run pytest tests/a.py -k x"),
+        ("poetry -C a run pytest", "poetry -C b run pytest", "poetry -C a run pytest -k x"),
+        ("pnpm -C a exec vitest", "pnpm -C b exec vitest", "pnpm --dir a exec vitest"),
+        ("pnpm exec vitest a.test.ts", "pnpm exec vitest b.test.ts", "pnpm exec vitest a.test.ts"),
+    ],
+)
+def test_a_global_flag_or_a_runner_skips_another_target_and_waits_for_the_fix(failed_command, other, fix):
+    result = pair_session(
+        (),
+        [
+            failed("f", START, command=failed_command),
+            call("other", START + 1, command=other),
+            call("fix", START + 2, command=fix),
+        ],
+        START + 3,
+    )
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 1)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("git --no-pager log -n 5", ("git", ("log",), (), {})),
+        ("git --paginate -C app status", ("git", ("status",), (), {"-C": ("app",)})),
+        ("uv --directory app run pytest tests/a.py -k x", ("pytest", (), ("tests/a.py",), {})),
+        ("pnpm -C app exec vitest run a.test.ts", ("vitest", (), ("run", "a.test.ts"), {})),
+        ("poetry run python -m pytest tests/a.py", ("pytest", (), ("tests/a.py",), {})),
+        ("poetry run python -c pass", ("python", (), ("pass",), {})),
+        ("uv sync --frozen", ("uv", ("sync",), (), {})),
+    ],
+)
+def test_the_target_skips_global_flags_and_comes_from_the_program_a_runner_runs(command, expected):
+    found = target(command)
+    assert (found.program, found.subcommand, found.operands, found.selectors) == expected
+
+
 def test_a_failure_one_second_short_of_a_day_still_pairs():
     late = call("p", START + IDLE_SECONDS - 1)
     result = pair_session(

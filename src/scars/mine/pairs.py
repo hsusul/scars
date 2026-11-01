@@ -13,7 +13,13 @@ After a missing-path error, exactly one operand may instead change to another li
 operands must contain a slash or a file extension, with no glob or expansion characters.
 The subcommand is the first words that are neither
 options nor option values, as many as `SUBCOMMAND_DEPTH` gives for the program (or for the program and its
-first such word), compared in order. Make targets and `xcodebuild` actions are operands.
+first such word), compared in order. Make targets and `xcodebuild` actions are operands. The valueless
+global flags in `GLOBAL_FLAGS` (`git --no-pager`) are skipped before the subcommand.
+
+When the program is a runner in `RUNNERS` (`poetry run`, `pnpm exec`, `uv --directory a run`, and
+`python -m` inside one), the target is read from the program it runs, since the option tables are keyed by
+that program. The runner's own subcommand and selectors (`uv --directory`, `pnpm -C`) must still match.
+The shell parser already removes a bare `uv run`, `npx` and `python -m`.
 
 Options are classified from two small per-program tables. `TARGET_OPTIONS` lists options whose value names
 the target (`git -C`, `gh -R`, `kubectl -n`, `npm --prefix`); when both calls give one, the values must be
@@ -95,6 +101,12 @@ TARGET_OPTIONS: dict[str, dict[str, str]] = {
     "xcodebuild": {"-project": "-project", "-workspace": "-workspace", "-scheme": "-scheme"},
     "make": {"-C": "--directory", "--directory": "--directory", "-f": "--file", "--file": "--file"},
     "cargo": {"--manifest-path": "--manifest-path", "-p": "--package", "--package": "--package"},
+    "poetry": {
+        "-C": "--directory",
+        "--directory": "--directory",
+        "-P": "--project",
+        "--project": "--project",
+    },
     "kubectl": {
         "-n": "--namespace",
         "--namespace": "--namespace",
@@ -106,6 +118,14 @@ TARGET_OPTIONS: dict[str, dict[str, str]] = {
     "docker": {"-H": "--host", "--host": "--host", "-c": "--context", "--context": "--context"},
 }
 """Per program, the spellings of options whose value selects the target, mapped to one name per option."""
+
+GLOBAL_FLAGS: dict[str, frozenset[str]] = {
+    "git": frozenset(
+        {"--no-pager", "-P", "--paginate", "--no-optional-locks", "--bare", "--literal-pathspecs"}
+    ),
+}
+"""Per program, global options that take no value, so the word after one before the subcommand is the
+subcommand."""
 
 VALUE_OPTIONS: dict[str, frozenset[str]] = {
     "git": frozenset(
@@ -149,6 +169,35 @@ PATTERNLESS_OPTIONS: dict[str, frozenset[str]] = {"rg": frozenset({"--files", "-
 
 
 @dataclass(frozen=True)
+class Runner:
+    """How a program names the program it runs."""
+
+    subcommand: tuple[str, ...] = ()
+    """Words before the program run, as `poetry run`; the next word that is not an option is that program."""
+    module_option: str | None = None
+    """An option whose value is the program run instead, as `python -m`."""
+    value_options: frozenset[str] = frozenset()
+    """The runner's own options, outside `TARGET_OPTIONS`, that take the next word as a value."""
+
+
+_PYTHON = Runner(module_option="-m", value_options=frozenset({"-c", "-W", "-X"}))
+RUNNERS: dict[str, Runner] = {
+    "uv": Runner(
+        ("run",),
+        value_options=frozenset(
+            {"--with", "--with-editable", "--with-requirements", "-p", "--python", "--package", "--env-file"}
+        ),
+    ),
+    "poetry": Runner(("run",)),
+    "pnpm": Runner(("exec",)),
+    "npx": Runner(value_options=frozenset({"-p", "--package"})),
+    "python": _PYTHON,
+    "python3": _PYTHON,
+}
+"""Programs that run another program whose target is the one compared."""
+
+
+@dataclass(frozen=True)
 class Target:
     """What a shell command acts on: its program, subcommand, positional operands and selecting options."""
 
@@ -158,6 +207,8 @@ class Target:
     """In order, including the word right after an option that is in neither option table."""
     selectors: dict[str, tuple[str, ...]]
     """The values of the options in `TARGET_OPTIONS`, by option name."""
+    runners: tuple["Target", ...] = ()
+    """The runners around the program, outermost first, each with its subcommand and selectors."""
 
 
 def _is_option(arg: str) -> bool:
@@ -173,17 +224,58 @@ def target(command: str) -> Target | None:
     if not commands:
         return None
     simple = commands[0]
-    program = posixpath.basename(simple.program)
+    return _target(posixpath.basename(simple.program), simple.args)
+
+
+def _target(program: str, args: Sequence[str]) -> Target:
+    split = _run(program, args)
+    if split is None:
+        return _frame(program, args)
+    prefix, inner, rest = split
+    runner = Target(program, RUNNERS[program].subcommand, (), _frame(program, prefix).selectors)
+    found = _target(posixpath.basename(inner), rest)
+    return replace(found, runners=(runner, *found.runners))
+
+
+def _run(program: str, args: Sequence[str]) -> tuple[Sequence[str], str, Sequence[str]] | None:
+    """The runner's own words, the program it runs and that program's words, or None when the command
+    runs no other program."""
+    runner = RUNNERS.get(program)
+    if runner is None:
+        return None
+    valued = runner.value_options | TARGET_OPTIONS.get(program, {}).keys()
+    expected = list(runner.subcommand)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == runner.module_option:
+            return (args[:i], args[i + 1], args[i + 2 :]) if i + 1 < len(args) else None
+        if _is_option(arg):
+            i += 2 if arg in valued else 1
+            continue
+        if expected:
+            if arg != expected.pop(0):
+                return None
+        elif runner.module_option is None:
+            return args[:i], arg, args[i + 1 :]
+        else:
+            return None
+        i += 1
+    return None
+
+
+def _frame(program: str, args: Sequence[str]) -> Target:
     selecting = TARGET_OPTIONS.get(program, {})
     patterns = PATTERN_OPTIONS.get(program, frozenset())
     valued = VALUE_OPTIONS.get(program, frozenset()) | patterns
     patternless = PATTERNLESS_OPTIONS.get(program, frozenset())
+    global_flags = GLOBAL_FLAGS.get(program, frozenset())
     positional_pattern = program in PATTERN_OPTIONS
     words: list[tuple[str, bool]] = []
     selectors: dict[str, list[str]] = {}
     options_end = False
     pending: str | None = None
-    for arg in simple.args:
+    for arg in args:
         if not options_end and arg == "--":
             options_end, pending = True, None
         elif not options_end and _is_option(arg):
@@ -201,7 +293,7 @@ def target(command: str) -> Target | None:
                 selectors.setdefault(selecting[arg[:2]], []).append(arg[2:])
             elif name[:2] in patterns and name not in patterns:
                 pass
-            elif not eq:
+            elif not eq and (words or name not in global_flags):
                 pending = _VALUE if name in valued else _UNKNOWN
         elif pending is None:
             words.append((arg, False))
@@ -239,10 +331,13 @@ def _literal_path(value: str) -> bool:
 def same_target(failed: str, passing: str, error: ErrorSignature | None = None) -> bool:
     """Whether commands share a target, allowing one literal path correction after a missing-path error."""
     a, b = target(failed), target(passing)
-    if a is None or b is None or (a.program, a.subcommand) != (b.program, b.subcommand):
+    if a is None or b is None or len(a.runners) != len(b.runners):
         return False
-    if any(a.selectors[name] != b.selectors[name] for name in a.selectors.keys() & b.selectors.keys()):
-        return False
+    for x, y in zip((*a.runners, a), (*b.runners, b), strict=True):
+        if (x.program, x.subcommand) != (y.program, y.subcommand):
+            return False
+        if any(x.selectors[name] != y.selectors[name] for name in x.selectors.keys() & y.selectors.keys()):
+            return False
     if (a.program, *a.subcommand) in UNORDERED:
         if Counter(a.operands) == Counter(b.operands):
             return True
