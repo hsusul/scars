@@ -251,9 +251,12 @@ def claude_files(scars_home: Path, hook_path: str) -> list[PlannedFile]:
     ]
 
 
-def shim_file(scars_home: Path, hook_path: str) -> PlannedFile:
+def shim_file(user_home: Path, scars_home: Path, hook_path: str) -> PlannedFile:
     """`~/.scars/bin/scars-hook`, which execs the installed hook with the harness's arguments."""
-    content = f'#!/bin/sh\nexec {shlex.quote(paths.text(hook_path))} "$@"\n'
+    content = "#!/bin/sh\n"
+    if scars_home != user_home / ".scars":
+        content += f"export SCARS_HOME={shlex.quote(paths.text(os.path.abspath(scars_home)))}\n"
+    content += f'exec {shlex.quote(paths.text(hook_path))} "$@"\n'
     return PlannedFile(scars_home / "bin" / "scars-hook", content, SHIM_MODE, force_mode=True)
 
 
@@ -531,7 +534,7 @@ def _recorded(f: PlannedFile) -> PlannedFile:
 
 
 def plan(ctx: Context, scars_home: Path, hook_path: str) -> Plan:
-    shim = _recorded(shim_file(scars_home, hook_path))
+    shim = _recorded(shim_file(ctx.user_home, scars_home, hook_path))
     command = paths.text(str(shim.path))
     job = None
     if ctx.platform == "darwin":
