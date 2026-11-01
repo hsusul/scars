@@ -1074,6 +1074,106 @@ def test_kill_switch_env_var_skips_all_work(env):
     assert [h[3:] for h in hits(home)] == [GATE_DENY]
 
 
+# ---------------------------------------------------------------- log-only baseline and arms
+
+ARM_ON_SESSION = "s1"
+ARM_OFF_SESSION = "s2"
+
+
+def logged(home):
+    return rows(home, "select session_id, lesson_id, outcome, injected_chars, arm from hits order by seq")
+
+
+def test_baseline_mode_prints_nothing_and_logs_the_matched_lesson(env):
+    home, repo = env
+    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
+    (home / "BASELINE").touch()
+    assert run_hook(home, "claude", "PostToolUseFailure", claude_failure(repo)).stdout == ""
+    miss = claude_failure(repo, tool_use_id="tu2", error="Exit code 2\nboom")
+    assert run_hook(home, "claude", "PostToolUseFailure", miss).stdout == ""
+    assert logged(home) == [
+        ("s1", lesson_id, "log_only", len(lesson_text(lesson_id)), "baseline"),
+        ("s1", None, "no_match", 0, "baseline"),
+    ]
+    assert rows(home, "select * from shown") == []
+
+
+def test_baseline_mode_prints_nothing_at_session_start(env):
+    home, repo = env
+    db = seed_store(home, repo)
+    add_lesson(db, fingerprint="fp1", triggers=REPAIR, status="candidate")
+    (home / "BASELINE").touch()
+    assert run_hook(home, "claude", "SessionStart", session_start(repo, "startup")).stdout == ""
+    assert logged(home) == [("s1", None, "no_match", 0, "baseline")]
+
+
+def test_an_agent_deny_still_prints_in_baseline_mode_and_in_the_off_arm(env):
+    home, repo = env
+    (home / "BASELINE").touch()
+    payload = pre_tool(repo, "scars promote L-1")
+    assert run_hook(home, "claude", "PreToolUse", payload).stdout == deny_json(run_reason("promote"))
+    (home / "BASELINE").unlink()
+    (home / "ARMS").touch()
+    off = pre_tool(repo, "scars promote L-1", session=ARM_OFF_SESSION)
+    assert run_hook(home, "codex", "PreToolUse", off).stdout == deny_json(run_reason("promote"))
+    assert rows(home, "select session_id, outcome, trigger_key, arm from hits order by seq") == [
+        ("s1", "blocked", "agent_deny", "baseline"),
+        (ARM_OFF_SESSION, "blocked", "agent_deny", "off"),
+    ]
+
+
+def test_the_arm_is_stable_for_a_session_and_about_half_the_sessions_are_on():
+    assert [hook.session_arm(s) for s in (ARM_ON_SESSION, ARM_OFF_SESSION, ARM_ON_SESSION)] == [
+        "on",
+        "off",
+        "on",
+    ]
+    sequential = [hook.session_arm(f"session-{i}") for i in range(1000)]
+    uuids = [hook.session_arm(f"{i:08x}-0000-4000-8000-000000000000") for i in range(1000)]
+    for arms in (sequential, uuids):
+        assert set(arms) == {"on", "off"}
+        assert 450 <= arms.count("on") <= 550
+
+
+def test_the_off_arm_prints_nothing_and_the_on_arm_delivers(env):
+    home, repo = env
+    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
+    text = lesson_text(lesson_id)
+    (home / "ARMS").touch()
+    off = claude_failure(repo, session=ARM_OFF_SESSION)
+    assert run_hook(home, "claude", "PostToolUseFailure", off).stdout == ""
+    on = claude_failure(repo, session=ARM_ON_SESSION, tool_use_id="tu2")
+    assert run_hook(home, "claude", "PostToolUseFailure", on).stdout == json.dumps(
+        context("PostToolUseFailure", text)
+    )
+    assert logged(home) == [
+        (ARM_OFF_SESSION, lesson_id, "log_only", len(text), "off"),
+        (ARM_ON_SESSION, lesson_id, "shown", len(text), "on"),
+    ]
+    assert rows(home, "select session_id, lesson_id from shown") == [(ARM_ON_SESSION, lesson_id)]
+
+
+def test_baseline_wins_when_both_mode_files_exist(env):
+    home, repo = env
+    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
+    (home / "ARMS").touch()
+    (home / "BASELINE").touch()
+    on = claude_failure(repo, session=ARM_ON_SESSION)
+    assert run_hook(home, "claude", "PostToolUseFailure", on).stdout == ""
+    assert logged(home) == [(ARM_ON_SESSION, lesson_id, "log_only", len(lesson_text(lesson_id)), "baseline")]
+
+
+def test_without_a_mode_file_the_lesson_is_shown_and_the_arm_is_null(env):
+    home, repo = env
+    lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
+    text = lesson_text(lesson_id)
+    off = claude_failure(repo, session=ARM_OFF_SESSION)
+    assert run_hook(home, "claude", "PostToolUseFailure", off).stdout == json.dumps(
+        context("PostToolUseFailure", text)
+    )
+    assert logged(home) == [(ARM_OFF_SESSION, lesson_id, "shown", len(text), None)]
+
+
 def test_cwd_outside_any_repo_sees_no_repo_lessons(env, tmp_path):
     home, repo = env
     add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
