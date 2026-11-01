@@ -8,6 +8,8 @@ Each check prints `ok` or `FAIL` with a reason, and any failure makes the exit c
 - no harness has scars hooks configured,
 - the hook shim uses a different store,
 - a harness's hook errored on more than 1% of its runs in the last 24 hours,
+- an installed harness's sandbox settings let agent commands write the store (see `claude_sandbox` and
+  `codex_sandbox`; settings doctor cannot read are reported as `unknown`, which does not fail),
 - the canary: a synthetic Claude Code `PostToolUseFailure` payload, run through the hook in this process
   against a temporary home holding one built-in lesson, must return that lesson within 100 ms.
 
@@ -33,6 +35,7 @@ import statistics
 import subprocess
 import tempfile
 import time
+import tomllib
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -69,7 +72,8 @@ CANARY_TEXT = LessonText(
 @dataclass(frozen=True)
 class Check:
     name: str
-    ok: bool
+    ok: bool | None
+    """None when doctor cannot tell, which is reported but does not fail doctor."""
     detail: str
 
 
@@ -194,6 +198,158 @@ def _hook_store(ctx: Context, scars_home: Path) -> Check:
     if os.path.realpath(home) != os.path.realpath(scars_home):
         return Check("hook store", False, f"shim uses {home}, doctor uses {scars_home}; run scars init")
     return Check("hook store", True, str(scars_home))
+
+
+CLAUDE_MANAGED_SETTINGS = {
+    "darwin": "Library/Application Support/ClaudeCode/managed-settings.json",
+    "linux": "etc/claude-code/managed-settings.json",
+}
+_GLOB = re.compile(r"[*?\[]")
+_EDIT_RULE = re.compile(r"Edit\((?P<path>.*)\)")
+
+
+def _reaches(entry: str, store: Path, user_home: Path, *, exact: bool = False) -> bool:
+    """Whether a path rule written in harness settings covers `store`. A rule with a wildcard is taken to
+    cover everything under its literal prefix, unless `exact` asks for a rule that surely covers it, as a
+    deny rule must."""
+    if entry == "~" or entry.startswith("~/"):
+        entry = str(user_home) + entry[1:]
+    if not entry.startswith("/"):
+        return False
+    targets = {str(store), os.path.realpath(store)}
+    if exact:
+        entry = entry.removesuffix("/**")
+    if wildcard := _GLOB.search(entry):
+        return not exact and any((t + "/").startswith(entry[: wildcard.start()]) for t in targets)
+    roots = {os.path.normpath(entry), os.path.realpath(entry)}
+    return any(t == r or t.startswith(r.rstrip("/") + "/") for t in targets for r in roots)
+
+
+def _strings(value: object) -> list[str] | None:
+    if value is None:
+        return []
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return value
+    return None
+
+
+def _section(settings: dict[str, object], *keys: str) -> dict[str, object]:
+    for key in keys:
+        value = settings.get(key)
+        settings = value if isinstance(value, dict) else {}
+    return settings
+
+
+def claude_sandbox(ctx: Context, store: Path) -> Check | None:
+    """Whether Claude Code's Bash sandbox, as its user and managed settings configure it, keeps commands
+    from writing `store`. None when Claude Code is not installed."""
+    name = "claude sandbox"
+    user = ctx.user_home / ".claude" / "settings.json"
+    managed = ctx.system_root / CLAUDE_MANAGED_SETTINGS.get(ctx.platform, CLAUDE_MANAGED_SETTINGS["linux"])
+    if not user.parent.is_dir() and not managed.exists():
+        return None
+    sources: list[tuple[Path, dict[str, object]]] = []
+    for path in (managed, user):
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            return Check(name, None, f"cannot parse {path}: {shown(str(exc))}")
+        if not isinstance(settings, dict):
+            return Check(name, None, f"cannot parse {path}: not a JSON object")
+        sources.append((path, settings))
+    if not sources:
+        return Check(name, None, f"no {user}")
+    # Managed settings win over the user's for a single value; lists from both apply.
+    enabled = next(
+        ((p, s["sandbox"]["enabled"]) for p, s in sources if "enabled" in _section(s, "sandbox")), None
+    )
+    if enabled is None:
+        return Check(name, None, f"no sandbox.enabled in {' or '.join(str(p) for p, _ in sources)}")
+    path, value = enabled
+    if not isinstance(value, bool):
+        return Check(name, None, f"sandbox.enabled in {path} is not true or false")
+    if not value:
+        return Check(name, False, f"sandbox.enabled is false in {path}, so Bash commands can write {store}")
+    for path, settings in sources:
+        if _section(settings, "sandbox", "filesystem").get("disabled") is True:
+            detail = f"sandbox.filesystem.disabled is true in {path}, so Bash commands can write {store}"
+            return Check(name, False, detail)
+    allows: list[tuple[str, str, Path]] = []
+    for path, settings in sources:
+        filesystem, permissions = (
+            _section(settings, "sandbox", "filesystem"),
+            _section(settings, "permissions"),
+        )
+        lists = {
+            "sandbox.filesystem.denyWrite": filesystem.get("denyWrite"),
+            "sandbox.filesystem.allowWrite": filesystem.get("allowWrite"),
+            "permissions.additionalDirectories": permissions.get("additionalDirectories"),
+            "permissions.allow": permissions.get("allow"),
+        }
+        for key, value in lists.items():
+            entries = _strings(value)
+            if entries is None:
+                return Check(name, None, f"{key} in {path} is not a list of strings")
+            for entry in entries:
+                if key == "sandbox.filesystem.denyWrite":
+                    if _reaches(entry, store, ctx.user_home, exact=True):
+                        detail = f"on, and {key} {shown(entry)} in {path} denies writes to {store}"
+                        return Check(name, True, detail)
+                    continue
+                target = entry
+                if key == "permissions.allow":
+                    rule = _EDIT_RULE.fullmatch(entry)
+                    # Edit rules write an absolute path as //path; /path is relative to the project.
+                    if rule is None or not rule["path"].startswith(("//", "~/")):
+                        continue
+                    target = rule["path"].removeprefix("/")
+                if _reaches(target, store, ctx.user_home):
+                    allows.append((key, entry, path))
+    if allows:
+        key, entry, path = allows[0]
+        return Check(name, False, f"{key} {shown(entry)} in {path} lets Bash commands write {store}")
+    return Check(name, True, f"on, and no write rule reaches {store}")
+
+
+def codex_sandbox(ctx: Context, store: Path) -> Check | None:
+    """Whether Codex's default sandbox mode, as `~/.codex/config.toml` sets it, keeps agent commands from
+    writing `store`. None when Codex is not installed."""
+    name = "codex sandbox"
+    path = ctx.user_home / ".codex" / "config.toml"
+    if not path.parent.is_dir():
+        return None
+    try:
+        config = tomllib.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return Check(name, None, f"no {path}")
+    except (OSError, ValueError) as exc:
+        return Check(name, None, f"cannot parse {path}: {shown(str(exc))}")
+    key, mode = "sandbox_mode", config.get("sandbox_mode")
+    profile = config.get("profile")
+    if isinstance(profile, str) and "sandbox_mode" in _section(config, "profiles", profile):
+        key, mode = f"profiles.{profile}.sandbox_mode", config["profiles"][profile]["sandbox_mode"]
+    match mode:
+        case None if "default_permissions" in config:
+            return Check(name, None, f"{path} sets default_permissions, which doctor does not read")
+        case None:
+            return Check(name, None, f"no sandbox_mode in {path}")
+        case "read-only":
+            return Check(name, True, f"{key} is read-only in {path}")
+        case "danger-full-access":
+            return Check(name, False, f"{key} is danger-full-access in {path}, so agents can write {store}")
+        case "workspace-write":
+            roots = _strings(_section(config, "sandbox_workspace_write").get("writable_roots"))
+            if roots is None:
+                detail = f"sandbox_workspace_write.writable_roots in {path} is not a list of strings"
+                return Check(name, None, detail)
+            for root in roots:
+                if _reaches(root, store, ctx.user_home):
+                    return Check(name, False, f"writable root {shown(root)} in {path} contains {store}")
+            detail = f"{key} is workspace-write in {path}, and no writable root contains {store}"
+            return Check(name, True, detail)
+    return Check(name, None, f"{key} {shown(str(mode))} in {path} is not a mode doctor knows")
 
 
 def _canary_payload(session: str, cwd: str) -> str:
@@ -338,6 +494,7 @@ def doctor(
         out.append(Check("hooks", False, "no harness has scars hooks installed"))
     else:
         out.append(_hook_store(ctx, scars_home))
+    out.extend(c for c in (claude_sandbox(ctx, scars_home), codex_sandbox(ctx, scars_home)) if c is not None)
     off = paths.is_off() or paths.off_value(ctx.env.get("SCARS_OFF"))
     out.append(Check("kill switch", not off, "on: hooks do nothing (scars on)" if off else "off"))
     out.extend(_store_checks(ctx, scars_home, location))
@@ -369,6 +526,7 @@ def cmd_doctor(_: argparse.Namespace, ctx: Context) -> int:
         if isinstance(item, str):
             ctx.print(item)
             continue
-        ctx.print(f"{'ok  ' if item.ok else 'FAIL'}  {item.name}: {clean(item.detail)}")
-        failed |= not item.ok
+        label = {True: "ok  ", False: "FAIL", None: "unknown"}[item.ok]
+        ctx.print(f"{label}  {item.name}: {clean(item.detail)}")
+        failed |= item.ok is False
     return 1 if failed else 0

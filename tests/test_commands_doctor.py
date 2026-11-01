@@ -1,3 +1,4 @@
+import json
 import re
 
 from cli_helpers import NOW, connect, first_telemetry, make_ctx, run, seed, telemetry_version
@@ -48,6 +49,7 @@ def test_healthy_doctor(home, user_home, monkeypatch):
         "codex: last hook 2027-01-15 07:59, 100 runs, p50 50.5 ms, p99 100.0 ms, errors 0 (0.0%), "
         "error classes: none; hooks installed\n"
         f"ok    hook store: {home}\n"
+        f"unknown  codex sandbox: no {user_home}/.codex/config.toml\n"
         "ok    kill switch: off\n"
         f"ok    store location: {home}\n"
         "ok    event chain: hash chain and replay match the lessons\n"
@@ -221,3 +223,180 @@ def test_an_older_telemetry_schema_in_a_read_only_store_does_not_fail_doctor(hom
     assert out.splitlines()[0] == OLD_SCHEMA
     assert "FAIL  telemetry" not in out
     assert telemetry_version(home / "telemetry.db") == 1
+
+
+MANAGED = "system/Library/Application Support/ClaudeCode/managed-settings.json"
+
+
+def sandbox(home, user_home, monkeypatch, *, claude=None, codex=None, managed=None):
+    """Doctor's exit code and sandbox lines, with codex hooks installed so nothing else fails."""
+    stub(monkeypatch)
+    install_codex(user_home)
+    seed(home)
+    if claude is not None:
+        (user_home / ".claude").mkdir()
+        (user_home / ".claude" / "settings.json").write_text(claude)
+    if codex is not None:
+        (user_home / ".codex" / "config.toml").write_text(codex)
+    if managed is not None:
+        path = user_home.parent / MANAGED
+        path.parent.mkdir(parents=True)
+        path.write_text(managed)
+    code, out, _ = run(make_ctx(user_home), "doctor")
+    return code, [line for line in out.splitlines() if " sandbox: " in line]
+
+
+CODEX_UNKNOWN = "unknown  codex sandbox: no {}/.codex/config.toml"
+
+
+def test_claude_sandbox_that_keeps_writes_away_from_the_store_is_ok(home, user_home, monkeypatch):
+    claude = '{"sandbox": {"enabled": true, "filesystem": {"allowWrite": ["~/.kube", "/tmp/build"]}}}'
+    assert sandbox(home, user_home, monkeypatch, claude=claude) == (
+        0,
+        [f"ok    claude sandbox: on, and no write rule reaches {home}", CODEX_UNKNOWN.format(user_home)],
+    )
+
+
+def test_claude_sandbox_turned_off_fails(home, user_home, monkeypatch):
+    assert sandbox(home, user_home, monkeypatch, claude='{"sandbox": {"enabled": false}}') == (
+        1,
+        [
+            f"FAIL  claude sandbox: sandbox.enabled is false in {user_home}/.claude/settings.json, "
+            f"so Bash commands can write {home}",
+            CODEX_UNKNOWN.format(user_home),
+        ],
+    )
+
+
+def test_claude_sandbox_with_filesystem_isolation_off_fails(home, user_home, monkeypatch):
+    claude = '{"sandbox": {"enabled": true, "filesystem": {"disabled": true}}}'
+    assert sandbox(home, user_home, monkeypatch, claude=claude)[1][0] == (
+        f"FAIL  claude sandbox: sandbox.filesystem.disabled is true in {user_home}/.claude/settings.json, "
+        f"so Bash commands can write {home}"
+    )
+
+
+def test_claude_sandbox_that_allows_writing_the_store_fails(home, user_home, monkeypatch):
+    claude = json.dumps({"sandbox": {"enabled": True, "filesystem": {"allowWrite": [f"{home.parent}/**"]}}})
+    assert sandbox(home, user_home, monkeypatch, claude=claude) == (
+        1,
+        [
+            f"FAIL  claude sandbox: sandbox.filesystem.allowWrite {home.parent}/** in "
+            f"{user_home}/.claude/settings.json lets Bash commands write {home}",
+            CODEX_UNKNOWN.format(user_home),
+        ],
+    )
+
+
+def test_claude_edit_allow_rule_over_the_store_fails(home, user_home, monkeypatch):
+    claude = json.dumps(
+        {"sandbox": {"enabled": True}, "permissions": {"allow": ["Bash(ls)", f"Edit(/{home})"]}}
+    )
+    assert sandbox(home, user_home, monkeypatch, claude=claude)[1][0] == (
+        f"FAIL  claude sandbox: permissions.allow Edit(/{home}) in {user_home}/.claude/settings.json "
+        f"lets Bash commands write {home}"
+    )
+
+
+def test_claude_deny_write_on_the_store_wins_over_an_allow(home, user_home, monkeypatch):
+    claude = json.dumps(
+        {"sandbox": {"enabled": True, "filesystem": {"allowWrite": ["/"], "denyWrite": [str(home)]}}}
+    )
+    assert sandbox(home, user_home, monkeypatch, claude=claude)[1][0] == (
+        f"ok    claude sandbox: on, and sandbox.filesystem.denyWrite {home} in "
+        f"{user_home}/.claude/settings.json denies writes to {home}"
+    )
+
+
+def test_claude_settings_without_the_sandbox_key_are_unknown_and_do_not_fail(home, user_home, monkeypatch):
+    assert sandbox(home, user_home, monkeypatch, claude='{"theme": "dark"}') == (
+        0,
+        [
+            f"unknown  claude sandbox: no sandbox.enabled in {user_home}/.claude/settings.json",
+            CODEX_UNKNOWN.format(user_home),
+        ],
+    )
+
+
+def test_claude_settings_that_do_not_parse_are_unknown(home, user_home, monkeypatch):
+    assert sandbox(home, user_home, monkeypatch, claude='{"sandbox": ')[1][0] == (
+        f"unknown  claude sandbox: cannot parse {user_home}/.claude/settings.json: "
+        "Expecting value: line 1 column 13 (char 12)"
+    )
+
+
+def test_claude_managed_settings_decide_whether_the_sandbox_is_on(home, user_home, monkeypatch):
+    managed = '{"sandbox": {"enabled": true}}'
+    claude = '{"sandbox": {"enabled": false}}'
+    assert sandbox(home, user_home, monkeypatch, claude=claude, managed=managed)[1][0] == (
+        f"ok    claude sandbox: on, and no write rule reaches {home}"
+    )
+
+
+def test_codex_read_only_sandbox_is_ok(home, user_home, monkeypatch):
+    assert sandbox(home, user_home, monkeypatch, codex='sandbox_mode = "read-only"\n') == (
+        0,
+        [f"ok    codex sandbox: sandbox_mode is read-only in {user_home}/.codex/config.toml"],
+    )
+
+
+def test_codex_workspace_write_away_from_the_store_is_ok(home, user_home, monkeypatch):
+    codex = 'sandbox_mode = "workspace-write"\n\n[sandbox_workspace_write]\nwritable_roots = ["/tmp/build"]\n'
+    assert sandbox(home, user_home, monkeypatch, codex=codex) == (
+        0,
+        [
+            f"ok    codex sandbox: sandbox_mode is workspace-write in {user_home}/.codex/config.toml, "
+            f"and no writable root contains {home}"
+        ],
+    )
+
+
+def test_codex_full_access_fails(home, user_home, monkeypatch):
+    assert sandbox(home, user_home, monkeypatch, codex='sandbox_mode = "danger-full-access"\n') == (
+        1,
+        [
+            f"FAIL  codex sandbox: sandbox_mode is danger-full-access in {user_home}/.codex/config.toml, "
+            f"so agents can write {home}"
+        ],
+    )
+
+
+def test_codex_writable_root_that_holds_the_store_fails(home, user_home, monkeypatch):
+    codex = (
+        f"sandbox_mode = 'workspace-write'\n[sandbox_workspace_write]\nwritable_roots = ['{home.parent}']\n"
+    )
+    assert sandbox(home, user_home, monkeypatch, codex=codex) == (
+        1,
+        [
+            f"FAIL  codex sandbox: writable root {home.parent} in {user_home}/.codex/config.toml "
+            f"contains {home}"
+        ],
+    )
+
+
+def test_codex_selected_profile_sets_the_sandbox_mode(home, user_home, monkeypatch):
+    codex = (
+        'profile = "yolo"\nsandbox_mode = "read-only"\n\n'
+        '[profiles.yolo]\nsandbox_mode = "danger-full-access"\n'
+    )
+    assert sandbox(home, user_home, monkeypatch, codex=codex)[1] == [
+        f"FAIL  codex sandbox: profiles.yolo.sandbox_mode is danger-full-access in "
+        f"{user_home}/.codex/config.toml, so agents can write {home}"
+    ]
+
+
+def test_codex_config_without_a_sandbox_mode_is_unknown_and_does_not_fail(home, user_home, monkeypatch):
+    assert sandbox(home, user_home, monkeypatch, codex='model = "gpt-5"\n') == (
+        0,
+        [f"unknown  codex sandbox: no sandbox_mode in {user_home}/.codex/config.toml"],
+    )
+
+
+def test_codex_config_that_does_not_parse_is_unknown(home, user_home, monkeypatch):
+    assert sandbox(home, user_home, monkeypatch, codex="sandbox_mode = \n") == (
+        0,
+        [
+            f"unknown  codex sandbox: cannot parse {user_home}/.codex/config.toml: "
+            "Invalid value (at line 1, column 16)"
+        ],
+    )
