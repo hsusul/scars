@@ -93,3 +93,13 @@ create table precision_runs (lesson_id text not null, revision integer not null,
 create index if not exists observations_lesson on observations(lesson_id);
 create index if not exists events_lesson on events(lesson_id, seq);
 create index if not exists mined_calls_at on mined_calls(at);
+
+-- A store made before this table existed has no row: its signatures count as the oldest rules.
+create table if not exists signature_rules (    -- the signature rules every stored signature follows
+  id integer primary key check (id = 1),
+  version integer not null
+);
+create table if not exists signature_review (   -- lessons kept through a rules change for a person to check
+  lesson_id text primary key references lessons(id),
+  revision integer not null                    -- any later change to the lesson ends the review
+);

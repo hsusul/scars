@@ -37,6 +37,11 @@ _ERROR_LINE = re.compile(
 )
 _MAX = 120
 
+RULES_VERSION = 4
+"""Bumped whenever `signature()` maps some text differently, so `scars mine` can tell a store's signatures
+were computed by older rules. 1 took the first usable line; 2 prefers an error-shaped line; 3 strips the
+space left by the cut; 4 rejects text starting with the reserved tool prefix."""
+
 
 def signature(text: str, *, command: str | None = None) -> ErrorSignature | None:
     """Normalize tool error output to a signature, or None when no lesson could address it.

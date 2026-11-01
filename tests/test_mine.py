@@ -600,6 +600,84 @@ def test_running_twice_changes_nothing(env):
     assert dump(lessons_db(env)) == before
 
 
+OLD_SIG = "collected <n> items"
+"""What the first-line rule made of output that starts with stdout before the error line."""
+
+
+def old_rules_store(env):
+    """A store as an older scars left it: a pending failure and a stored failed call holding the
+    first-line signature of stdout-first output, a candidate keyed on it, and no record of the rules."""
+    from scars.mine.build import fingerprint
+    from scars.model import LessonText
+
+    t = Claude(env["repo"]).bash("t1", "pytest --frobnicate tests", "collected 0 items\n" + FAIL_TEXT)
+    path = write(env, "s1", t.read("t2").text())
+    mine_now(env, now=START + 3600)
+    db = lessons_db(env)
+    db.execute("update pending_failures set error_signature = ?", (OLD_SIG,))
+    db.execute("update mined_calls set error_signature = ? where status = 'failed'", (OLD_SIG,))
+    db.execute("drop table if exists signature_rules")
+    scope = RepoScope(RepoId("own-app"))
+    stale = store.create_lesson(
+        db,
+        text=LessonText("pytest --frobnicate tests", "run `pytest tests` instead", MINED_WHY),
+        scope=scope,
+        trust_class=TrustClass.OWN_CODE,
+        triggers=(Trigger(TriggerKind.ERROR, OLD_SIG, Stage.REPAIR),),
+        fingerprint=fingerprint(scope, OLD_SIG),
+        actor="miner",
+        at=START,
+    )
+    store.add_observation(
+        db,
+        store.Observation(
+            stale, "claude", "s0", "old1", "pytest --frobnicate tests", OLD_SIG, "pytest tests", START
+        ),
+    )
+    db.commit()
+    t.records = []
+    with path.open("a") as f:
+        f.write(t.bash("t3", "pytest tests").text())
+    return db, stale
+
+
+def test_older_signature_rules_drop_pending_failures_and_retire_stale_candidates(env):
+    db, stale = old_rules_store(env)
+    summary = mine_now(env, now=START + 7200)
+    assert (summary.calls, summary.pairs, summary.observations, summary.retired_unrenderable) == (1, 0, 0, {})
+    assert summary.signature_upgrade == mine.SignatureUpgrade(
+        from_version=1, pending_dropped=1, calls_unpaired=1, retired=1, to_review=0
+    )
+    assert db.execute(
+        "select type, payload from events where lesson_id = ? order by seq", (stale,)
+    ).fetchall()[1:] == [("retired", '{"reason":"signature rules changed"}')]
+    assert db.execute("select count(*) from pending_failures").fetchone() == (0,)
+    assert db.execute(
+        "select tool_use_id, error_signature from mined_calls where status = 'failed'"
+    ).fetchall() == [("t1", None)]
+    assert db.execute("select version from signature_rules").fetchall() == [(4,)]
+    assert store.verify(db) == []
+
+
+def test_the_signature_upgrade_runs_once(env):
+    db, _ = old_rules_store(env)
+    mine_now(env, now=START + 7200)
+
+    def everything():
+        return dump(db) + [
+            db.execute(f"select * from {t}").fetchall() for t in ("signature_rules", "signature_review")
+        ]
+
+    before = everything()
+    assert mine_now(env, now=START + 7200) == Summary()
+    assert everything() == before
+
+
+def test_a_new_store_records_the_current_signature_rules(env):
+    assert lessons_db(env).execute("select version from signature_rules").fetchall() == [(4,)]
+    assert mine_now(env).signature_upgrade is None
+
+
 # ---------------------------------------------------------------- Codex
 
 

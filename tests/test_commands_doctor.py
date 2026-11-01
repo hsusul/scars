@@ -52,6 +52,7 @@ def test_healthy_doctor(home, user_home, monkeypatch):
         f"ok    store location: {home}\n"
         "ok    event chain: hash chain and replay match the lessons\n"
         "ok    lessons render: every active lesson renders\n"
+        "ok    signature rules: every error trigger follows the current rules\n"
         "ok    canary: lesson returned in 7 ms\n",
         "",
     )
@@ -85,6 +86,34 @@ def test_doctor_fails_on_a_promoted_lesson_that_names_a_secret_argument(home, us
     assert "hunter2" not in out
 
 
+def test_a_promoted_lesson_from_older_signature_rules_is_kept_and_named_for_review(
+    home, user_home, monkeypatch
+):
+    from cli_helpers import human
+    from scars.model import EventType
+
+    stub(monkeypatch)
+    lesson_id = seed(home)
+    human(home, lesson_id, EventType.PROMOTED)
+    connect(home).execute("drop table if exists signature_rules")
+
+    def lesson_rows():
+        return [tuple(r) for r in connect(home).execute("select * from lessons")]
+
+    before = lesson_rows()
+    assert run(make_ctx(user_home), "mine")[1].splitlines()[2] == (
+        "signature rules changed (version 1 to 4): 0 pending failures dropped, 0 failed calls unpaired, "
+        "0 lessons retired, 1 to review (scars doctor names them)"
+    )
+    assert lesson_rows() == before
+    code, out, _ = run(make_ctx(user_home), "doctor")
+    assert code == 1
+    assert f"FAIL  signature rules: {lesson_id}: error trigger made by older signature rules\n" in out
+    assert run(make_ctx(user_home), "ls")[1].splitlines()[-1] == (
+        f"needs review: lesson {lesson_id} has an error trigger made by older signature rules"
+    )
+
+
 def test_each_failing_check_makes_doctor_exit_1(home, user_home, monkeypatch):
     stub(monkeypatch, location="it is on an external disk", canary=doctor.Check("canary", False, "no lesson"))
     lesson_id = seed(home)
@@ -105,6 +134,7 @@ def test_each_failing_check_makes_doctor_exit_1(home, user_home, monkeypatch):
         f"FAIL  store location: {home}: it is on an external disk",
         f"FAIL  event chain: {lesson_id}: avoid is tampered in lessons but pytest --frobnicate from events",
         f"FAIL  lessons render: {lesson_id}: mined.program_mismatch in instead",
+        "ok    signature rules: every error trigger follows the current rules",
         "FAIL  canary: no lesson",
     ]
 

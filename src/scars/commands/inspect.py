@@ -90,6 +90,7 @@ def cmd_ls(args: argparse.Namespace, ctx: Context) -> int:
     with lessons_db(readonly=True) as db:
         lessons, problems = store.read_lessons(db, statuses=statuses, repo_id=repo)
         refused = unrenderable(db, lessons)
+        to_review = store.signature_reviews(db)
         try:
             last_seen = store.lessons_last_seen(db) if args.stale else {}
         except (ValueError, TypeError) as exc:
@@ -113,6 +114,11 @@ def cmd_ls(args: argparse.Namespace, ctx: Context) -> int:
     for lesson_id, exc in refused:
         if lesson_id in shown_ids:
             ctx.print(f"cannot render: lesson {shown(lesson_id)} breaks {exc.rule} in {exc.field}")
+    for lesson_id in to_review:
+        if lesson_id in shown_ids:
+            ctx.print(
+                f"needs review: lesson {shown(lesson_id)} has an error trigger made by older signature rules"
+            )
     for lesson_id, reason in problems:
         ctx.print(f"problem: lesson {shown(lesson_id)} cannot be read: {shown(reason)}")
     return 1 if problems else 0
