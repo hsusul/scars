@@ -101,6 +101,112 @@ def test_a_pass_on_another_operand_is_skipped_and_the_failure_keeps_waiting():
 
 
 @pytest.mark.parametrize(
+    ("command", "fix", "output"),
+    [
+        (
+            "sed -n 1,280p lib/realtime/gen_rpc_pub_sub.ex",
+            "sed -n 1,280p lib/realtime/gen_rpc/pub_sub.ex",
+            "sed: lib/realtime/gen_rpc_pub_sub.ex: No such file or directory",
+        ),
+        ("cat missing.txt", "cat actual.txt", "cat: missing.txt: No such file or directory"),
+        ("ls src/missing", "ls src/actual", "ls: cannot access 'src/missing': No such file or directory"),
+        ("ls src/missing", "ls src/actual", "ls: cannot access 'src/missing'"),
+        ("cat missing.txt", "cat actual.txt", "Error: File 'missing.txt' does not exist."),
+        ("cat src/missing", "cat src/actual", "error: src/missing does not exist"),
+        ("cat missing.txt", "cat actual.txt", "error: missing.txt not found"),
+        ("cat src/missing", "cat src/actual", "error: not found: src/missing"),
+        ("cat src/missing", "cat src/actual", "ERROR: SRC/MISSING NOT FOUND"),
+    ],
+)
+def test_a_missing_path_failure_pairs_with_one_corrected_path(command, fix, output):
+    result = pair_session(
+        (),
+        [
+            call("f", START, command=command, status=CallStatus.FAILED, output=output),
+            call("fix", START + 1, command=fix),
+        ],
+        START + 2,
+    )
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 0)
+
+
+@pytest.mark.parametrize(
+    ("command", "other", "fix"),
+    [
+        ("cp src/missing.txt dst/a.txt", "cp src/actual.txt dst/b.txt", "cp src/actual.txt dst/a.txt"),
+        ("cat src/missing.txt", "cat src/actual.txt extra.txt", "cat src/actual.txt"),
+        ("cat src/missing.txt extra.txt", "cat src/actual.txt", "cat src/actual.txt extra.txt"),
+        ("git checkout a src/missing.txt", "git checkout b src/missing.txt", "git checkout a src/actual.txt"),
+        ("git checkout src/missing.txt", "git show src/actual.txt", "git checkout src/actual.txt"),
+        (
+            "git -C app checkout src/missing.txt",
+            "git -C other checkout src/actual.txt",
+            "git -C app checkout src/actual.txt",
+        ),
+        ("cat src/missing.txt", "cat src/*.txt", "cat src/actual.txt"),
+        ("cat src/missing.txt", "cat src/?.txt", "cat src/actual.txt"),
+        ("cat src/missing.txt", "cat src/[ab].txt", "cat src/actual.txt"),
+        ("cat src/missing.txt", "cat $ROOT/actual.txt", "cat src/actual.txt"),
+        ("cat src/missing.txt", "cat ~/actual.txt", "cat src/actual.txt"),
+    ],
+)
+def test_a_path_correction_skips_other_targets_and_waits_for_its_fix(command, other, fix):
+    result = pair_session(
+        (),
+        [
+            call(
+                "f",
+                START,
+                command=command,
+                status=CallStatus.FAILED,
+                output="cat: src/missing.txt: No such file or directory",
+            ),
+            call("other", START + 1, command=other),
+            call("fix", START + 2, command=fix),
+        ],
+        START + 3,
+    )
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 1)
+
+
+def test_path_corrections_require_a_missing_path_signature_and_path_operands():
+    results = []
+    for command, fix, output in [
+        ("git checkout a", "git checkout b", "fatal: path 'a' does not exist"),
+        ("cat src/missing.txt", "cat src/actual.txt", "cat: src/missing.txt: Permission denied"),
+        ("cat src/missing.txt", "cat src/actual.txt", "error: unknown option --number"),
+        ("cat src/missing.txt", "cat src/actual.txt", "zsh: command not found: cat"),
+        ("gh pr diff old.txt", "gh pr diff actual.txt", "gh: Not Found (HTTP 404)"),
+        ("cat 'src/*.txt'", "cat src/actual.txt", "cat: src/*.txt: No such file or directory"),
+        (
+            "cat '$ROOT/missing.txt'",
+            "cat src/actual.txt",
+            "cat: $ROOT/missing.txt: No such file or directory",
+        ),
+        ("cat missing.txt", "cat actual.txt", "cat: missing.txt: No such file or directory"),
+    ]:
+        result = pair_session(
+            (),
+            [
+                call("f", START, command=command, status=CallStatus.FAILED, output=output),
+                call("fix", START + 1, command=fix),
+            ],
+            START + 2,
+        )
+        results.append((outcome(result), result.operand_mismatch))
+    assert results == [
+        (([], ["f"], 1, 0, 0), 1),
+        (([], ["f"], 1, 0, 0), 1),
+        (([], ["f"], 1, 0, 0), 1),
+        (([], ["f"], 1, 0, 0), 1),
+        (([], ["f"], 1, 0, 0), 1),
+        (([], ["f"], 1, 0, 0), 1),
+        (([], ["f"], 1, 0, 0), 1),
+        (([("f", "fix")], [], 1, 0, 0), 0),
+    ]
+
+
+@pytest.mark.parametrize(
     ("command", "expected"),
     [
         (
