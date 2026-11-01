@@ -136,6 +136,66 @@ def test_commands_of_two_programs_never_share_a_target():
     assert (same_target("cat a", "less a"), same_target("cat a", "cat --number a")) == (False, True)
 
 
+@pytest.mark.parametrize(
+    ("failed_command", "other", "fix"),
+    [
+        ("sed -n 270-310p f", "sed -n 718,742p g", "sed -n 718,742p f"),
+        (r'grep -rln "A" a b', r'grep -rn "A\|B" b a', r'grep -rn "A\|B" a b'),
+        ("rg pat a", "rg other b", "rg other a"),
+        ("awk '{print $1}' a", "awk '{print $2}' b", "awk '{print $2}' a"),
+        ("jq .a f", "jq .a g", "jq .b f"),
+        ("sed -n 1,240p a", "sed -n -e 1,180p b", "sed -n -e 1,180p a"),
+        ("sed -n 1,240p a", "sed -n --expression=1,180p b", "sed -n --expression=1,180p a"),
+        ("sed -n 1,240p a", "sed -n -f script b", "sed -n -f script a"),
+        ("sed -n 1,240p a", "sed -n --file script b", "sed -n --file script a"),
+        ("grep pat a", "grep -e other b", "grep -e other a"),
+        ("grep pat a", "grep --regexp=other b", "grep --regexp=other a"),
+        ("grep pat a", "grep -f patterns b", "grep -f patterns a"),
+        ("grep pat a", "grep --file patterns b", "grep --file patterns a"),
+        ("rg pat a", "rg -e other b", "rg -e other a"),
+        ("rg pat a", "rg --regexp other b", "rg --regexp other a"),
+        ("rg pat a", "rg -f patterns b", "rg -f patterns a"),
+        ("rg pat a", "rg --file=patterns b", "rg --file=patterns a"),
+        ("awk '{print $1}' a", "awk -f script b", "awk -f script a"),
+        ("jq .a f", "jq -f filter g", "jq -f filter f"),
+        ("jq .a f", "jq --from-file filter g", "jq --from-file filter f"),
+        ("sed -n 1,240p a", "sed -n -e1,180p b", "sed -n -e1,180p a"),
+        ("grep pat a", "grep -eother b", "grep -eother a"),
+        ("rg pat a", "rg -eother b", "rg -eother a"),
+        ("awk '{print $1}' a", "awk -fscript b", "awk -fscript a"),
+        ("jq .a f", "jq -ffilter g", "jq -ffilter f"),
+        ("grep -e pat a", "grep -e other b", "grep -e other a"),
+        ("grep -f patterns a", "grep -f corrected b", "grep -f corrected a"),
+        ("rg -e pat -e more a", "rg -e other -e more b", "rg -e other -e more a"),
+        ("sed -ne1p a", "sed -ne2p b", "sed -n -e 2p a"),
+        ("rg -- pat a", "rg -- other b", "rg -- other a"),
+    ],
+)
+def test_a_changed_pattern_skips_other_files_and_pairs_on_the_same_files(failed_command, other, fix):
+    result = pair_session(
+        (),
+        [
+            failed("f", START, command=failed_command),
+            call("other", START + 1, command=other),
+            call("fix", START + 2, command=fix),
+        ],
+        START + 3,
+    )
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 1)
+
+
+def test_a_changed_pattern_without_file_operands_still_pairs():
+    result = pair_session(
+        (),
+        [
+            failed("f", START, command='grep -rln "A"'),
+            call("fix", START + 1, command=r'grep -rn "A\|B"'),
+        ],
+        START + 2,
+    )
+    assert (outcome(result), result.operand_mismatch) == (([("f", "fix")], [], 1, 0, 0), 0)
+
+
 def test_a_failure_one_second_short_of_a_day_still_pairs():
     late = call("p", START + IDLE_SECONDS - 1)
     result = pair_session(
