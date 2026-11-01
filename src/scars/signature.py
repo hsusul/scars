@@ -57,7 +57,7 @@ def signature(text: str, *, command: str | None = None) -> ErrorSignature | None
             normalized = pattern.sub(replacement, normalized)
         if _SKIP_LINE.match(normalized) or not re.search(r"[A-Za-z]{3,}", normalized):
             continue
-        result = normalized.strip()[:_MAX]
+        result = normalized[:_MAX].strip()
         if _ERROR_LINE.search(line):
             return None if _UNLESSONABLE.search(result) else ErrorSignature(result)
         if fallback is None:

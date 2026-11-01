@@ -6,9 +6,10 @@ next 10 calls and no edit call (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `a
 it. An edit means the fix was a source change, which is ordinary debugging and not a lesson.
 
 The same target means the first simple command of each call has the same subcommand, the same
-positional operands and the same value for every option that selects the target, so only other options
-and their values differ. A pass of the same program on another file, PR, branch, make target, directory,
-repo or namespace is a different task, not a fix. The subcommand is the first words that are neither
+file or other target operands and the same value for every option that selects the target. A leading
+pattern or script operand may differ for programs in `PATTERN_OPTIONS`. A pass of the same program on
+another file, PR, branch, make target, directory, repo or namespace is a different task, not a fix.
+The subcommand is the first words that are neither
 options nor option values, as many as `SUBCOMMAND_DEPTH` gives for the program (or for the program and its
 first such word), compared in order. Make targets and `xcodebuild` actions are operands.
 
@@ -130,6 +131,20 @@ UNORDERED: frozenset[tuple[str, ...]] = frozenset({("git", "worktree", "add")})
 """Program and subcommand whose operands may come in any order and still name the same target."""
 
 
+PATTERN_OPTIONS: dict[str, frozenset[str]] = {
+    "sed": frozenset({"-e", "--expression", "-f", "--file"}),
+    "grep": frozenset({"-e", "--regexp", "-f", "--file"}),
+    "rg": frozenset({"-e", "--regexp", "-f", "--file"}),
+    "awk": frozenset({"-f"}),
+    "jq": frozenset({"-f", "--from-file"}),
+}
+"""Programs with a leading pattern or script operand, unless one of these options supplies it instead.
+Pattern option values may differ just like values in `VALUE_OPTIONS`."""
+
+PATTERNLESS_OPTIONS: dict[str, frozenset[str]] = {"rg": frozenset({"--files", "--type-list"})}
+"""Modes in which every positional word is a target operand, with no leading pattern."""
+
+
 @dataclass(frozen=True)
 class Target:
     """What a shell command acts on: its program, subcommand, positional operands and selecting options."""
@@ -157,7 +172,10 @@ def target(command: str) -> Target | None:
     simple = commands[0]
     program = posixpath.basename(simple.program)
     selecting = TARGET_OPTIONS.get(program, {})
-    valued = VALUE_OPTIONS.get(program, frozenset())
+    patterns = PATTERN_OPTIONS.get(program, frozenset())
+    valued = VALUE_OPTIONS.get(program, frozenset()) | patterns
+    patternless = PATTERNLESS_OPTIONS.get(program, frozenset())
+    positional_pattern = program in PATTERN_OPTIONS
     words: list[tuple[str, bool]] = []
     selectors: dict[str, list[str]] = {}
     options_end = False
@@ -167,6 +185,10 @@ def target(command: str) -> Target | None:
             options_end, pending = True, None
         elif not options_end and _is_option(arg):
             name, eq, value = arg.partition("=")
+            # A short bundle may hide a script, so keep its possible file operands.
+            bundled_pattern = not name.startswith("--") and any(f"-{flag}" in patterns for flag in name[1:])
+            if name in patterns or bundled_pattern or name in patternless:
+                positional_pattern = False
             pending = None
             if name in selecting and eq:
                 selectors.setdefault(selecting[name], []).append(value)
@@ -174,6 +196,8 @@ def target(command: str) -> Target | None:
                 pending = selecting[name]
             elif arg[:2] in selecting:
                 selectors.setdefault(selecting[arg[:2]], []).append(arg[2:])
+            elif name[:2] in patterns and name not in patterns:
+                pass
             elif not eq:
                 pending = _VALUE if name in valued else _UNKNOWN
         elif pending is None:
@@ -184,6 +208,8 @@ def target(command: str) -> Target | None:
             elif pending != _VALUE:
                 selectors.setdefault(pending, []).append(arg)
             pending = None
+    if positional_pattern:
+        words = words[1:]
     plain = [word for word, ambiguous in words if not ambiguous]
     depth = SUBCOMMAND_DEPTH.get((program, *plain[:1]), SUBCOMMAND_DEPTH.get((program,), 0))
     subcommand: list[str] = []
