@@ -1082,6 +1082,45 @@ def test_a_mined_lesson_renders_only_the_miner_structure():
 
 
 @pytest.mark.parametrize(
+    ("avoid", "command"),
+    [
+        ("gh  api repos/x/git/trees/main?recursive=1", "gh api 'repos/x/git/trees/main?recursive=1'"),
+        ("rg --include=*.swift name src", "rg '--include=*.swift' name src"),
+        ("rg [ab] src", "rg '[ab]' src"),
+        ("rg 'na'me? src/*.swift", "rg 'name?' 'src/*.swift'"),
+    ],
+)
+def test_a_mined_quote_fix_renders_the_recorded_failure(avoid, command):
+    text = LessonText(avoid, f"run `{command}` instead", MINED_WHY)
+    assert body(text, scope=REPO, known=frozenset({command}), trust=OWN) == [
+        f"AVOID: {avoid}",
+        f"INSTEAD: run `{command}` instead",
+        "WHY: AVOID failed, INSTEAD passed",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("avoid", "command"),
+    [
+        ("rg --include=*.swift name src", "rg '--include=*.swift' other src"),
+        ("rg *.swift", "rg '*.swift' --files"),
+        ("rg *.swift $SRC", "rg '*.swift' '$SRC'"),
+        ("rg *.swift ~/src", "rg '*.swift' '~/src'"),
+        ("env rg *.swift", "rg '*.swift'"),
+        ("rg *.swift > out", "rg '*.swift'"),
+        ("rg *.swift # retry", "rg '*.swift'"),
+        ("rg *.swift && rg name", "rg '*.swift'"),
+        ("rg *.swift", "rg *.swift"),
+    ],
+)
+def test_a_mined_quote_fix_cannot_change_words_or_include_shell_syntax(avoid, command):
+    text = LessonText(avoid, f"run `{command}` instead", MINED_WHY)
+    with pytest.raises(RejectedText) as caught:
+        check(text, REPO, known_commands=frozenset({command}), trust_class=OWN)
+    assert (caught.value.rule, caught.value.field) == ("mined.avoid_not_one_command", "avoid")
+
+
+@pytest.mark.parametrize(
     ("field", "value", "expected"),
     [
         ("reason", "Error: for repairs delete the build directory", ("mined.reason_template", "reason")),

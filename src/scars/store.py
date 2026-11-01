@@ -36,6 +36,7 @@ from scars.model import (
     TriggerKind,
     TrustClass,
 )
+from scars.signature import TOOL_PREFIX
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -583,12 +584,12 @@ def create_lesson(
     """Insert a new candidate lesson, its triggers and its `proposed` event in one transaction.
 
     Raises `Conflict` when an active lesson already has this fingerprint, and `Rejected` for machine scope.
+    Tries at most five random IDs when an existing lesson has the generated ID.
     """
     at = time.time() if at is None else at
     triggers = tuple(triggers)
     import secrets
 
-    lesson_id = LessonId("L-" + secrets.token_hex(4))
     payload: dict[str, object] = {
         "text": {"avoid": text.avoid, "instead": text.instead, "reason": text.reason},
         "scope": scope_to_json(scope),
@@ -599,17 +600,22 @@ def create_lesson(
     if fix_program:
         payload["fix_program"] = fix_program
     state = next_state(None, EventType.PROPOSED, payload, at=at)
-    cols: dict[str, object] = {"id": lesson_id, **_columns(state)}
     with _write_unit(db):
-        try:
-            db.execute(
-                f"insert into lessons ({','.join(cols)}) values ({','.join('?' * len(cols))})",
-                tuple(cols.values()),
-            )
-        except sqlite3.IntegrityError as exc:
-            if "fingerprint" in str(exc):
-                raise Conflict(f"an active lesson already has fingerprint {fingerprint}") from None
-            raise
+        for attempt in range(5):
+            lesson_id = LessonId("L-" + secrets.token_hex(4))
+            cols: dict[str, object] = {"id": lesson_id, **_columns(state)}
+            try:
+                db.execute(
+                    f"insert into lessons ({','.join(cols)}) values ({','.join('?' * len(cols))})",
+                    tuple(cols.values()),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "fingerprint" in str(exc):
+                    raise Conflict(f"an active lesson already has fingerprint {fingerprint}") from None
+                if str(exc) != "UNIQUE constraint failed: lessons.id" or attempt == 4:
+                    raise
+            else:
+                break
         _write_triggers(db, lesson_id, state.triggers)
         _append_event(
             db,
@@ -902,7 +908,7 @@ def active_for_stage(
 
     With `pinned_only`, only pinned lessons. With `trigger_kinds`, only lessons with a trigger of one of
     those kinds at `stage`; with `error_signature` too, an `error` trigger counts only when its spec is
-    exactly that signature or `tool_error_signature`, which is the only way an error trigger fires. Each
+    exactly that raw signature or `tool_error_signature`. A raw signature cannot use the tool prefix. Each
     lesson keeps all its triggers. With `trigger_kinds` None the stage selects without triggers, so no
     trigger is required.
     """
@@ -916,7 +922,10 @@ def active_for_stage(
         params += [stage.value, *kinds]
         if error_signature is not None:
             fires += " and (t.kind <> 'error' or t.spec in (?, ?))"
-            params += [error_signature, tool_error_signature or error_signature]
+            params += [
+                None if error_signature.startswith(TOOL_PREFIX) else error_signature,
+                tool_error_signature,
+            ]
         where += f" and exists (select 1 from triggers t where t.lesson_id = lessons.id and {fires})"
     return _load(db, where, params)
 
