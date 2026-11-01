@@ -25,7 +25,8 @@ roots only) rather than a list of bad phrases.
    segments, or a host (`localhost`, an IPv4 address, `host:port`).
 5. Mined structure: a lesson whose trust class is not `human` holds only what the miner builds from
    parsed calls, never transcript prose. `avoid` is one plain command and the command in `instead` is
-   another with the same program, each written as `shlex.join` of its words (see `plain_command`), and
+   another with the same program, each written as `shlex.join` of its words (see `plain_command`). A
+   failure fixed only by quoting bare glob characters keeps its recorded text (see `quote_only_fix`).
    `reason` is exactly `MINED_REASON`. The agent already sees its own error at the repair stage, so the
    error text adds nothing a lesson needs and is the one field an attacker fully controls. A mined lesson
    about a non-shell tool takes the one other shape `tool_text` writes instead (see `FieldChange`): it is
@@ -673,6 +674,37 @@ def plain_text(simple: SimpleCommand) -> str:
     return shlex.join((simple.program, *simple.args))
 
 
+def quote_only_fix(failed: str, passing: str) -> bool:
+    """Whether quoting bare glob characters makes `failed` the same plain command as `passing`.
+
+    Quote only those characters, then let `plain_command` reject every other shell expansion or syntax.
+    Comparing parsed words keeps a change to an argument or an added word from becoming a quote fix.
+    """
+    fix = plain_command(passing)
+    if fix is None:
+        return False
+    quoted: list[str] = []
+    quote: str | None = None
+    escaped = False
+    changed = False
+    for char in failed:
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote is not None:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char in "?*[":
+            quoted.append(f"'{char}'")
+            changed = True
+            continue
+        quoted.append(char)
+    return changed and plain_command("".join(quoted)) == fix
+
+
 def _canonical(text: str) -> SimpleCommand | None:
     simple = plain_command(text)
     return simple if simple is not None and plain_text(simple) == text else None
@@ -681,9 +713,12 @@ def _canonical(text: str) -> SimpleCommand | None:
 def _check_mined(values: Mapping[str, str]) -> None:
     """Stage 5. `instead` already matched one of `INSTEAD_TEMPLATES`, so it holds exactly one code span."""
     avoid = _canonical(values["avoid"])
+    command = values["instead"].split("`")[1]
+    if avoid is None and quote_only_fix(values["avoid"], command):
+        avoid = plain_command(command)
     if avoid is None:
         raise RejectedText("mined.avoid_not_one_command", "avoid")
-    fix = _canonical(values["instead"].split("`")[1])
+    fix = _canonical(command)
     if fix is None:
         raise RejectedText("mined.instead_not_one_command", "instead")
     if fix.program != avoid.program:

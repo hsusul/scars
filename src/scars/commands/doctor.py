@@ -6,6 +6,7 @@ Each check prints `ok` or `FAIL` with a reason, and any failure makes the exit c
 - the store sits on a synced folder, a network file system or an external disk,
 - the kill switch is on, so no hook consults lessons,
 - no harness has scars hooks configured,
+- the hook shim uses a different store,
 - a harness's hook errored on more than 1% of its runs in the last 24 hours,
 - the canary: a synthetic Claude Code `PostToolUseFailure` payload, run through the hook in this process
   against a temporary home holding one built-in lesson, must return that lesson within 100 ms.
@@ -26,6 +27,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import sqlite3
 import statistics
 import subprocess
@@ -177,6 +179,23 @@ def _plugin_state(ctx: Context, scars_home: Path) -> dict[Harness, str]:
     return {Harness.CLAUDE: claude, Harness.CODEX: codex}
 
 
+def _hook_store(ctx: Context, scars_home: Path) -> Check:
+    shim = scars_home / "bin" / "scars-hook"
+    try:
+        words = shlex.split(shim.read_text(encoding="utf-8"), comments=True)
+    except (OSError, ValueError) as exc:
+        return Check("hook store", False, f"cannot read {shim}: {shown(str(exc))}; run scars init")
+    home = ctx.user_home / ".scars"
+    if len(words) == 5 and words[0] == "export" and words[1].startswith("SCARS_HOME="):
+        home = Path(words[1].removeprefix("SCARS_HOME="))
+        words = words[2:]
+    if len(words) != 3 or words[0] != "exec" or words[2] != "$@" or not home.is_absolute():
+        return Check("hook store", False, f"cannot determine the store from {shim}; run scars init")
+    if os.path.realpath(home) != os.path.realpath(scars_home):
+        return Check("hook store", False, f"shim uses {home}, doctor uses {scars_home}; run scars init")
+    return Check("hook store", True, str(scars_home))
+
+
 def _canary_payload(session: str, cwd: str) -> str:
     return json.dumps(
         {
@@ -308,6 +327,8 @@ def doctor(
             )
     if not any(state == "installed" for state in plugins.values()):
         out.append(Check("hooks", False, "no harness has scars hooks installed"))
+    else:
+        out.append(_hook_store(ctx, scars_home))
     off = paths.is_off() or paths.off_value(ctx.env.get("SCARS_OFF"))
     out.append(Check("kill switch", not off, "on: hooks do nothing (scars on)" if off else "off"))
     out.extend(_store_checks(ctx, scars_home, location))

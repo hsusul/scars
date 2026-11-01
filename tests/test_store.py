@@ -1,5 +1,7 @@
 import sqlite3
 import stat
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import pytest
 
@@ -179,6 +181,49 @@ def test_create_lesson_stores_a_candidate_with_triggers_and_a_proposed_event(db)
     assert rows == [(lesson_id, "proposed", "miner", None, 1, GENESIS_HASH)]
 
 
+@pytest.mark.parametrize("outer_transaction", [False, True])
+def test_create_lesson_retries_an_id_collision(db, outer_transaction):
+    with patch("secrets.token_hex", return_value="00000001"):
+        assert new(db) == "L-00000001"
+
+    with store.transaction(db) if outer_transaction else nullcontext():
+        with patch("secrets.token_hex", side_effect=["00000001", "00000002"]):
+            assert new(db, fingerprint="fp2") == "L-00000002"
+        assert db.in_transaction is outer_transaction
+
+    lesson = get_lesson(db, "L-00000002")
+    assert (lesson.fingerprint, lesson.text, set(lesson.triggers)) == ("fp2", TEXT, {ERR, CMD})
+    assert db.execute("select id, fingerprint from lessons order by id").fetchall() == [
+        ("L-00000001", "fp1"),
+        ("L-00000002", "fp2"),
+    ]
+    assert db.execute("select lesson_id, type, to_revision from events order by seq").fetchall() == [
+        ("L-00000001", "proposed", 1),
+        ("L-00000002", "proposed", 1),
+    ]
+    assert verify(db) == []
+    assert not db.in_transaction
+
+
+@pytest.mark.parametrize("outer_transaction", [False, True])
+def test_create_lesson_stops_after_five_colliding_ids_and_writes_nothing(db, outer_transaction):
+    with patch("secrets.token_hex", return_value="00000001"):
+        assert new(db) == "L-00000001"
+
+    with store.transaction(db) if outer_transaction else nullcontext():
+        with patch("secrets.token_hex", return_value="00000001") as token_hex:
+            with pytest.raises(sqlite3.IntegrityError, match=r"UNIQUE constraint failed: lessons\.id"):
+                new(db, fingerprint="fp2")
+            assert token_hex.call_count == 5
+        assert db.in_transaction is outer_transaction
+        assert db.execute("select id, fingerprint from lessons").fetchall() == [("L-00000001", "fp1")]
+        assert db.execute("select lesson_id, type from events").fetchall() == [("L-00000001", "proposed")]
+        assert db.execute("select count(*) from triggers").fetchone() == (2,)
+        assert verify(db) == []
+
+    assert not db.in_transaction
+
+
 @pytest.mark.parametrize(
     ("scope", "columns"),
     [
@@ -205,10 +250,14 @@ def test_create_lesson_rejects_machine_scope(db):
 
 
 def test_create_lesson_with_an_active_fingerprint_conflicts_and_writes_nothing(db):
-    new(db)
-    with pytest.raises(Conflict):
-        new(db)
+    with patch("secrets.token_hex", side_effect=["00000001", "00000002"]) as token_hex:
+        assert new(db) == "L-00000001"
+        with pytest.raises(Conflict, match="an active lesson already has fingerprint fp1"):
+            new(db)
+        assert token_hex.call_count == 2
+    assert db.execute("select id, fingerprint from lessons").fetchall() == [("L-00000001", "fp1")]
     assert db.execute("select count(*) from events").fetchone() == (1,)
+    assert verify(db) == []
 
 
 def test_a_retired_fingerprint_can_be_proposed_again(db):
