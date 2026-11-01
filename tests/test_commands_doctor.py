@@ -2,7 +2,7 @@ import re
 
 from cli_helpers import NOW, connect, first_telemetry, make_ctx, run, seed, telemetry_version
 from scars import telemetry
-from scars.commands import doctor
+from scars.commands import doctor, install
 from scars.model import HitOutcome
 
 pytest_plugins = ("cli_fixtures",)
@@ -28,6 +28,9 @@ def stub(monkeypatch, location=None, canary=HEALTHY_CANARY):
 
 
 def install_codex(user_home):
+    from scars import paths
+
+    install.shim_file(user_home, paths.home(), "/bin/scars-hook").write()
     (user_home / ".codex").mkdir()
     (user_home / ".codex" / "hooks.json").write_text('{"hooks": {"x": "/bin/scars-hook codex x"}}')
 
@@ -44,6 +47,7 @@ def test_healthy_doctor(home, user_home, monkeypatch):
         "claude: no hook runs in the last 24 hours; hooks not installed (run scars init)\n"
         "codex: last hook 2027-01-15 07:59, 100 runs, p50 50.5 ms, p99 100.0 ms, errors 0 (0.0%), "
         "error classes: none; hooks installed\n"
+        f"ok    hook store: {home}\n"
         "ok    kill switch: off\n"
         f"ok    store location: {home}\n"
         "ok    event chain: hash chain and replay match the lessons\n"

@@ -2,13 +2,28 @@ import json
 import os
 import plistlib
 import shlex
+import subprocess
+import sys
 import time
 
 import pytest
 
-from cli_helpers import FAILURE_PAIR, Tty, claude_transcript, git_repo, make_ctx, run
+from cli_helpers import (
+    FAILURE_PAIR,
+    NOW,
+    REPO,
+    SIG,
+    Tty,
+    claude_transcript,
+    git_repo,
+    human,
+    make_ctx,
+    run,
+    seed,
+)
 from scars import store
-from scars.commands import install
+from scars.commands import doctor, install
+from scars.model import EventType
 
 pytest_plugins = ("cli_fixtures",)
 
@@ -225,7 +240,7 @@ def test_init_writes_a_stable_shim_and_points_both_harnesses_at_it(machine):
     user, scars_home = machine
     assert run(make_ctx(user, clock=time.time), "init", "--yes")[0] == 0
     shim = scars_home / "bin" / "scars-hook"
-    assert (shim.read_text(), mode(shim)) == (SHIM_BODY, "0o755")
+    assert (shim.read_bytes(), mode(shim)) == (SHIM_BODY.encode(), "0o755")
     quoted = shlex.quote(str(shim))
     claude = json.loads((scars_home / "plugins" / "claude" / "hooks" / "hooks.json").read_text())
     codex = json.loads((user / ".codex" / "hooks.json").read_text())
@@ -236,6 +251,98 @@ def test_init_writes_a_stable_shim_and_points_both_harnesses_at_it(machine):
     assert mode(user / ".codex" / "hooks.json") == "0o600"
     assert mode(scars_home / "plugins" / "claude" / "hooks" / "hooks.json") == "0o600"
     assert mode(user / "Library" / "LaunchAgents" / "dev.scars.miner.plist") == "0o644"
+
+
+@pytest.mark.parametrize("dirname", ["lesson store", 'Sam\'s "lesson" $store'])
+def test_custom_store_shim_delivers_and_honors_off_without_inherited_home(
+    machine, work, monkeypatch, dirname
+):
+    user, _ = machine
+    scars_home = user / dirname
+    monkeypatch.setenv("SCARS_HOME", str(scars_home))
+    target = work / "installed hook"
+    target.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
+        "-c 'from scars.hook_entry import main; main()' \"$@\"\n"
+    )
+    target.chmod(0o755)
+    monkeypatch.setattr(install, "installed_script", lambda name: str(target))
+    assert run(make_ctx(user), "init", "--yes")[0] == 0
+    repo = git_repo(work / "app")
+    db = store.connect(scars_home / "lessons.db")
+    store.add_repo(db, REPO, "app", "own")
+    store.add_clone(db, str(repo / ".git"), REPO, NOW)
+    db.close()
+    lesson_id = seed(scars_home, provisional=False)
+    human(scars_home, lesson_id, EventType.PROMOTED)
+    payload = {
+        "session_id": "custom-store",
+        "cwd": str(repo),
+        "hook_event_name": "PostToolUseFailure",
+        "tool_name": "Bash",
+        "tool_input": {"command": "pytest --frobnicate tests"},
+        "tool_use_id": "failure",
+        "error": SIG,
+    }
+    env = dict(os.environ, HOME=str(user))
+    for name in ("SCARS_HOME", "SCARS_OFF", "SCARS_ARM"):
+        env.pop(name, None)
+    shim = scars_home / "bin" / "scars-hook"
+
+    def invoke():
+        return subprocess.run(
+            [str(shim), "claude", "PostToolUseFailure"],
+            input=json.dumps(payload),
+            env=env,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    result = invoke()
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout == json.dumps(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUseFailure",
+                "additionalContext": (
+                    f"[scars {lesson_id} note | repo app | seen 1x | reviewed 2027-01-15]\n"
+                    "AVOID: pytest --frobnicate\n"
+                    "INSTEAD: run `pytest tests` instead\n"
+                    "WHY: AVOID failed, INSTEAD passed\n"
+                    f"(advisory; scars why {lesson_id})"
+                ),
+            }
+        }
+    )
+    assert run(make_ctx(user), "off")[0] == 0
+    assert (scars_home / "OFF").exists()
+    payload["session_id"] = "custom-store-off"
+    result = invoke()
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        SHIM_BODY,
+        "#!/bin/sh\nexport SCARS_HOME='/another store'\nexec /opt/scars-hook \"$@\"\n",
+        '#!/bin/sh\nexport SCARS_HOME=\'unterminated\nexec /opt/scars-hook "$@"\n',
+    ],
+)
+def test_doctor_rejects_a_shim_that_does_not_use_its_store(machine, monkeypatch, body):
+    user, _ = machine
+    scars_home = user / "lesson store"
+    monkeypatch.setenv("SCARS_HOME", str(scars_home))
+    monkeypatch.setattr(doctor, "store_location_problem", lambda _: None)
+    monkeypatch.setattr(doctor, "run_canary", lambda: doctor.Check("canary", True, "lesson returned in 7 ms"))
+    assert run(make_ctx(user), "init", "--yes")[0] == 0
+    assert run(make_ctx(user), "doctor")[0] == 0
+    (scars_home / "bin" / "scars-hook").write_text(body)
+    code, out, err = run(make_ctx(user), "doctor")
+    assert (code, err) == (1, "")
+    assert "FAIL  hook store:" in out
 
 
 def test_init_refuses_a_hook_inside_a_git_checkout_unless_allowed(machine, work, monkeypatch):
