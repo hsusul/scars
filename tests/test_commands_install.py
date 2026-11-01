@@ -568,3 +568,67 @@ def test_init_top_list_never_offers_a_lesson_that_names_a_secret_argument(home, 
         "    would have fired 0 times in the last 30 days\n"
         "review them with: scars inbox\n"
     )
+
+
+def test_init_top_list_counts_tool_failures_in_its_repo(home, user_home, tmp_path):
+    from dataclasses import replace
+
+    from cli_helpers import DAY, NOW, REPO, SIG, connect, seed
+    from scars import render
+    from scars.model import LessonText, RepoScope, Stage, Trigger, TriggerKind, TrustClass
+
+    repo = git_repo(tmp_path / "app")
+    other = git_repo(tmp_path / "other")
+    shell = seed(home)
+    db = connect(home)
+    store.add_clone(db, str(repo / ".git"), REPO, NOW)
+    tool = store.create_lesson(
+        db,
+        text=LessonText('T with mode="invalid"', 'mode="valid"', render.MINED_REASON),
+        scope=RepoScope(REPO),
+        trust_class=TrustClass.OWN_CODE,
+        triggers=[Trigger(TriggerKind.ERROR, "[tool T] invalid mode", Stage.REPAIR)],
+        fingerprint="tool-mode",
+        actor="miner",
+        at=NOW - DAY,
+    )
+    store.add_observation(
+        db,
+        store.Observation(tool, "claude", "s1", "bad", "invalid", "invalid mode", 'mode="valid"', NOW - DAY),
+    )
+    failed = store.MinedCall(
+        "tool-0", "claude", "s1", NOW - DAY, "T", "other", None, (), "failed", "invalid mode", str(repo), None
+    )
+    calls = [
+        *[replace(failed, tool_use_id=f"tool-{i}") for i in range(3)],
+        replace(failed, tool_use_id="other-repo", cwd=str(other)),
+        replace(failed, tool_use_id="other-tool", tool="U"),
+        replace(failed, tool_use_id="success", status="ok"),
+        replace(failed, tool_use_id="old", at=NOW - 31 * DAY),
+        *[
+            replace(
+                failed,
+                tool_use_id=f"shell-{i}",
+                tool="Bash",
+                tool_kind="shell",
+                command="pytest --frobnicate",
+                error_signature=SIG,
+                cwd=str(cwd),
+            )
+            for i, cwd in enumerate((repo, other))
+        ],
+    ]
+    store.commit_batch(db, offsets=(), seen=(), pending=(), calls=calls, prune_before=0.0)
+    db.close()
+
+    ctx = make_ctx(user_home)
+    install.show_top(ctx, home)
+    out = ctx.stdout.getvalue()
+    assert (
+        f'  {tool}  candidate  AVOID T with mode="invalid"\n'
+        "    would have fired 3 times in the last 30 days\n"
+    ) in out
+    assert (
+        f"  {shell}  provisional  AVOID pytest --frobnicate\n"
+        "    would have fired 2 times in the last 30 days\n"
+    ) in out
