@@ -161,7 +161,9 @@ def _read(
 
 def _mined_row(call: calls.Call) -> store.MinedCall:
     """The row to store for a call, with every transcript-derived text secret-scanned."""
-    sig = pairs.signature(call.output) if call.status is calls.CallStatus.FAILED else None
+    sig = (
+        pairs.signature(call.output, command=call.command) if call.status is calls.CallStatus.FAILED else None
+    )
     return store.MinedCall(
         tool_use_id=call.tool_use_id,
         harness=str(call.harness),

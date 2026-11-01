@@ -49,3 +49,38 @@ def test_signature_is_none_for_output_no_lesson_can_address(output):
 )
 def test_output_carrying_a_scars_header_is_never_a_signature(output):
     assert signature(output) is None
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("# Contributing...\ncat: x: No such file or directory", "cat: x: No such file or directory"),
+        (
+            "==> forum\nsed: src/config.py: No such file or directory",
+            "sed: src<path>: No such file or directory",
+        ),
+        (
+            "import asyncio\nModuleNotFoundError: No module named 'fitz'",
+            "ModuleNotFoundError: No module named 'fitz'",
+        ),
+        ('# Useful Commands\nUnknown JSON field: "message"', 'Unknown JSON field: "message"'),
+        (
+            '# Investigation\nInvalid search query "repo:example/project".',
+            'Invalid search query "repo:example<path>".',
+        ),
+        (".github/workflows\ngh: Not Found (HTTP 404)", "gh: Not Found (HTTP <n>)"),
+        ("# Refactoring\nfatal: Needed a single revision", "fatal: Needed a single revision"),
+        (
+            "# Individual Contributor License Agreement\n(eval):7: no matches found: --include=*.swift",
+            "(eval):<n>: no matches found: --include=*.swift",
+        ),
+        (
+            "# Opening a PR\n(eval):3: permission denied: /tmp/project/check.sh",
+            "(eval):<n>: permission denied: <path>",
+        ),
+        ("# Contributing...\n\x1b[31mERROR: build failed\x1b[0m", "ERROR: build failed"),
+        ("# Contributing...\nerror:\ncat: x: No such file or directory", "cat: x: No such file or directory"),
+    ],
+)
+def test_signature_prefers_an_error_line_over_stdout(output, expected):
+    assert signature(output) == expected

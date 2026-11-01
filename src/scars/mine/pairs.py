@@ -85,9 +85,20 @@ TARGET_OPTIONS: dict[str, dict[str, str]] = {
     "git": {"-C": "-C", "--git-dir": "--git-dir", "--work-tree": "--work-tree"},
     "gh": {"-R": "--repo", "--repo": "--repo"},
     "npm": {"--prefix": "--prefix", "-w": "--workspace", "--workspace": "--workspace"},
+    "pnpm": {"-C": "--dir", "--dir": "--dir", "--filter": "--filter", "-F": "--filter"},
+    "yarn": {"--cwd": "--cwd"},
+    "uv": {"--directory": "--directory", "--project": "--project"},
+    "xcodebuild": {"-project": "-project", "-workspace": "-workspace", "-scheme": "-scheme"},
     "make": {"-C": "--directory", "--directory": "--directory", "-f": "--file", "--file": "--file"},
     "cargo": {"--manifest-path": "--manifest-path", "-p": "--package", "--package": "--package"},
-    "kubectl": {"-n": "--namespace", "--namespace": "--namespace", "--context": "--context"},
+    "kubectl": {
+        "-n": "--namespace",
+        "--namespace": "--namespace",
+        "--context": "--context",
+        "--kubeconfig": "--kubeconfig",
+        "-l": "--selector",
+        "--selector": "--selector",
+    },
     "docker": {"-H": "--host", "--host": "--host", "-c": "--context", "--context": "--context"},
 }
 """Per program, the spellings of options whose value selects the target, mapped to one name per option."""
@@ -161,6 +172,8 @@ def target(command: str) -> Target | None:
                 selectors.setdefault(selecting[name], []).append(value)
             elif name in selecting:
                 pending = selecting[name]
+            elif arg[:2] in selecting:
+                selectors.setdefault(selecting[arg[:2]], []).append(arg[2:])
             elif not eq:
                 pending = _VALUE if name in valued else _UNKNOWN
         elif pending is None:
@@ -266,7 +279,7 @@ def open_failure(call: Call) -> OpenFailure | None:
         return None
     if call.tool_kind is ToolKind.SHELL and call.program is None:
         return None
-    sig = signature(call.output)
+    sig = signature(call.output, command=call.command)
     if sig is None:
         return None
     return OpenFailure(

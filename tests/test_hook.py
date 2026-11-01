@@ -248,6 +248,27 @@ GATE_DENY = ("pre_tool", "gate", None, None, "agent_deny", "blocked", 0, None)
 # ---------------------------------------------------------------- end to end
 
 
+def test_compound_stdout_does_not_deliver_an_error_lesson(env, monkeypatch):
+    from scars import telemetry
+    from scars.model import HitOutcome
+
+    home, repo = env
+    db = seed_store(home, repo)
+    add_lesson(
+        db,
+        fingerprint="stdout",
+        triggers=(Trigger(TriggerKind.ERROR, "# Useful Commands", Stage.REPAIR),),
+        reason="# Useful Commands",
+    )
+    db.close()
+    monkeypatch.setenv("SCARS_HOME", str(home))
+    payload = claude_failure(repo, error="# Useful Commands")
+    payload["tool_input"] = {"command": "cat AGENTS.md; rg missing src"}
+    event = claude.parse("PostToolUseFailure", payload)
+    decision = hook.decide(event, "PostToolUseFailure", telemetry.EMPTY, now=T0)
+    assert (decision.outcome, decision.shown) == (HitOutcome.NO_MATCH, [])
+
+
 def test_claude_repair_shows_the_lesson_records_it_and_dedupes_until_compaction(env):
     home, repo = env
     lesson_id = add_lesson(seed_store(home, repo), fingerprint="fp1", triggers=REPAIR)
