@@ -583,12 +583,12 @@ def create_lesson(
     """Insert a new candidate lesson, its triggers and its `proposed` event in one transaction.
 
     Raises `Conflict` when an active lesson already has this fingerprint, and `Rejected` for machine scope.
+    Tries at most five random IDs when an existing lesson has the generated ID.
     """
     at = time.time() if at is None else at
     triggers = tuple(triggers)
     import secrets
 
-    lesson_id = LessonId("L-" + secrets.token_hex(4))
     payload: dict[str, object] = {
         "text": {"avoid": text.avoid, "instead": text.instead, "reason": text.reason},
         "scope": scope_to_json(scope),
@@ -599,17 +599,22 @@ def create_lesson(
     if fix_program:
         payload["fix_program"] = fix_program
     state = next_state(None, EventType.PROPOSED, payload, at=at)
-    cols: dict[str, object] = {"id": lesson_id, **_columns(state)}
     with _write_unit(db):
-        try:
-            db.execute(
-                f"insert into lessons ({','.join(cols)}) values ({','.join('?' * len(cols))})",
-                tuple(cols.values()),
-            )
-        except sqlite3.IntegrityError as exc:
-            if "fingerprint" in str(exc):
-                raise Conflict(f"an active lesson already has fingerprint {fingerprint}") from None
-            raise
+        for attempt in range(5):
+            lesson_id = LessonId("L-" + secrets.token_hex(4))
+            cols: dict[str, object] = {"id": lesson_id, **_columns(state)}
+            try:
+                db.execute(
+                    f"insert into lessons ({','.join(cols)}) values ({','.join('?' * len(cols))})",
+                    tuple(cols.values()),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "fingerprint" in str(exc):
+                    raise Conflict(f"an active lesson already has fingerprint {fingerprint}") from None
+                if str(exc) != "UNIQUE constraint failed: lessons.id" or attempt == 4:
+                    raise
+            else:
+                break
         _write_triggers(db, lesson_id, state.triggers)
         _append_event(
             db,
