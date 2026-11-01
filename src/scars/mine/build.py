@@ -3,9 +3,11 @@
 - Only structured data built from the parsed calls goes into a lesson, never transcript prose. The failed
   and the passing input must each be one plain command (`render.plain_command`): a compound, wrapped,
   redirected or run-time-expanded command is not lessonable, and neither is an input holding the scars
-  header, so a lesson shown to an agent never feeds back into a new one.
+  header, so a lesson shown to an agent never feeds back into a new one. A failure fixed only by quoting
+  bare glob characters is also lessonable when `render.quote_only_fix` accepts the pair.
 - `avoid` is the failed command as it ran, written as `shlex.join` of its parsed words (so only its
-  whitespace and quoting are normalized) and never backticked.
+  whitespace and quoting are normalized) and never backticked. A quote-only fix keeps the recorded failed
+  command so its unquoted glob characters remain visible.
 - `instead` is `run `<passing command>` instead`, with the passing command written as `shlex.join` of its
   words. The observation stores that same text as its passing input, so the hook's known commands always
   contain it; one over the 1 KB observation cap drops the candidate instead of being cut.
@@ -276,13 +278,18 @@ def build(pair: Pair, repo_id: RepoId | None, owner_class: str | None) -> Candid
         return _build_tool(pair, repo_id, owner_class)
     if passing.tool_kind is not ToolKind.SHELL or passing.command is None:
         raise Skipped("non_shell_tool")
-    failed_cmd, passing_cmd = _plain(failed.input), _plain(passing.input)
+    quote_fix = render.quote_only_fix(failed.input, passing.input)
+    if quote_fix:
+        failed_cmd = passing_cmd = _plain(passing.input)
+        avoid = failed.input
+    else:
+        failed_cmd, passing_cmd = _plain(failed.input), _plain(passing.input)
+        avoid = render.plain_text(failed_cmd)
     if failed_cmd.program != passing_cmd.program:
         raise Skipped("program_mismatch")
-    if failed_cmd.args == passing_cmd.args:
+    if not quote_fix and failed_cmd.args == passing_cmd.args:
         raise Skipped("identical_retry")
     differing = [a for a in failed_cmd.args if a not in set(passing_cmd.args)]
-    avoid = render.plain_text(failed_cmd)
     command = render.plain_text(passing_cmd)
     if len(command.encode()) > OBSERVATION_CAP:
         raise Skipped("passing_input_too_long")
