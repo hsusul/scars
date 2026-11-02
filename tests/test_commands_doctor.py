@@ -28,28 +28,31 @@ def stub(monkeypatch, location=None, canary=HEALTHY_CANARY):
     monkeypatch.setattr(doctor, "run_canary", lambda: canary)
 
 
-def install_codex(user_home):
+def install_claude(user_home):
     from scars import paths
 
     install.shim_file(user_home, paths.home(), "/bin/scars-hook").write()
-    (user_home / ".codex").mkdir()
-    (user_home / ".codex" / "hooks.json").write_text('{"hooks": {"x": "/bin/scars-hook codex x"}}')
+    hook_file = paths.home() / "plugins" / "claude" / "hooks" / "hooks.json"
+    hook_file.parent.mkdir(parents=True)
+    hook_file.write_text('{"hooks": {}}')
+    installed = user_home / ".claude" / "plugins" / "installed_plugins.json"
+    installed.parent.mkdir(parents=True)
+    installed.write_text('{"plugins": {"scars@scars-local": []}}')
 
 
 def test_healthy_doctor(home, user_home, monkeypatch):
     stub(monkeypatch)
-    install_codex(user_home)
+    install_claude(user_home)
     seed(home)
     write_hits(
-        home, [hit("codex", float(ms)) for ms in range(1, 101)] + [hit("codex", 9.0, at=NOW - 2 * 86400)]
+        home, [hit("claude", float(ms)) for ms in range(1, 101)] + [hit("claude", 9.0, at=NOW - 2 * 86400)]
     )
     assert run(make_ctx(user_home), "doctor") == (
         0,
-        "claude: no hook runs in the last 24 hours; hooks not installed (run scars init)\n"
-        "codex: last hook 2027-01-15 07:59, 100 runs, p50 50.5 ms, p99 100.0 ms, errors 0 (0.0%), "
+        "claude: last hook 2027-01-15 07:59, 100 runs, p50 50.5 ms, p99 100.0 ms, errors 0 (0.0%), "
         "error classes: none; hooks installed\n"
         f"ok    hook store: {home}\n"
-        f"unknown  codex sandbox: no {user_home}/.codex/config.toml\n"
+        f"unknown  claude sandbox: no {user_home}/.claude/settings.json\n"
         "ok    kill switch: off\n"
         "ok    delivery: lessons are shown\n"
         f"ok    store location: {home}\n"
@@ -131,7 +134,6 @@ def test_each_failing_check_makes_doctor_exit_1(home, user_home, monkeypatch):
         "claude: last hook 2027-01-15 07:59, 100 runs, p50 5.0 ms, p99 900.0 ms, errors 2 (2.0%), "
         "error classes: lessons_unavailable 2; hooks not installed (run scars init)",
         "FAIL  claude hook errors: more than 1% of runs failed in the last 24 hours",
-        "codex: no hook runs in the last 24 hours; hooks not installed (run scars init)",
         "FAIL  hooks: no harness has scars hooks installed",
         "FAIL  kill switch: on: hooks do nothing (scars on)",
         "ok    delivery: lessons are shown",
@@ -183,17 +185,17 @@ def test_synced_folders_are_flagged(tmp_path):
 
 def test_ignored_events_do_not_count_toward_the_error_rate(home, user_home, monkeypatch):
     stub(monkeypatch)
-    install_codex(user_home)
+    install_claude(user_home)
     seed(home)
     write_hits(
-        home, [hit("codex", 5.0, HitOutcome.ERROR, "Boom")] + [hit("codex", 5.0, HitOutcome.IGNORED)] * 999
+        home, [hit("claude", 5.0, HitOutcome.ERROR, "Boom")] + [hit("claude", 5.0, HitOutcome.IGNORED)] * 999
     )
     code, out, _ = run(make_ctx(user_home), "doctor")
     assert code == 1
-    assert out.splitlines()[1:3] == [
-        "codex: last hook 2027-01-15 07:59, 1000 runs, p50 5.0 ms, p99 5.0 ms, errors 1 (100.0%), "
+    assert out.splitlines()[:2] == [
+        "claude: last hook 2027-01-15 07:59, 1000 runs, p50 5.0 ms, p99 5.0 ms, errors 1 (100.0%), "
         "error classes: Boom 1; hooks installed",
-        "FAIL  codex hook errors: more than 1% of runs failed in the last 24 hours",
+        "FAIL  claude hook errors: more than 1% of runs failed in the last 24 hours",
     ]
 
 
@@ -205,26 +207,25 @@ OLD_SCHEMA = (
 
 def test_doctor_reports_an_older_telemetry_schema_without_writing_it(home, user_home, monkeypatch):
     stub(monkeypatch)
-    install_codex(user_home)
+    install_claude(user_home)
     seed(home)
     (home / "telemetry.db").unlink()
     first_telemetry(home / "telemetry.db")
     before = (home / "telemetry.db").read_bytes()
     code, out, _ = run(make_ctx(user_home), "doctor")
     assert code == 0
-    assert out.splitlines()[:3] == [
+    assert out.splitlines()[:2] == [
         OLD_SCHEMA,
-        "claude: no hook runs in the last 24 hours; hooks not installed (run scars init)",
-        "codex: last hook 2027-01-15 07:59, 1 runs, no latency, errors 0 (0.0%), error classes: none; "
-        "hooks installed",
+        "claude: no hook runs in the last 24 hours; hooks installed",
     ]
+    assert "codex" not in out.lower()
     assert (home / "telemetry.db").read_bytes() == before
     assert telemetry_version(home / "telemetry.db") == 1
 
 
 def test_an_older_telemetry_schema_in_a_read_only_store_does_not_fail_doctor(home, user_home, monkeypatch):
     stub(monkeypatch)
-    install_codex(user_home)
+    install_claude(user_home)
     seed(home)
     (home / "telemetry.db").unlink()
     first_telemetry(home / "telemetry.db")
@@ -244,16 +245,14 @@ def test_an_older_telemetry_schema_in_a_read_only_store_does_not_fail_doctor(hom
 MANAGED = "system/Library/Application Support/ClaudeCode/managed-settings.json"
 
 
-def sandbox(home, user_home, monkeypatch, *, claude=None, codex=None, managed=None):
-    """Doctor's exit code and sandbox lines, with codex hooks installed so nothing else fails."""
+def sandbox(home, user_home, monkeypatch, *, claude=None, managed=None):
+    """Doctor's exit code and sandbox lines, with Claude Code hooks installed so nothing else fails."""
     stub(monkeypatch)
-    install_codex(user_home)
+    install_claude(user_home)
     seed(home)
     if claude is not None:
-        (user_home / ".claude").mkdir()
+        (user_home / ".claude").mkdir(exist_ok=True)
         (user_home / ".claude" / "settings.json").write_text(claude)
-    if codex is not None:
-        (user_home / ".codex" / "config.toml").write_text(codex)
     if managed is not None:
         path = user_home.parent / MANAGED
         path.parent.mkdir(parents=True)
@@ -262,14 +261,11 @@ def sandbox(home, user_home, monkeypatch, *, claude=None, codex=None, managed=No
     return code, [line for line in out.splitlines() if " sandbox: " in line]
 
 
-CODEX_UNKNOWN = "unknown  codex sandbox: no {}/.codex/config.toml"
-
-
 def test_claude_sandbox_that_keeps_writes_away_from_the_store_is_ok(home, user_home, monkeypatch):
     claude = '{"sandbox": {"enabled": true, "filesystem": {"allowWrite": ["~/.kube", "/tmp/build"]}}}'
     assert sandbox(home, user_home, monkeypatch, claude=claude) == (
         0,
-        [f"ok    claude sandbox: on, and no write rule reaches {home}", CODEX_UNKNOWN.format(user_home)],
+        [f"ok    claude sandbox: on, and no write rule reaches {home}"],
     )
 
 
@@ -279,7 +275,6 @@ def test_claude_sandbox_turned_off_fails(home, user_home, monkeypatch):
         [
             f"FAIL  claude sandbox: sandbox.enabled is false in {user_home}/.claude/settings.json, "
             f"so Bash commands can write {home}",
-            CODEX_UNKNOWN.format(user_home),
         ],
     )
 
@@ -299,7 +294,6 @@ def test_claude_sandbox_that_allows_writing_the_store_fails(home, user_home, mon
         [
             f"FAIL  claude sandbox: sandbox.filesystem.allowWrite {home.parent}/** in "
             f"{user_home}/.claude/settings.json lets Bash commands write {home}",
-            CODEX_UNKNOWN.format(user_home),
         ],
     )
 
@@ -329,7 +323,6 @@ def test_claude_settings_without_the_sandbox_key_are_unknown_and_do_not_fail(hom
         0,
         [
             f"unknown  claude sandbox: no sandbox.enabled in {user_home}/.claude/settings.json",
-            CODEX_UNKNOWN.format(user_home),
         ],
     )
 
@@ -346,73 +339,4 @@ def test_claude_managed_settings_decide_whether_the_sandbox_is_on(home, user_hom
     claude = '{"sandbox": {"enabled": false}}'
     assert sandbox(home, user_home, monkeypatch, claude=claude, managed=managed)[1][0] == (
         f"ok    claude sandbox: on, and no write rule reaches {home}"
-    )
-
-
-def test_codex_read_only_sandbox_is_ok(home, user_home, monkeypatch):
-    assert sandbox(home, user_home, monkeypatch, codex='sandbox_mode = "read-only"\n') == (
-        0,
-        [f"ok    codex sandbox: sandbox_mode is read-only in {user_home}/.codex/config.toml"],
-    )
-
-
-def test_codex_workspace_write_away_from_the_store_is_ok(home, user_home, monkeypatch):
-    codex = 'sandbox_mode = "workspace-write"\n\n[sandbox_workspace_write]\nwritable_roots = ["/tmp/build"]\n'
-    assert sandbox(home, user_home, monkeypatch, codex=codex) == (
-        0,
-        [
-            f"ok    codex sandbox: sandbox_mode is workspace-write in {user_home}/.codex/config.toml, "
-            f"and no writable root contains {home}"
-        ],
-    )
-
-
-def test_codex_full_access_fails(home, user_home, monkeypatch):
-    assert sandbox(home, user_home, monkeypatch, codex='sandbox_mode = "danger-full-access"\n') == (
-        1,
-        [
-            f"FAIL  codex sandbox: sandbox_mode is danger-full-access in {user_home}/.codex/config.toml, "
-            f"so agents can write {home}"
-        ],
-    )
-
-
-def test_codex_writable_root_that_holds_the_store_fails(home, user_home, monkeypatch):
-    codex = (
-        f"sandbox_mode = 'workspace-write'\n[sandbox_workspace_write]\nwritable_roots = ['{home.parent}']\n"
-    )
-    assert sandbox(home, user_home, monkeypatch, codex=codex) == (
-        1,
-        [
-            f"FAIL  codex sandbox: writable root {home.parent} in {user_home}/.codex/config.toml "
-            f"contains {home}"
-        ],
-    )
-
-
-def test_codex_selected_profile_sets_the_sandbox_mode(home, user_home, monkeypatch):
-    codex = (
-        'profile = "yolo"\nsandbox_mode = "read-only"\n\n'
-        '[profiles.yolo]\nsandbox_mode = "danger-full-access"\n'
-    )
-    assert sandbox(home, user_home, monkeypatch, codex=codex)[1] == [
-        f"FAIL  codex sandbox: profiles.yolo.sandbox_mode is danger-full-access in "
-        f"{user_home}/.codex/config.toml, so agents can write {home}"
-    ]
-
-
-def test_codex_config_without_a_sandbox_mode_is_unknown_and_does_not_fail(home, user_home, monkeypatch):
-    assert sandbox(home, user_home, monkeypatch, codex='model = "gpt-5"\n') == (
-        0,
-        [f"unknown  codex sandbox: no sandbox_mode in {user_home}/.codex/config.toml"],
-    )
-
-
-def test_codex_config_that_does_not_parse_is_unknown(home, user_home, monkeypatch):
-    assert sandbox(home, user_home, monkeypatch, codex="sandbox_mode = \n") == (
-        0,
-        [
-            f"unknown  codex sandbox: cannot parse {user_home}/.codex/config.toml: "
-            "Invalid value (at line 1, column 16)"
-        ],
     )

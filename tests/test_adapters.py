@@ -5,12 +5,12 @@ from pathlib import Path
 import pytest
 
 from scars import adapters
-from scars.adapters import Ignored, MalformedInput, claude, codex
-from scars.model import Harness, HookEventKind, ToolKind
+from scars.adapters import Ignored, MalformedInput, claude
+from scars.model import Harness
 from scars.shell import Unsupported, parse
 
 FIXTURES = Path(__file__).parent / "fixtures"
-MODULES = {"claude": claude, "codex": codex}
+MODULES = {"claude": claude}
 ERRORS = {"MalformedInput": MalformedInput, "Ignored": Ignored}
 
 
@@ -47,10 +47,6 @@ def test_every_mapped_event_has_a_fixture():
         ("claude", "PostCompact"),
         ("claude", "PreToolUse"),
         ("claude", "PostToolUseFailure"),
-        ("codex", "SessionStart"),
-        ("codex", "UserPromptSubmit"),
-        ("codex", "PreToolUse"),
-        ("codex", "PostToolUse"),
     }
 
 
@@ -70,11 +66,6 @@ def bash(command, **extra):
 def test_claude_rejects_events_outside_the_event_map(event_name):
     with pytest.raises(MalformedInput):
         claude.parse(event_name, {**bash("ls"), "hook_event_name": event_name})
-
-
-def test_codex_rejects_events_outside_the_event_map():
-    with pytest.raises(MalformedInput):
-        codex.parse("PostToolUseFailure", {**bash("ls"), "hook_event_name": "PostToolUseFailure"})
 
 
 def test_cursor_version_is_skipped_on_every_event():
@@ -116,43 +107,7 @@ def test_error_text_and_prompt_are_capped_at_4_kb_without_splitting_characters()
     failure = {**bash("ls"), "hook_event_name": "PostToolUseFailure", "error": "é" * 3000}
     assert claude.parse("PostToolUseFailure", failure).error_text == "é" * 2048
     prompt = {"session_id": "s", "cwd": "/r", "hook_event_name": "UserPromptSubmit", "prompt": "x" * 9000}
-    assert codex.parse("UserPromptSubmit", prompt).prompt == "x" * 4096
-
-
-def test_codex_post_tool_use_reads_a_nonzero_exit_header_and_ignores_zero():
-    payload = {**bash("ls"), "hook_event_name": "PostToolUse", "tool_response": "Exit code: 0\nOutput:\nok"}
-    with pytest.raises(Ignored):
-        codex.parse("PostToolUse", payload)
-    payload["tool_response"] = "Exit code: 3\nOutput:\nboom"
-    event = codex.parse("PostToolUse", payload)
-    assert (event.event, event.tool_kind, event.error_text) == (
-        HookEventKind.TOOL_FAILED,
-        ToolKind.SHELL,
-        "boom",
-    )
-
-
-def test_codex_apply_patch_without_file_headers_has_no_paths_on_both_events():
-    patch = {"command": "*** Begin Patch\n*** End Patch\n"}
-    pre = {**bash("x"), "tool_name": "apply_patch", "tool_input": patch}
-    assert codex.parse("PreToolUse", pre).paths == ()
-    post = {**pre, "hook_event_name": "PostToolUse", "tool_response": "Exit code: 1\nOutput:\nbad patch"}
-    event = codex.parse("PostToolUse", post)
-    assert (event.tool_kind, event.paths, event.error_text) == (ToolKind.EDIT, (), "bad patch")
-
-
-def test_codex_header_without_an_output_line_keeps_the_whole_text():
-    assert codex.exit_status("Process exited with code 2\nboom") == (2, "Process exited with code 2\nboom")
-
-
-def test_codex_exit_code_must_be_an_integer_not_a_boolean():
-    assert codex.exit_status({"exit_code": True, "output": "x"}) == (None, "x")
-    assert codex.exit_status(["Exit code: 1"]) == (None, "")
-
-
-def test_codex_exit_header_only_counts_near_the_top():
-    late = "\n".join(["line"] * 20 + ["Process exited with code 1"])
-    assert codex.exit_status(late) == (None, late)
+    assert claude.parse("UserPromptSubmit", prompt).prompt == "x" * 4096
 
 
 def test_context_output_shape():
@@ -177,4 +132,3 @@ def test_deny_output_shape_is_deny_and_reason_only():
 
 def test_harness_tags_follow_the_adapter():
     assert claude.parse("PreToolUse", bash("ls")).harness is Harness.CLAUDE
-    assert codex.parse("PreToolUse", bash("ls")).harness is Harness.CODEX

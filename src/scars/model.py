@@ -51,7 +51,6 @@ class TriggerKind(StrEnum):
 
 class Harness(StrEnum):
     CLAUDE = "claude"
-    CODEX = "codex"
 
 
 class HookEventKind(StrEnum):

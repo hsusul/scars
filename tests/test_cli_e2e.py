@@ -35,7 +35,6 @@ def test_init_mine_inbox_then_the_hook_shows_the_lesson(work, monkeypatch):
     for path in (
         scars_home / "plugins" / ".claude-plugin" / "marketplace.json",
         scars_home / "plugins" / "claude" / "hooks" / "hooks.json",
-        user_home / ".codex" / "hooks.json",
         user_home / "Library" / "LaunchAgents" / "dev.scars.miner.plist",
     ):
         assert path.exists(), path

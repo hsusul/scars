@@ -141,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.configure(p)
         p.set_defaults(handler=command.handler, guarded=command.guarded)
     hook_parser = sub.add_parser("hook", help="entry point that agent hooks call")
-    hook_parser.add_argument("harness", choices=["claude", "codex"])
+    hook_parser.add_argument("harness", choices=["claude"])
     hook_parser.add_argument("event")
     hook_parser.set_defaults(handler="hook")
     return parser

@@ -1,4 +1,4 @@
-"""`scars mine`: one miner batch over the default Claude Code and Codex transcript folders.
+"""`scars mine`: one miner batch over the default Claude Code transcript folders.
 
 `--since` limits the batch to transcript files modified at or after that time. Each file still resumes
 from its saved offset, so a later run without `--since` reads the rest and nothing is mined twice. The

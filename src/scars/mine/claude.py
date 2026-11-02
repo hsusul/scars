@@ -18,7 +18,6 @@ from scars.mine.calls import (
     SHELL_TOOL,
     Call,
     CallStatus,
-    Context,
     Invocation,
     Line,
     Parsed,
@@ -76,8 +75,7 @@ def _call(
     )
 
 
-def parse(lines: Iterable[Line], session_id: str, context: Context | None = None, now: float = 0.0) -> Parsed:
-    """`context` is accepted for symmetry with Codex; Claude records carry their own cwd and model."""
+def parse(lines: Iterable[Line], session_id: str, now: float = 0.0) -> Parsed:
     uses: dict[str, _Use] = {}
     order: dict[str, Invocation] = {}
     newest: float | None = None
