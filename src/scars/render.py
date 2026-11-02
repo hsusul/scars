@@ -14,17 +14,19 @@ roots only) rather than a list of bad phrases.
 1. Sanitizer: empty and over-cap fields, ANSI escapes, control characters (every C0 and C1 character,
    tab and newline included), anything outside printable ASCII, code fences and URLs.
 2. Imperative lint: the fixed `IMPERATIVE_RULES` table on every field, then the shape rules. A lesson
-   whose trust class is not `human` has a fixed structure: `instead` is exactly one of
+   whose trust class is neither `human` nor `model` has a fixed structure: `instead` is exactly one of
    `INSTEAD_TEMPLATES` around one observed command, and `avoid` and `reason` hold no code span at all
    (see `_check_shape`). Free prose is never searched for commands; the structure leaves no room for one.
-   A `human` lesson keeps free wording, subject to every other rule.
+   A `human` lesson keeps free wording, subject to every other rule. A `model` lesson is prose too, but
+   no field may hold a code span and `instead` may not hold a shell command (see `_check_model`).
 3. Secret scan: known token formats, matched wherever they start, and a high-entropy fallback.
 4. Machine-scope lint: machine lessons reach every repo, so they may not name a repo, a GitHub
    `owner/name`, a `..` path segment, or an absolute path outside `ALLOWED_ROOTS`, including a path
    attached to an option (`-I/x`, `--prefix=/x`, `key=/x`), a relative path of three or more
-   segments, or a host (`localhost`, an IPv4 address, `host:port`).
-5. Mined structure: a lesson whose trust class is not `human` holds only what the miner builds from
-   parsed calls, never transcript prose. `avoid` is one plain command and the command in `instead` is
+   segments, or a host (`localhost`, an IPv4 address, `host:port`). A `model` machine lesson always
+   meets the stricter writing rules, on every read as well as when it is written.
+5. Mined structure: a lesson whose trust class is neither `human` nor `model` holds what the miner builds
+   from parsed calls, never transcript prose. `avoid` is one plain command and the command in `instead` is
    another with the same program, each written as `shlex.join` of its words (see `plain_command`). A
    failure fixed only by quoting bare glob characters keeps its recorded text (see `quote_only_fix`).
    `reason` is exactly `MINED_REASON`. The agent already sees its own error at the repair stage, so the
@@ -332,6 +334,65 @@ _CODE_SPAN = re.compile(r"`|<\s*/?\s*(?:code|pre|kbd)\b|\$\(", re.IGNORECASE)
 """A backtick, an HTML `code`, `pre` or `kbd` tag (opening or closing, any case), or `$(`."""
 
 
+# fmt: off
+MODEL_PROGRAMS = frozenset({
+    "awk", "bash", "brew", "bun", "cargo", "cd", "chmod", "chown", "cp", "curl", "deno", "docker", "env",
+    "gh", "git", "grep", "kubectl", "ln", "ls", "mkdir", "mv", "nohup", "node", "npm", "npx", "perl", "pip",
+    "pip3", "pnpm", "pwd", "pytest", "python", "python3", "rg", "rm", "rmdir", "rsync", "ruby", "ruff",
+    "scp", "sed", "sh", "ssh", "sudo", "tar", "uv", "uvx", "wget", "xargs", "yarn", "zsh",
+})
+# fmt: on
+"""Programs that are not English words, so a word in command position names one in any case."""
+
+_SHELL_SYNTAX = re.compile(r"[|&<>$=\\]|(?:^|\s)--?[a-z0-9]", re.IGNORECASE)
+"""A shell operator, an assignment, an escape, or an option word (`-s`, `--force`)."""
+
+_CLAUSE_END = re.compile(r"[.,:;!?](?:\s+|$)")
+_COMMAND_LEADS = frozenset({"run", "use", "try", "then", "and", "or", "first", "instead", "execute", "type"})
+
+
+def _observed_programs(known_commands: frozenset[str]) -> frozenset[str]:
+    programs: set[str] = set()
+    for command in known_commands:
+        try:
+            programs.update(c.program.rsplit("/", 1)[-1] for c in parse(command))
+        except Unsupported:
+            continue
+    return frozenset(programs)
+
+
+def _names_command(instead: str, known_commands: frozenset[str]) -> bool:
+    """Whether `instead` holds shell syntax, or a program name in command position.
+
+    A word is in command position when it opens a clause or follows a word such as `run`, `use` or
+    `then`. It names a program when it is in `MODEL_PROGRAMS`, any case, or is, exactly as written, the
+    program of a command in `known_commands`. Observed programs are matched only as written because
+    some are English verbs (`make`, `find`, `test`): a sentence that opens with `Find` stays prose.
+    """
+    if _SHELL_SYNTAX.search(instead):
+        return True
+    observed = _observed_programs(known_commands)
+    for clause in _CLAUSE_END.split(instead):
+        previous = ""
+        for i, raw in enumerate(clause.split()):
+            # The shell drops quotes inside a word, so `g'i't` runs git; prose `don't` reads `dont`.
+            word = raw.replace("'", "").replace('"', "").strip("()[]").rsplit("/", 1)[-1]
+            in_position = i == 0 or previous in _COMMAND_LEADS
+            if in_position and (word.lower() in MODEL_PROGRAMS or word in observed):
+                return True
+            previous = word.lower()
+    return False
+
+
+def _check_model(values: Mapping[str, str], known_commands: frozenset[str]) -> None:
+    """The structural rules for model prose: no code span in any field, no shell command in `instead`."""
+    for field in FIELDS:
+        if _CODE_SPAN.search(values[field]):
+            raise RejectedText("model.code_span", field)
+    if _names_command(values["instead"], known_commands):
+        raise RejectedText("model.instead_command", "instead")
+
+
 def _check_tool_shape(values: Mapping[str, str], known_commands: frozenset[str]) -> None:
     """The structural rules for a structured tool lesson: no code span in any field, both fields read
     back as the same field changes, and `instead` is one this machine observed as written."""
@@ -619,7 +680,7 @@ def _names_repo(text: str, registered_repos: Iterable[str]) -> bool:
 
 def _check_machine_scope(values: Mapping[str, str], registered_repos: Sequence[str], writing: bool) -> None:
     """`writing` adds the relative-path and host rules. They came after human machine lessons were
-    already stored, so they hold only when a person writes one; a stored lesson keeps rendering."""
+    already stored, so stored human lessons keep rendering. Model lessons always use these rules."""
     for field in FIELDS:
         value = values[field]
         if _names_repo(value, registered_repos):
@@ -887,7 +948,7 @@ def _consistent(changes: Sequence[FieldChange]) -> bool:
 
 def _is_tool_shape(values: Mapping[str, str], trust_class: TrustClass) -> bool:
     return (
-        trust_class is not TrustClass.HUMAN
+        trust_class not in (TrustClass.HUMAN, TrustClass.MODEL)
         and "`" not in values["instead"]
         and parse_instead_fields(values["instead"]) is not None
     )
@@ -914,16 +975,19 @@ def _check_values(
     _run(SANITIZER_RULES, values)
     _run(IMPERATIVE_RULES, values)
     tool_shape = _is_tool_shape(values, trust_class)
-    if tool_shape:
+    if trust_class is TrustClass.MODEL:
+        _check_model(values, known_commands)
+    elif tool_shape:
         _check_tool_shape(values, known_commands)
     else:
         _check_shape(values, known_commands, trust_class)
     _run(SECRET_RULES, values)
     if isinstance(scope, MachineScope):
-        _check_machine_scope(values, registered_repos, writing and trust_class is TrustClass.HUMAN)
+        strict = trust_class is TrustClass.MODEL or (writing and trust_class is TrustClass.HUMAN)
+        _check_machine_scope(values, registered_repos, strict)
     if tool_shape and values["reason"] != MINED_REASON:
         raise RejectedText("mined.reason_template", "reason")
-    if not tool_shape and trust_class is not TrustClass.HUMAN:
+    if not tool_shape and trust_class not in (TrustClass.HUMAN, TrustClass.MODEL):
         _check_mined(values)
 
 
@@ -941,10 +1005,10 @@ def check(
     `known_commands` holds full commands that ran successfully on this machine: the miner passes the
     passing inputs it observed, the hook passes the lesson's own observed passing inputs. It has no
     default, so no caller can skip the observed-command rule by accident. `trust_class` is the lesson's;
-    only `human` exempts a lesson from that rule and from the fixed shape (`INSTEAD_TEMPLATES` for
+    `human` and `model` exempt a lesson from that rule and from the fixed shape (`INSTEAD_TEMPLATES` for
     `instead`, no code span in `avoid` or `reason`). `registered_repos` holds the display names
     of every registered repo. `writing` is for a path that stores text or scope: it adds the rules that
-    hold only for new human machine lessons (see `_check_machine_scope`).
+    hold for new human machine lessons. Model machine lessons always use the strict rules.
     """
     values = {field: getattr(text, field) for field in FIELDS}
     _check_values(values, scope, known_commands, trust_class, registered_repos, writing)

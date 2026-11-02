@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import stat
 from contextlib import nullcontext
@@ -104,13 +105,13 @@ def column(db, lesson_id, name):
 # init and connect
 
 
-def test_init_creates_private_files_and_schema_version_1(tmp_path):
+def test_init_creates_private_files_and_schema_version_2(tmp_path):
     path = tmp_path / "a b" / "lessons.db"
     init_lessons(path).close()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     db = connect(path)
-    assert db.execute("pragma user_version").fetchone() == (1,)
+    assert db.execute("pragma user_version").fetchone() == (2,)
     assert db.execute("pragma journal_mode").fetchone() == ("wal",)
     assert db.execute("pragma foreign_keys").fetchone() == (1,)
 
@@ -118,9 +119,59 @@ def test_init_creates_private_files_and_schema_version_1(tmp_path):
 def test_init_twice_is_a_no_op_and_keeps_data(db, tmp_path):
     lesson_id = new(db)
     again = init_lessons(tmp_path / "home dir" / ".scars" / "lessons.db")
-    assert again.execute("pragma user_version").fetchone() == (1,)
+    assert again.execute("pragma user_version").fetchone() == (2,)
     assert get_lesson(again, lesson_id).id == lesson_id
     assert again.execute("select count(*) from events").fetchone() == (1,)
+
+
+def version_1_store(path):
+    """A store as the version 1 schema made it: its lessons table rejects trust class `model`."""
+    path.parent.mkdir(parents=True)
+    conn = connect(path)
+    for statement in store._statements(store.schema_sql("lessons").replace(",'model'", "")):
+        conn.execute(statement)
+    conn.execute("pragma user_version = 1")
+    return conn
+
+
+def test_ensure_miner_schema_rebuilds_a_version_1_store_to_hold_model_lessons(tmp_path):
+    db = version_1_store(tmp_path / "old" / "lessons.db")
+    add_repo(db, OW, "openwhispr", "own")
+    lesson_id = promoted(db)
+    other = new(db, fingerprint="fp2")
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed: trust_class"):
+        step(db, lesson_id, EventType.EDITED, {"trust_class": "model"})
+    rows = db.execute("select * from lessons order by id").fetchall()
+    store.ensure_miner_schema(db)
+    store.ensure_miner_schema(db)
+    assert db.execute("pragma user_version").fetchone() == (2,)
+    assert db.execute("pragma foreign_keys").fetchone() == (1,)
+    assert db.execute("select * from lessons order by id").fetchall() == rows
+    referenced = {
+        (table, row[2])
+        for table in ("lessons", "triggers", "observations", "events", "signature_review")
+        for row in db.execute(f"pragma foreign_key_list({table})")
+    }
+    assert referenced == {
+        ("lessons", "lessons"),
+        ("lessons", "repos"),
+        ("triggers", "lessons"),
+        ("observations", "lessons"),
+        ("events", "lessons"),
+        ("signature_review", "lessons"),
+    }
+    indexes = db.execute("select name from sqlite_master where type = 'index' and tbl_name = 'lessons'")
+    assert {name for (name,) in indexes if not name.startswith("sqlite_autoindex")} == {
+        "lessons_active",
+        "lessons_fingerprint",
+    }
+    step(db, lesson_id, EventType.EDITED, {"trust_class": "model"})
+    assert (get_lesson(db, lesson_id).trust_class, get_lesson(db, other).trust_class) == (
+        TrustClass.MODEL,
+        TrustClass.OWN_CODE,
+    )
+    assert verify(db) == []
+    db.close()
 
 
 def test_init_telemetry_applies_the_telemetry_schema(tmp_path):
@@ -384,6 +435,56 @@ def test_edited_returns_a_lesson_to_candidate_and_clears_pin_level_and_precision
     assert column(db, lesson_id, "precision_ok") == 0
     assert column(db, lesson_id, "expires_at") == T0 + EXPIRY_SECONDS
     assert verify(db) == []
+
+
+def test_model_edit_then_promotion_keeps_model_trust_and_note_level(db):
+    lesson_id = promoted(db)
+    step(db, lesson_id, EventType.PINNED)
+    step(db, lesson_id, EventType.LEVEL_SET, {"level": "warn"})
+    db.execute("update lessons set precision_ok = 1 where id = ?", (lesson_id,))
+    text = {
+        "avoid": "building in the wrong directory",
+        "instead": "check the workspace root",
+        "reason": "relative paths depend on the working directory",
+    }
+    step(db, lesson_id, EventType.EDITED, {"text": text, "trust_class": "model"})
+    edited = get_lesson(db, lesson_id)
+    assert (edited.status, edited.trust_class, edited.level, edited.pinned) == (
+        Status.CANDIDATE,
+        TrustClass.MODEL,
+        Level.NOTE,
+        False,
+    )
+    assert edited.text == LessonText(**text)
+    assert column(db, lesson_id, "precision_ok") == 0
+    step(db, lesson_id, EventType.PROMOTED)
+    lesson = get_lesson(db, lesson_id)
+    assert (lesson.status, lesson.trust_class, lesson.level) == (
+        Status.PROMOTED,
+        TrustClass.MODEL,
+        Level.NOTE,
+    )
+    assert verify(db) == []
+
+
+@pytest.mark.parametrize("level", ["warn", "block"])
+def test_model_level_changes_are_rejected_in_writes_and_replay(db, level):
+    lesson_id = new(db)
+    step(db, lesson_id, EventType.EDITED, {"trust_class": "model"})
+    step(db, lesson_id, EventType.PROMOTED)
+    precision_run(db, lesson_id, 10, 0)
+    before = get_lesson(db, lesson_id)
+    events = store.lesson_events(db, lesson_id)
+    with pytest.raises(Rejected, match="model lessons must keep level note"):
+        step(db, lesson_id, EventType.LEVEL_SET, {"level": level})
+    assert get_lesson(db, lesson_id) == before
+    assert store.lesson_events(db, lesson_id) == events
+    assert verify(db) == []
+    state = None
+    for event in events:
+        state = next_state(state, EventType(event.type), json.loads(event.payload), at=event.at)
+    with pytest.raises(Rejected, match="model lessons must keep level note"):
+        next_state(state, EventType.LEVEL_SET, {"level": level}, at=T0 + 50)
 
 
 def test_edited_keeps_a_machine_lesson_promoted_with_pin_level_and_precision_cleared(db):

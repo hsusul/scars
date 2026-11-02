@@ -21,7 +21,7 @@ create table lessons (
   avoid text not null check (length(avoid) <= 240),
   instead text not null check (length(instead) <= 240),
   reason text not null check (length(reason) <= 240),
-  trust_class text not null check (trust_class in ('own_code','third_party_repo','web','human')),
+  trust_class text not null check (trust_class in ('own_code','third_party_repo','web','human','model')),
   fingerprint text not null,                   -- sha256 of scope and error signature, not command text
   sessions_seen integer not null default 1,
   fix_programs text not null default '[]',     -- JSON list of distinct programs used in the passing call

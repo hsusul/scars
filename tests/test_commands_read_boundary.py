@@ -46,7 +46,7 @@ def test_a_print_site_that_forgets_shown_is_still_cleaned(home, user_home, monke
     monkeypatch.setattr(inspect, "row", lambda lesson: f"{lesson.id} caf\u00e9 {ESC}")
     assert run(make_ctx(user_home), "ls") == (
         0,
-        "ID          STATUS      LEVEL PIN SEEN  SCOPE  AVOID\n[hidden: sanitizer.ansi_escape]\n",
+        "ID          STATUS      LEVEL PIN SEEN  SCOPE  TRUST  AVOID\n[hidden: sanitizer.ansi_escape]\n",
         "",
     )
     monkeypatch.setattr(inspect, "describe", lambda lesson: [f"token {TOKEN}", f"{lesson.id} ok"])
@@ -177,8 +177,9 @@ def test_a_lesson_id_is_hidden_wherever_it_is_printed(home, user_home):
     code, out, err = run(make_ctx(user_home), "ls")
     assert (code, err) == (0, "")
     assert out.splitlines()[1:] == [
-        "[hidden: sanitizer.ansi_escape] provisional note -      1  repo app  pytest --frobnicate",
-        f"{lesson_id:<11} provisional note -      1  repo app  pytest --frobnicate",
+        "[hidden: sanitizer.ansi_escape] provisional note -      1  repo app  trust own_code  "
+        "pytest --frobnicate",
+        f"{lesson_id:<11} provisional note -      1  repo app  trust own_code  pytest --frobnicate",
         "cannot render: lesson [hidden: sanitizer.ansi_escape] breaks header.lesson_id in id",
     ]
     code, out, err = run(make_ctx(user_home), "why", BAD_ID)
@@ -266,7 +267,7 @@ def test_a_lesson_with_empty_stored_text_is_reported_not_raised(home, user_home,
     code, out, err = run(make_ctx(user_home), "ls")
     assert (code, err) == (1, "")
     assert out.splitlines()[1:] == [
-        f"{good:<11} provisional note -      1  repo app  pytest --frobnicate",
+        f"{good:<11} provisional note -      1  repo app  trust own_code  pytest --frobnicate",
         f"problem: lesson {broken} cannot be read: avoid must be 1 to 240 characters, got 0",
     ]
     for command in ("why", "test"):

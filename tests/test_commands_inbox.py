@@ -1,12 +1,13 @@
 import pytest
 
-from cli_helpers import DAY, NOW, SIG, connect, make_ctx, run, seed
+from cli_helpers import DAY, MODEL_TEXT, NOW, SIG, connect, make_ctx, model_edit, run, seed
 from scars import render, store
 from scars.commands import UserError
 from scars.commands.inbox import consistency, parse_edit, rank
 from scars.model import (
     TEXT_CAP,
     LessonText,
+    Level,
     SessionId,
     SessionScope,
     Stage,
@@ -317,3 +318,33 @@ def test_parse_edit_rejects_missing_and_unknown_fields():
         parse_edit("avoid: a\ninstead: b\n")
     with pytest.raises(UserError, match="unexpected line 'level: warn'"):
         parse_edit("level: warn\n")
+
+
+def test_a_human_edit_of_a_model_lesson_makes_the_text_human(home, user_home):
+    lesson_id = seed(home)
+    model_edit(home, lesson_id)
+    ctx = make_ctx(
+        user_home,
+        keys="eya",
+        edit=lambda text: text.replace(
+            f"instead: {MODEL_TEXT.instead}", "instead: confirm the workspace root before building"
+        ),
+    )
+    code, out, err = run(ctx, "inbox")
+    assert (code, err) == (0, "")
+    assert f"edited {lesson_id}; it is a candidate again\n" in out
+    db = connect(home)
+    lesson = store.get_lesson(db, lesson_id)
+    assert (lesson.status, lesson.trust_class, lesson.level, lesson.text) == (
+        Status.PROMOTED,
+        TrustClass.HUMAN,
+        Level.NOTE,
+        LessonText(MODEL_TEXT.avoid, "confirm the workspace root before building", MODEL_TEXT.reason),
+    )
+    assert [(e.actor, e.type) for e in store.lesson_events(db, lesson_id)][-3:] == [
+        ("autolearn", "edited"),
+        ("human", "edited"),
+        ("human", "promoted"),
+    ]
+    assert store.verify(db) == []
+    db.close()

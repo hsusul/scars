@@ -1,6 +1,6 @@
 import pytest
 
-from cli_helpers import NOW, connect, human, make_ctx, run, seed
+from cli_helpers import NOW, connect, human, make_ctx, model_edit, run, seed
 from scars import paths, render, store
 from scars.commands import harness_in, refusal
 from scars.model import (
@@ -237,3 +237,27 @@ def test_a_change_between_read_and_write_is_reported_as_a_conflict(home, user_ho
         f"scars pin: conflict: {lesson_id} is at revision 3, expected 2; "
         "it changed since it was read, so run the command again\n",
     )
+
+
+def test_level_refuses_warn_and_block_for_a_model_lesson(home, user_home):
+    lesson_id = seed(home)
+    model_edit(home, lesson_id)
+    human(home, lesson_id, EventType.PROMOTED)
+    assert run(make_ctx(user_home), "level", lesson_id, "warn") == (
+        1,
+        "",
+        f"scars level: {lesson_id}: model lessons must keep level note\n",
+    )
+    assert run(make_ctx(user_home), "level", lesson_id, "block") == (
+        1,
+        "",
+        "scars level: level block is not available in this version; use note or warn\n",
+    )
+    db = connect(home)
+    lesson = store.get_lesson(db, lesson_id)
+    assert (lesson.status, lesson.level, lesson.trust_class) == (
+        Status.PROMOTED,
+        Level.NOTE,
+        TrustClass.MODEL,
+    )
+    db.close()
