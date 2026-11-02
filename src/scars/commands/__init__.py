@@ -17,10 +17,13 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from scars import paths, render, store, telemetry
 from scars.model import ACTIVE_STATUSES, Lesson, LessonId
+
+if TYPE_CHECKING:
+    from scars.learn import AskModel, Record, Verdict
 
 
 class UserError(Exception):
@@ -142,6 +145,8 @@ class Context:
     """Command lines of the ancestor processes, nearest first; None when they cannot be read."""
     edit: Callable[[str], str] | None = None
     """Lets the person rewrite a text and returns it. None runs `$EDITOR`."""
+    ask_model: AskModel | None = None
+    """Judges one mined record. None runs `claude -p` (`scars.learn.ask_claude`)."""
     clock: Callable[[], float] = time.time
     user_home: Path = field(default_factory=Path.home)
     system_root: Path = Path("/")
@@ -165,6 +170,13 @@ class Context:
 
     def rewrite(self, text: str) -> str:
         return self.edit(text) if self.edit is not None else edit_in_editor(text, self.env)
+
+    def judge(self, record: Record) -> Verdict:
+        if self.ask_model is not None:
+            return self.ask_model(record)
+        from scars.learn import ask_claude
+
+        return ask_claude(record)
 
     def guarded(self) -> Context:
         """This context with stdout and stderr passed line by line through `clean`."""
